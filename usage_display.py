@@ -1,6 +1,6 @@
 """
 title: Token Usage Display
-author: assistant
+author: smetdenis
 version: 1.0.0
 description: Displays input/output/total token counts and generation time below each AI response. Reads API-reported usage when available, falls back to tiktoken estimation.
 required_open_webui_version: 0.8.0
@@ -111,6 +111,10 @@ class Filter:
         show_audio_tokens: bool = Field(
             default=False,
             description="Display audio tokens (for audio-capable models like gpt-4o-audio).",
+        )
+        show_model_name: bool = Field(
+            default=True,
+            description="Display base model name for custom workspace models.",
         )
 
     class UserValves(BaseModel):
@@ -318,6 +322,15 @@ class Filter:
                 if isinstance(val, (int, float)) and val > 0:
                     cached_tokens = int(val)
 
+        # --- Extract base model name for custom workspace models ---
+        base_model_name = None
+        if self.valves.show_model_name and __model__ and isinstance(__model__, dict):
+            info = __model__.get("info")
+            if isinstance(info, dict):
+                base_model_id = info.get("base_model_id")
+                if base_model_id:
+                    base_model_name = base_model_id
+
         # --- Build stats display ---
         stats_parts = []
 
@@ -357,6 +370,9 @@ class Filter:
         ):
             tps = output_tokens / elapsed_seconds
             stats_parts.append(f"⚡ {tps:.1f} t/s")
+
+        if self.valves.show_model_name and base_model_name:
+            stats_parts.append(f"🤖 {base_model_name}")
 
         if self.valves.show_data_source and stats_parts:
             label = "API" if is_api_reported else "est."
