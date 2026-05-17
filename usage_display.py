@@ -1,12 +1,13 @@
 """
 title: Token Usage Display
 author: smetdenis
-version: 1.0.0
-description: Displays input/output/total token counts and generation time below each AI response. Reads API-reported usage when available, falls back to tiktoken estimation.
+version: 1.1.0
+description: Displays input/output/total token counts and generation time below each AI response. Reads API-reported usage when available, falls back to tiktoken estimation. Compatible with Open WebUI 0.8.x and 0.9.x (multi-source token extraction, multi-level timing fallback, Anthropic Messages format).
 required_open_webui_version: 0.8.0
 requirements: tiktoken
 """
 
+import json
 import time
 from collections.abc import Awaitable, Callable
 
@@ -116,6 +117,10 @@ class Filter:
             default=True,
             description="Display base model name for custom workspace models.",
         )
+        debug_mode: bool = Field(
+            default=False,
+            description="Emit an additional status event with raw payload (info/usage/body/metadata keys). Use to diagnose missing widget on 0.9.x.",
+        )
 
     class UserValves(BaseModel):
         enabled: bool = Field(
@@ -146,12 +151,17 @@ class Filter:
             else f"fallback:{id(body)}"
         )
 
-        _request_timings[key] = time.time()
+        start_time = time.time()
+        _request_timings[key] = start_time
 
-        # Store the key in body metadata so outlet can retrieve it
         if "metadata" not in body:
             body["metadata"] = {}
         body["metadata"]["_tud_timing_key"] = key
+        body["metadata"]["_tud_start"] = start_time
+
+        if __metadata__ is not None:
+            __metadata__["_tud_timing_key"] = key
+            __metadata__["_tud_start"] = start_time
 
         return body
 
@@ -193,29 +203,38 @@ class Filter:
         if not assistant_msg:
             return body
 
-        # --- Extract timing ---
+        # --- Extract timing (multi-level fallback: __metadata__ -> body -> module dict) ---
         elapsed_seconds = None
-        timing_key = None
+        start_time = None
+
         if __metadata__:
-            timing_key = __metadata__.get("_tud_timing_key")
-        if not timing_key:
+            start_time = __metadata__.get("_tud_start")
+
+        if start_time is None:
             body_meta = body.get("metadata", {})
             if isinstance(body_meta, dict):
-                timing_key = body_meta.get("_tud_timing_key")
+                start_time = body_meta.get("_tud_start")
 
-        # Fallback: reconstruct key from metadata identifiers (same logic as inlet)
-        if not timing_key and __metadata__:
-            chat_id = __metadata__.get("chat_id", "") or ""
-            message_id = __metadata__.get("message_id", "") or ""
-            if chat_id or message_id:
-                timing_key = f"{chat_id}:{message_id}"
+        if start_time is None:
+            timing_key = None
+            if __metadata__:
+                timing_key = __metadata__.get("_tud_timing_key")
+            if not timing_key:
+                body_meta = body.get("metadata", {})
+                if isinstance(body_meta, dict):
+                    timing_key = body_meta.get("_tud_timing_key")
+            if not timing_key and __metadata__:
+                chat_id = __metadata__.get("chat_id", "") or ""
+                message_id = __metadata__.get("message_id", "") or ""
+                if chat_id or message_id:
+                    timing_key = f"{chat_id}:{message_id}"
+            if timing_key and timing_key in _request_timings:
+                start_time = _request_timings.pop(timing_key)
 
-        if timing_key and timing_key in _request_timings:
-            start_time = _request_timings.pop(timing_key)
+        if start_time is not None:
             elapsed_seconds = time.time() - start_time
         else:
-            # Clean up old timing entries (prevent memory leaks)
-            cutoff = time.time() - 600  # 10-minute TTL
+            cutoff = time.time() - 600
             stale_keys = [k for k, v in _request_timings.items() if v < cutoff]
             for k in stale_keys:
                 _request_timings.pop(k, None)
@@ -225,11 +244,28 @@ class Filter:
         output_tokens = None
         is_api_reported = False
 
+        body_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
+        body_info = body.get("info") if isinstance(body.get("info"), dict) else None
+
+        def _pick_input(src: dict) -> int | None:
+            return (
+                src.get("prompt_eval_count")
+                or src.get("prompt_tokens")
+                or src.get("input_tokens")
+            )
+
+        def _pick_output(src: dict) -> int | None:
+            return (
+                src.get("eval_count")
+                or src.get("completion_tokens")
+                or src.get("output_tokens")
+            )
+
         # Method 1: Read API-reported usage from assistant message "info" dict
         info = assistant_msg.get("info", {})
         if isinstance(info, dict) and info:
-            input_tokens = info.get("prompt_eval_count") or info.get("prompt_tokens")
-            output_tokens = info.get("eval_count") or info.get("completion_tokens")
+            input_tokens = _pick_input(info)
+            output_tokens = _pick_output(info)
             if input_tokens is not None or output_tokens is not None:
                 is_api_reported = True
                 input_tokens = input_tokens or 0
@@ -239,16 +275,24 @@ class Filter:
         if not is_api_reported:
             usage = assistant_msg.get("usage", {})
             if isinstance(usage, dict) and usage:
-                input_tokens = usage.get("prompt_tokens") or usage.get(
-                    "prompt_eval_count"
-                )
-                output_tokens = usage.get("completion_tokens") or usage.get(
-                    "eval_count"
-                )
+                input_tokens = _pick_input(usage)
+                output_tokens = _pick_output(usage)
                 if input_tokens is not None or output_tokens is not None:
                     is_api_reported = True
                     input_tokens = input_tokens or 0
                     output_tokens = output_tokens or 0
+
+        # Method 2b: Body-level usage/info (0.9.x may surface tokens at body root)
+        if not is_api_reported:
+            for src in (body_usage, body_info):
+                if isinstance(src, dict) and src:
+                    input_tokens = _pick_input(src)
+                    output_tokens = _pick_output(src)
+                    if input_tokens is not None or output_tokens is not None:
+                        is_api_reported = True
+                        input_tokens = input_tokens or 0
+                        output_tokens = output_tokens or 0
+                        break
 
         # Method 3: Fallback to tiktoken estimation
         if not is_api_reported and self.valves.fallback_to_tiktoken:
@@ -288,7 +332,12 @@ class Filter:
         audio_tokens_in = None
         audio_tokens_out = None
 
-        for source in (assistant_msg.get("info", {}), assistant_msg.get("usage", {})):
+        for source in (
+            assistant_msg.get("info", {}),
+            assistant_msg.get("usage", {}),
+            body_info or {},
+            body_usage or {},
+        ):
             if not isinstance(source, dict) or not source:
                 continue
 
@@ -316,9 +365,13 @@ class Filter:
                     if isinstance(val, (int, float)) and val > 0:
                         audio_tokens_in = int(val)
 
-            # Anthropic-style cache fields at top level
+            # Anthropic-style cache fields at top level (read + write)
             if cached_tokens is None:
                 val = source.get("cache_read_input_tokens")
+                if isinstance(val, (int, float)) and val > 0:
+                    cached_tokens = int(val)
+            if cached_tokens is None:
+                val = source.get("cache_creation_input_tokens")
                 if isinstance(val, (int, float)) and val > 0:
                     cached_tokens = int(val)
 
@@ -386,6 +439,39 @@ class Filter:
                     "type": "status",
                     "data": {
                         "description": stats_string,
+                        "done": True,
+                    },
+                }
+            )
+
+        if self.valves.debug_mode and __event_emitter__:
+            debug_payload = {
+                "task": task,
+                "messages_count": len(messages),
+                "assistant_keys": sorted(assistant_msg.keys()),
+                "assistant_info": assistant_msg.get("info"),
+                "assistant_usage": assistant_msg.get("usage"),
+                "body_keys": sorted(body.keys()),
+                "body_usage": body_usage,
+                "body_info": body_info,
+                "metadata_keys": sorted(__metadata__.keys()) if __metadata__ else [],
+                "model_id": (__model__ or {}).get("id"),
+                "is_api_reported": is_api_reported,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "cached_tokens": cached_tokens,
+                "elapsed_seconds": elapsed_seconds,
+            }
+            try:
+                debug_str = json.dumps(debug_payload, default=str, ensure_ascii=False)
+            except Exception as exc:
+                debug_str = f"serialization error: {exc}"
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"[TUD debug] {debug_str}",
                         "done": True,
                     },
                 }
