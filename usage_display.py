@@ -1,12 +1,12 @@
 """
 title: Token Usage Display
 author: smetdenis
-version: 2.0
-description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec and context-window utilization below each AI response. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Rebuilt for Open WebUI 0.10.x (structured output, normalized usage). tiktoken is optional (soft import).
-required_open_webui_version: 0.10.0
+version: 2.1.0
+description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import).
+required_open_webui_version: 0.9.0
 """
 
-# NOTE (0.10.x design, verified against source):
+# NOTE (0.9.0+ target, built around the 0.10.x model, verified against source):
 #   * OWUI runs `normalize_usage`/`merge_usage` on every usage-save path, so a
 #     saved `message["usage"]` is GUARANTEED to carry input_tokens/output_tokens/
 #     total_tokens, while provider-native keys/detail dicts are preserved.
@@ -22,6 +22,10 @@ required_open_webui_version: 0.10.0
 #   * merge_usage sums input/output/total + *_tokens_details, but NOT top-level
 #     Anthropic cache fields nor Ollama durations -> in multi-round tool turns
 #     those reflect the last round only (an OWUI limitation we surface, not fix).
+#   * 0.9.0+ compatible: the outlet body carries per-message `usage` since 0.9.0 and
+#     normalize_usage exists since 0.8.0, so tokens/context/timing/estimate all work on
+#     0.9.x. Only NATIVE provider cost (USAGE_COST_KEYS) needs 0.10.0+ -> on 0.9.x use
+#     cost_mode 'estimate'. Verified via git history, not a live 0.9.x run.
 
 # tiktoken is optional: OWUI bundles it, but per-plugin `requirements:` installs
 # fail in some sandboxes (uvx/LXC). Soft-import so the plugin always loads.
@@ -46,6 +50,7 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -59,6 +64,9 @@ _ctx_size_cache: dict = {}
 
 # Cached models.dev lookup table (id -> context tokens): {"map": dict|None, "expiry": epoch}.
 _modelsdev_cache: dict = {"map": None, "expiry": 0.0}
+
+# Cached models.dev price map (id -> {input,output,cache_read,cache_write} USD/1M): {"map": dict|None, "expiry": epoch}.
+_modelsdev_prices_cache: dict = {"map": None, "expiry": 0.0}
 
 # Static context-window table — offline default, seeded from models.dev (2026-07).
 # Matched as a case-insensitive substring of the model id; the LONGEST matching key
@@ -146,6 +154,63 @@ _STATIC_CONTEXT_SIZES: dict = {
     "command-a": 256000,
     "command-r": 128000,
     "command": 128000,
+}
+
+# Static price table — offline fallback for cost estimation (USD per 1M tokens),
+# seeded from models.dev (2026-07). Matched like the context table: case-insensitive
+# substring of the model id, LONGEST key wins. `cache_read` is the discounted price
+# for cached-prompt tokens; `cache_write` (Anthropic only) is the cache-write premium.
+# Prices are provider-specific — these use each family's first-party ("canonical")
+# provider, so an estimate is only ever an approximation. Enable
+# `fetch_prices_from_modelsdev` for exact, always-current per-provider prices.
+# NOTE: local/free backends (Ollama, llama.cpp, Meta's free Llama API) are omitted on
+# purpose — their price is $0 or varies by host, so estimating would mislead.
+_STATIC_PRICES: dict = {
+    # --- OpenAI ---
+    "gpt-5.5": {"input": 5.00, "output": 30.00, "cache_read": 0.50},
+    "gpt-5-mini": {"input": 0.25, "output": 2.00, "cache_read": 0.025},
+    "gpt-5": {"input": 1.25, "output": 10.00, "cache_read": 0.125},
+    "gpt-4.1": {"input": 2.00, "output": 8.00, "cache_read": 0.50},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60, "cache_read": 0.075},
+    "gpt-4o": {"input": 2.50, "output": 10.00, "cache_read": 1.25},
+    "o4-mini": {"input": 1.10, "output": 4.40, "cache_read": 0.275},
+    "o3": {"input": 2.00, "output": 8.00, "cache_read": 0.50},
+    # --- Anthropic (cache_write = cache-write premium) ---
+    "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00, "cache_read": 0.20, "cache_write": 2.50},
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
+    # --- Google Gemini ---
+    "gemini-3.5-flash": {"input": 1.50, "output": 9.00, "cache_read": 0.15},
+    "gemini-3-pro": {"input": 2.00, "output": 12.00, "cache_read": 0.20},
+    "gemini-2.5-pro": {"input": 1.25, "output": 10.00, "cache_read": 0.125},
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50, "cache_read": 0.03},
+    # --- DeepSeek ---
+    "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cache_read": 0.003625},
+    "deepseek-v4": {"input": 0.14, "output": 0.28, "cache_read": 0.0028},
+    "deepseek-reasoner": {"input": 0.14, "output": 0.28, "cache_read": 0.0028},
+    "deepseek-chat": {"input": 0.14, "output": 0.28, "cache_read": 0.0028},
+    # --- xAI Grok ---
+    "grok-4": {"input": 1.25, "output": 2.50, "cache_read": 0.20},
+    # --- Mistral ---
+    "mistral-large": {"input": 0.50, "output": 1.50},
+    "mistral-medium": {"input": 0.40, "output": 2.00},
+    "mistral-small": {"input": 0.15, "output": 0.60},
+    "pixtral": {"input": 2.00, "output": 6.00},
+    # --- Alibaba Qwen ---
+    "qwen3-coder": {"input": 1.00, "output": 5.00},
+    "qwen3-max": {"input": 1.20, "output": 6.00},
+    # --- Moonshot Kimi ---
+    "kimi-k2.6": {"input": 0.95, "output": 4.00, "cache_read": 0.16},
+    "kimi-k2": {"input": 0.60, "output": 2.50, "cache_read": 0.15},
+    # --- Zhipu GLM ---
+    "glm-5.2": {"input": 1.40, "output": 4.40, "cache_read": 0.26},
+    "glm-5": {"input": 1.00, "output": 3.20, "cache_read": 0.20},
+    "glm-4.6": {"input": 0.60, "output": 2.20, "cache_read": 0.11},
+    # --- MiniMax ---
+    "minimax-m3": {"input": 0.30, "output": 1.20, "cache_read": 0.06},
+    # --- Cohere Command ---
+    "command-a": {"input": 2.50, "output": 10.00},
+    "command-r": {"input": 0.15, "output": 0.60},
 }
 
 
@@ -262,6 +327,17 @@ def _format_k(n: float) -> str:
     return f"{int(n)}"
 
 
+def _format_cost(usd: float) -> str:
+    """USD with precision scaled to magnitude (e.g. $1.23, $0.0123, <$0.0001)."""
+    if usd <= 0:
+        return "$0.00"
+    if usd < 0.0001:
+        return "<$0.0001"
+    if usd < 1:
+        return f"${usd:.4f}"
+    return f"${usd:,.2f}"
+
+
 class Filter:
     class Valves(BaseModel):
         priority: int = Field(
@@ -311,8 +387,8 @@ class Filter:
         modelsdev_ttl: int = Field(
             default=86400, description="Seconds to cache the fetched models.dev context table (default 24h)."
         )
-        context_warn_percent: int = Field(default=80, description="Context %% at which the icon turns orange.")
-        context_critical_percent: int = Field(default=95, description="Context %% at which the icon turns red.")
+        context_warn_percent: int = Field(default=25, description="Context %% at which the icon turns orange.")
+        context_critical_percent: int = Field(default=70, description="Context %% at which the icon turns red.")
         llamacpp_url: str = Field(
             default="",
             description="Optional llama.cpp base URL (e.g. http://127.0.0.1:8080) for /props n_ctx probe. Empty=off.",
@@ -323,6 +399,33 @@ class Filter:
         )
         context_probe_ttl: int = Field(
             default=600, description="Seconds to cache a probed/resolved context size."
+        )
+        # --- Cost ---
+        cost_mode: Literal["off", "auto", "estimate"] = Field(
+            default="auto",
+            description=(
+                "off = never show/compute cost; auto = show only the provider's own cost "
+                "(OpenRouter/LiteLLM), never estimate or fetch; estimate = also approximate cost "
+                "from models.dev prices when the provider reports none (marked ≈)."
+            ),
+        )
+        show_cumulative_cost: bool = Field(
+            default=True, description="Also show the running total cost for the whole chat."
+        )
+        price_map: str = Field(
+            default="",
+            description=(
+                'JSON of {"model-substring": {"input": USD_per_1M, "output": USD_per_1M, '
+                '"cache_read": USD_per_1M, "cache_write": USD_per_1M}}; highest priority in estimate mode.'
+            ),
+        )
+        fetch_prices_from_modelsdev: bool = Field(
+            default=True,
+            description="In estimate mode, fetch live per-provider prices from models.dev (cached ~24h). Off = static table only.",
+        )
+        modelsdev_api_url: str = Field(
+            default="https://models.dev/api.json",
+            description="models.dev price endpoint used when fetch_prices_from_modelsdev is on.",
         )
         debug_mode: bool = Field(
             default=False, description="Emit an extra status event with the raw payload for diagnostics."
@@ -416,7 +519,16 @@ class Filter:
         timing = self._resolve_timing(usage, elapsed_seconds, tokens["output"])
         ctx = await self._resolve_context(body, __metadata__, __model__, tokens)
 
-        stats_parts = self._build_stats(v, tokens, timing, ctx, __model__)
+        model_id = ""
+        if isinstance(__model__, dict):
+            model_id = __model__.get("id", "") or ""
+        if not model_id:
+            model_id = body.get("model", "") or ""
+        cost = await self._resolve_cost(usage, tokens, messages, model_id)
+
+        stats_parts = self._build_stats(v, tokens, timing, ctx, cost, __model__)
+        if v.debug_mode:
+            stats_parts.append("(debug)")
 
         if stats_parts and __event_emitter__:
             await __event_emitter__(
@@ -427,7 +539,7 @@ class Filter:
             )
 
         if v.debug_mode and __event_emitter__:
-            await self._emit_debug(__event_emitter__, task, messages, assistant_msg, usage, tokens, timing, ctx)
+            await self._emit_debug(__event_emitter__, task, messages, assistant_msg, usage, tokens, timing, ctx, cost)
 
         return body
 
@@ -769,9 +881,233 @@ class Filter:
                 return table[key]
         return None
 
+    # --- cost ------------------------------------------------------------------
+
+    async def _resolve_cost(self, usage: dict | None, tokens: dict, messages: list, model_id: str) -> dict:
+        """Cost of this message + running chat total. Native (provider) first, else estimate.
+
+        cost_mode: off -> nothing; auto -> native only (no fetch/estimate);
+        estimate -> native first, else approximate from models.dev prices (marked ≈).
+        """
+        result = {"message": None, "message_est": False, "cumulative": None, "cumulative_est": False}
+        mode = self.valves.cost_mode
+        if mode == "off":
+            return result
+
+        native = self._native_cost(usage)
+        price = None
+        if native is not None:
+            result["message"] = native
+        elif mode == "estimate":
+            price = await self._resolve_price(model_id)
+            est = self._estimate_cost(tokens, price)
+            if est is not None:
+                result["message"] = est
+                result["message_est"] = True
+
+        if self.valves.show_cumulative_cost:
+            if price is None and mode == "estimate":
+                price = await self._resolve_price(model_id)
+            total = 0.0
+            seen = False
+            any_est = False
+            for m in messages:
+                if not (isinstance(m, dict) and m.get("role") == "assistant"):
+                    continue
+                u = m.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                n = self._native_cost(u)
+                if n is not None:
+                    total += n
+                    seen = True
+                    continue
+                if mode == "estimate" and price:
+                    est = self._estimate_cost(self._usage_token_bag(u), price)
+                    if est is not None:
+                        total += est
+                        seen = True
+                        any_est = True
+            if seen:
+                result["cumulative"] = total
+                result["cumulative_est"] = any_est
+        return result
+
+    @staticmethod
+    def _native_cost(usage: dict | None) -> float | None:
+        """Provider/proxy-reported cost from the usage object (OpenRouter, LiteLLM, ...)."""
+        if not isinstance(usage, dict):
+            return None
+        total = _first_num(usage, "cost", "total_cost")
+        if total is not None:
+            return float(total)
+        inp = _first_num(usage, "input_cost", "prompt_cost")
+        out = _first_num(usage, "output_cost", "completion_cost")
+        if inp is not None or out is not None:
+            return float((inp or 0) + (out or 0))
+        return None
+
+    @staticmethod
+    def _usage_token_bag(usage: dict) -> dict:
+        """Minimal token counts from a usage dict (for cost of historical messages)."""
+        bag = {"input": None, "output": None, "cached": None, "cache_write": None, "is_anthropic": False}
+        if not isinstance(usage, dict):
+            return bag
+        bag["input"] = _first_num(usage, "input_tokens", "prompt_tokens", "prompt_eval_count", "prompt_n")
+        bag["output"] = _first_num(usage, "output_tokens", "completion_tokens", "eval_count", "predicted_n")
+        openai_cached = _detail_num(usage, "prompt_tokens_details", "cached_tokens") or _detail_num(
+            usage, "input_tokens_details", "cached_tokens"
+        )
+        anth_read = _num(usage.get("cache_read_input_tokens"))
+        anth_write = _num(usage.get("cache_creation_input_tokens"))
+        bag["is_anthropic"] = anth_read is not None or anth_write is not None
+        bag["cached"] = anth_read if bag["is_anthropic"] else openai_cached
+        bag["cache_write"] = anth_write
+        return bag
+
+    @staticmethod
+    def _estimate_cost(bag: dict, price: dict | None) -> float | None:
+        """Estimate USD from a token bag and a per-1M price dict. None if not computable."""
+        if not price:
+            return None
+        p_in = _num(price.get("input"))
+        p_out = _num(price.get("output"))
+        if p_in is None and p_out is None:
+            return None
+        p_in = p_in or 0.0
+        p_out = p_out or 0.0
+        p_cache_read = _num(price.get("cache_read"))
+        if p_cache_read is None:
+            p_cache_read = p_in
+
+        inp = bag.get("input") or 0
+        out = bag.get("output") or 0
+        cached = bag.get("cached") or 0
+        cache_write = bag.get("cache_write") or 0
+        if not inp and not out:
+            return None
+
+        if bag.get("is_anthropic"):
+            # Anthropic: cache read/write are billed ON TOP of fresh input tokens.
+            p_cache_write = _num(price.get("cache_write"))
+            if p_cache_write is None:
+                p_cache_write = p_in
+            tokens_cost = inp * p_in + cached * p_cache_read + cache_write * p_cache_write + out * p_out
+        else:
+            # OpenAI-style: cached tokens are a discounted SUBSET of the input count.
+            billable_in = max(inp - cached, 0)
+            tokens_cost = billable_in * p_in + cached * p_cache_read + out * p_out
+        return tokens_cost / 1_000_000.0
+
+    async def _resolve_price(self, model_id: str) -> dict | None:
+        """Per-1M price for the model: manual map -> live models.dev -> static table."""
+        price = self._price_map_lookup(model_id)
+        if price:
+            return price
+        if self.valves.fetch_prices_from_modelsdev:
+            price = await self._modelsdev_price_lookup(model_id)
+            if price:
+                return price
+        return self._static_price_lookup(model_id)
+
+    def _price_map_lookup(self, model_id: str) -> dict | None:
+        raw = self.valves.price_map
+        if not raw:
+            return None
+        try:
+            user_map = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(user_map, dict):
+            return None
+        table = {str(k).lower(): v for k, v in user_map.items() if isinstance(v, dict)}
+        mid = (model_id or "").lower()
+        for key in sorted(table, key=len, reverse=True):
+            if key in mid:
+                return table[key]
+        return None
+
+    @staticmethod
+    def _static_price_lookup(model_id: str) -> dict | None:
+        mid = (model_id or "").lower()
+        for key in sorted(_STATIC_PRICES, key=len, reverse=True):
+            if key in mid:
+                return _STATIC_PRICES[key]
+        return None
+
+    async def _modelsdev_prices_map(self) -> dict:
+        """Fetch and cache {model_id -> price dict} from models.dev api.json. Non-fatal."""
+        now = time.time()
+        if _modelsdev_prices_cache.get("map") is not None and _modelsdev_prices_cache.get("expiry", 0) > now:
+            return _modelsdev_prices_cache["map"]
+
+        result: dict = {}
+        if _AIOHTTP_AVAILABLE:
+            try:
+                timeout = aiohttp.ClientTimeout(total=5)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(self.valves.modelsdev_api_url) as resp:
+                        data = await resp.json(content_type=None)
+                result = self._parse_prices(data)
+            except Exception:
+                result = {}
+
+        ttl = self.valves.modelsdev_ttl if result else min(300, self.valves.modelsdev_ttl)
+        _modelsdev_prices_cache["map"] = result
+        _modelsdev_prices_cache["expiry"] = now + max(60, ttl)
+        return result
+
+    @staticmethod
+    def _parse_prices(data) -> dict:
+        """Flatten models.dev api.json to {model_id(lower) -> price}. Tolerant of shape.
+
+        Expected: {provider: {"models": {model_id: {..., "cost": {...}}}}}; also accepts a
+        flat {model_id: {..., "cost": {...}}}. Prices are USD per 1M tokens.
+        """
+        out: dict = {}
+
+        def add(model_id, cost) -> None:
+            if not isinstance(cost, dict):
+                return
+            price = {}
+            for field in ("input", "output", "cache_read", "cache_write"):
+                val = _num(cost.get(field))
+                if val is not None:
+                    price[field] = val
+            if price.get("input") is None and price.get("output") is None:
+                return
+            key = str(model_id).lower()
+            out.setdefault(key, price)
+            out.setdefault(key.split("/")[-1], price)
+
+        if isinstance(data, dict):
+            for pid, prov in data.items():
+                if isinstance(prov, dict) and isinstance(prov.get("models"), dict):
+                    for mid, entry in prov["models"].items():
+                        if isinstance(entry, dict):
+                            add(entry.get("id", mid), entry.get("cost"))
+                elif isinstance(prov, dict) and "cost" in prov:
+                    add(prov.get("id", pid), prov.get("cost"))
+        return out
+
+    async def _modelsdev_price_lookup(self, model_id: str) -> dict | None:
+        table = await self._modelsdev_prices_map()
+        if not table:
+            return None
+        mid = (model_id or "").lower()
+        if mid in table:
+            return table[mid]
+        bare = mid.split("/")[-1]
+        if bare in table:
+            return table[bare]
+        for key in sorted(table, key=len, reverse=True):
+            if key and key in mid:
+                return table[key]
+        return None
+
     # --- display ---------------------------------------------------------------
 
-    def _build_stats(self, v, tokens, timing, ctx, model) -> list:
+    def _build_stats(self, v, tokens, timing, ctx, cost, model) -> list:
         parts: list[str] = []
 
         if v.show_input_tokens and tokens["input"] is not None:
@@ -802,6 +1138,18 @@ class Filter:
         if v.show_tokens_per_second and timing["tps"]:
             parts.append(f"⚡ {timing['tps']:.1f} t/s")
 
+        if cost["message"] is not None:
+            prefix = "≈" if cost["message_est"] else ""
+            parts.append(f"💰 {prefix}{_format_cost(cost['message'])}")
+        # Chat total — only when it adds information over the single-message figure.
+        if (
+            cost["cumulative"] is not None
+            and v.show_cumulative_cost
+            and (cost["message"] is None or abs(cost["cumulative"] - (cost["message"] or 0)) > 1e-9)
+        ):
+            prefix = "≈" if cost["cumulative_est"] else ""
+            parts.append(f"💰Σ {prefix}{_format_cost(cost['cumulative'])}")
+
         if v.show_model_name and isinstance(model, dict):
             info = model.get("info")
             base = info.get("base_model_id") if isinstance(info, dict) else None
@@ -813,22 +1161,50 @@ class Filter:
 
         return parts
 
-    async def _emit_debug(self, emit, task, messages, assistant_msg, usage, tokens, timing, ctx) -> None:
+    async def _emit_debug(self, emit, task, messages, assistant_msg, usage, tokens, timing, ctx, cost) -> None:
+        """Diagnostics for troubleshooting, in a copyable and untruncated form.
+
+        A chat status line is clamped to one line and not selectable, so it cannot show the raw
+        JSON. The stats line only carries a small `(debug)` marker; the full payload is emitted
+        two ways:
+          1. a `citation` event -> a "Token Usage Display - Debug info" source whose modal renders
+             the JSON in a ```json code block WITH a Copy button (persisted with the message);
+          2. the server/container stdout (`docker logs`) as a copyable fallback.
+        """
         content = assistant_msg.get("content")
+        output = assistant_msg.get("output")
         payload = {
             "task": task,
             "messages_count": len(messages),
             "assistant_keys": sorted(assistant_msg.keys()),
             "usage": usage,
-            "has_output": bool(assistant_msg.get("output")),
+            "output_types": (
+                [item.get("type") for item in output if isinstance(item, dict)] if isinstance(output, list) else None
+            ),
             "content_len": len(content) if isinstance(content, str) else -1,
             "tokens": tokens,
             "timing": timing,
             "ctx": ctx,
+            "cost": cost,
             "tiktoken": _TIKTOKEN_AVAILABLE,
         }
         try:
-            text = json.dumps(payload, default=str, ensure_ascii=False)
+            pretty = json.dumps(payload, default=str, ensure_ascii=False, indent=2)
         except Exception as exc:
-            text = f"serialization error: {exc}"
-        await emit({"type": "status", "data": {"description": f"[TUD debug] {text}", "done": True}})
+            pretty = f"serialization error: {exc}"
+
+        # 1) In-chat, copyable, untruncated: a citation renders the JSON in a modal (titled from
+        #    source.name) with a Copy button. The payload MUST NOT carry a top-level `type` key or
+        #    the backend drops it.
+        await emit(
+            {
+                "type": "citation",
+                "data": {
+                    "source": {"name": "Token Usage Display - Debug info"},
+                    "document": [f"```json\n{pretty}\n```"],
+                    "metadata": [{"source": "Token Usage Display - Debug info"}],
+                },
+            }
+        )
+        # 2) Copyable fallback -> container stdout (docker logs / uvicorn console).
+        print(f"[TUD debug]\n{pretty}", flush=True)  # noqa: T201 - intentional debug channel
