@@ -1,49 +1,240 @@
 """
 title: Token Usage Display
 author: smetdenis
-version: 1.1.0
-description: Displays input/output/total token counts and generation time below each AI response. Reads API-reported usage when available, falls back to tiktoken estimation. Compatible with Open WebUI 0.8.x and 0.9.x (multi-source token extraction, multi-level timing fallback, Anthropic Messages format).
-required_open_webui_version: 0.8.0
-requirements: tiktoken
+version: 2.0
+description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec and context-window utilization below each AI response. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Rebuilt for Open WebUI 0.10.x (structured output, normalized usage). tiktoken is optional (soft import).
+required_open_webui_version: 0.10.0
 """
 
+# NOTE (0.10.x design, verified against source):
+#   * OWUI runs `normalize_usage`/`merge_usage` on every usage-save path, so a
+#     saved `message["usage"]` is GUARANTEED to carry input_tokens/output_tokens/
+#     total_tokens, while provider-native keys/detail dicts are preserved.
+#     -> primary token read is the normalized triple; provider keys are backup.
+#   * `message["content"]` is NOT persisted for streaming chats (text lives in the
+#     structured `message["output"]` array); it IS present for non-streaming.
+#     -> tiktoken fallback reads content first, then walks `output`.
+#   * `message["info"]` is a redundant mirror ({"usage": ...}) of top-level usage
+#     on persisted chats -> intentionally ignored to avoid double counting.
+#   * Detail keys differ by API: Chat Completions -> prompt_tokens_details /
+#     completion_tokens_details; Responses API -> input_tokens_details /
+#     output_tokens_details; Anthropic -> top-level cache_read/creation.
+#   * merge_usage sums input/output/total + *_tokens_details, but NOT top-level
+#     Anthropic cache fields nor Ollama durations -> in multi-round tool turns
+#     those reflect the last round only (an OWUI limitation we surface, not fix).
+
+# tiktoken is optional: OWUI bundles it, but per-plugin `requirements:` installs
+# fail in some sandboxes (uvx/LXC). Soft-import so the plugin always loads.
+try:
+    import tiktoken
+
+    _TIKTOKEN_AVAILABLE = True
+except Exception:  # pragma: no cover - environment dependent
+    tiktoken = None
+    _TIKTOKEN_AVAILABLE = False
+
+# aiohttp is bundled with OWUI; soft-imported only for the optional context probe.
+try:
+    import aiohttp
+
+    _AIOHTTP_AVAILABLE = True
+except Exception:  # pragma: no cover - environment dependent
+    aiohttp = None
+    _AIOHTTP_AVAILABLE = False
+
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable
 
-import tiktoken
 from pydantic import BaseModel, Field
 
-# Thread-safe storage for request timing keyed by chat context
+# --- Module-level state --------------------------------------------------------
+
+# Request start times keyed by chat context (wall-clock fallback timing).
 _request_timings: dict = {}
+
+# Context-window size cache: model_key -> (size, expiry_epoch).
+_ctx_size_cache: dict = {}
+
+# Cached models.dev lookup table (id -> context tokens): {"map": dict|None, "expiry": epoch}.
+_modelsdev_cache: dict = {"map": None, "expiry": 0.0}
+
+# Static context-window table — offline default, seeded from models.dev (2026-07).
+# Matched as a case-insensitive substring of the model id; the LONGEST matching key
+# wins, so specific keys (gpt-4o) override generic ones (gpt-4). Enable the
+# `fetch_context_from_modelsdev` valve for always-current sizes across every model.
+_STATIC_CONTEXT_SIZES: dict = {
+    # --- OpenAI ---
+    "gpt-5.5": 1050000,
+    "gpt-5.4": 1050000,
+    "gpt-5": 400000,
+    "gpt-4.1": 1047576,
+    "gpt-4o": 128000,
+    "gpt-4-turbo": 128000,
+    "gpt-4": 8192,
+    "gpt-3.5": 16385,
+    "o4-mini": 200000,
+    "o3": 200000,
+    "o1": 200000,
+    # --- Anthropic (Opus 4.6+/Sonnet 5 moved to 1M) ---
+    "claude-opus-4-8": 1000000,
+    "claude-opus-4-7": 1000000,
+    "claude-opus-4-6": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    "claude-fable-5": 1000000,
+    "claude": 200000,
+    # --- Google Gemini (3.x is the current generation) ---
+    "gemini-3.5": 1048576,
+    "gemini-3.1": 1048576,
+    "gemini-3": 1048576,
+    "gemini-2.5": 1048576,
+    "gemini-2.0": 1048576,
+    "gemini-1.5-pro": 2097152,
+    "gemini-1.5": 1048576,
+    "gemini": 1048576,
+    # --- Meta Llama ---
+    "llama-4-scout": 3500000,
+    "llama-4": 1000000,
+    "llama-3.3": 128000,
+    "llama-3.1": 128000,
+    "llama-3": 128000,
+    "llama": 8192,
+    # --- DeepSeek ---
+    "deepseek-r1": 128000,
+    "deepseek-reasoner": 1000000,
+    "deepseek-chat": 1000000,
+    "deepseek-v4": 1000000,
+    "deepseek-flash": 1000000,
+    "deepseek": 128000,
+    # --- xAI Grok ---
+    "grok-4": 1000000,
+    "grok-3": 131072,
+    "grok": 256000,
+    # --- Mistral ---
+    "mistral-large": 262144,
+    "mistral-medium": 262144,
+    "mistral-small": 256000,
+    "codestral": 256000,
+    "devstral": 262144,
+    "magistral": 128000,
+    "mistral-nemo": 128000,
+    "pixtral": 128000,
+    "mistral": 32768,
+    # --- Alibaba Qwen ---
+    "qwen3-coder": 262144,
+    "qwen3-max": 262144,
+    "qwen3": 131072,
+    "qwq": 131072,
+    "qwen2.5": 128000,
+    "qwen": 32768,
+    # --- Moonshot Kimi ---
+    "kimi-k2": 262144,
+    "kimi": 200000,
+    # --- Zhipu GLM ---
+    "glm-5.2": 1000000,
+    "glm-5": 204800,
+    "glm-4.7": 204800,
+    "glm-4.6": 204800,
+    "glm-4.5": 131072,
+    "glm": 131072,
+    # --- MiniMax ---
+    "minimax-m3": 512000,
+    "minimax": 204800,
+    # --- Cohere Command ---
+    "command-a": 256000,
+    "command-r": 128000,
+    "command": 128000,
+}
+
+
+# --- Helpers -------------------------------------------------------------------
+
+
+def _num(value) -> int | float | None:
+    """Return the value if it is a real (non-bool) number, else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return None
+
+
+def _first_num(src: dict, *keys: str) -> int | float | None:
+    """First present numeric value among keys (0 is valid, unlike `or`-chains)."""
+    if not isinstance(src, dict):
+        return None
+    for key in keys:
+        val = _num(src.get(key))
+        if val is not None:
+            return val
+    return None
+
+
+def _detail_num(usage: dict, group: str, key: str) -> int | float | None:
+    """Read usage[group][key] as a number (e.g. completion_tokens_details.reasoning_tokens)."""
+    if not isinstance(usage, dict):
+        return None
+    group_dict = usage.get(group)
+    if isinstance(group_dict, dict):
+        return _num(group_dict.get(key))
+    return None
 
 
 def _get_last_assistant_message_obj(messages: list) -> dict:
     """Return the last assistant message dict from the message list."""
     for message in reversed(messages):
-        if message.get("role") == "assistant":
+        if isinstance(message, dict) and message.get("role") == "assistant":
             return message
     return {}
 
 
-def _extract_text_content(message: dict) -> str:
-    """Extract text from a message, handling multimodal content arrays."""
+def _extract_output_text(output: list) -> str:
+    """Concatenate visible assistant text from a structured `output` array.
+
+    Mirrors OWUI's own convert_output_to_messages: only `message` items and their
+    `output_text` parts are visible text. Reasoning items are excluded (they are
+    counted separately as reasoning tokens and are often hidden by the provider).
+    """
+    if not isinstance(output, list):
+        return ""
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        for part in item.get("content", []) or []:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                text = part.get("text", "")
+                if text:
+                    parts.append(text if isinstance(text, str) else str(text))
+    return "".join(parts)
+
+
+def _message_text(message: dict) -> str:
+    """Best-effort visible text of a message: content if present, else output."""
     content = message.get("content", "")
-    if isinstance(content, str):
+    if isinstance(content, str) and content:
         return content
     if isinstance(content, list):
-        parts = []
+        chunks = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(item.get("text", ""))
+                chunks.append(item.get("text", ""))
             elif isinstance(item, str):
-                parts.append(item)
-        return " ".join(parts)
-    return str(content) if content else ""
+                chunks.append(item)
+        if chunks:
+            return " ".join(c for c in chunks if c)
+    # Streaming assistant messages keep their text only in `output`.
+    return _extract_output_text(message.get("output", []))
 
 
-def _count_tokens_tiktoken(text: str, model: str = "") -> int:
-    """Estimate token count using tiktoken. Falls back to cl100k_base."""
+def _count_tokens_tiktoken(text: str, model: str = "") -> int | None:
+    """Estimate token count with tiktoken. Returns None if tiktoken is unavailable."""
+    if not _TIKTOKEN_AVAILABLE or not text:
+        return None if not _TIKTOKEN_AVAILABLE else 0
     try:
         encoding = tiktoken.encoding_for_model(model)
     except (KeyError, ValueError):
@@ -52,84 +243,98 @@ def _count_tokens_tiktoken(text: str, model: str = "") -> int:
 
 
 def _format_duration(seconds: float) -> str:
-    """Format elapsed time in a human-friendly way."""
+    """Human-friendly elapsed time."""
     if seconds < 1.0:
         return f"{seconds * 1000:.0f}ms"
-    elif seconds < 60.0:
+    if seconds < 60.0:
         return f"{seconds:.1f}s"
-    else:
-        minutes = int(seconds // 60)
-        secs = seconds % 60
-        return f"{minutes}m {secs:.0f}s"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes}m {secs:.0f}s"
+
+
+def _format_k(n: float) -> str:
+    """Compact k/M token formatting for context display (e.g. 3.5k, 1.0M)."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return f"{int(n)}"
 
 
 class Filter:
     class Valves(BaseModel):
         priority: int = Field(
             default=10,
-            description="Filter priority (lower = runs first). Set high (e.g., 10) so this runs after other filters.",
+            description="Filter priority (lower runs first). Keep high so this runs after other filters.",
         )
-        show_input_tokens: bool = Field(
-            default=True,
-            description="Display input (prompt) token count.",
+        show_input_tokens: bool = Field(default=True, description="Display input (prompt) token count.")
+        show_output_tokens: bool = Field(default=True, description="Display output (completion) token count.")
+        show_total_tokens: bool = Field(default=True, description="Display total token count.")
+        show_generation_time: bool = Field(default=True, description="Display generation time.")
+        show_tokens_per_second: bool = Field(default=True, description="Display output tokens per second.")
+        show_reasoning_tokens: bool = Field(
+            default=True, description="Display reasoning/thinking tokens (o1/o3/o4, Gemini thinking)."
         )
-        show_output_tokens: bool = Field(
-            default=True,
-            description="Display output (completion) token count.",
-        )
-        show_total_tokens: bool = Field(
-            default=True,
-            description="Display total token count.",
-        )
-        show_generation_time: bool = Field(
-            default=True,
-            description="Display generation wall-clock time.",
-        )
-        show_tokens_per_second: bool = Field(
-            default=True,
-            description="Display output tokens per second.",
-        )
+        show_cached_tokens: bool = Field(default=True, description="Display cached prompt tokens (cache hits).")
+        show_audio_tokens: bool = Field(default=False, description="Display audio tokens (gpt-4o-audio etc.).")
+        show_model_name: bool = Field(default=True, description="Display base model name for workspace models.")
         show_data_source: bool = Field(
-            default=False,
-            description="Indicate whether token counts are API-reported or estimated.",
+            default=False, description="Append [API]/[est.] to indicate token count source."
         )
         fallback_to_tiktoken: bool = Field(
-            default=True,
-            description="Estimate tokens with tiktoken when API-reported usage is unavailable.",
+            default=True, description="Estimate tokens with tiktoken when the API reports no usage (needs tiktoken)."
         )
         count_all_messages_for_input: bool = Field(
             default=True,
-            description="When estimating input tokens, count all messages (not just the last user message).",
+            description="When estimating input tokens, count the whole conversation, not just the last turn.",
         )
-        show_reasoning_tokens: bool = Field(
-            default=True,
-            description="Display reasoning/thinking tokens (for o1/o3/o4/Gemini thinking models).",
+        # --- Context-window utilization ---
+        show_context_window: bool = Field(
+            default=True, description="Display context-window utilization (used/available + %)."
         )
-        show_cached_tokens: bool = Field(
-            default=True,
-            description="Display cached prompt tokens (prompt cache hit count).",
+        context_size_override: int = Field(
+            default=0, description="Force a context-window size (tokens). 0 = auto-detect. Highest priority."
         )
-        show_audio_tokens: bool = Field(
+        context_size_map: str = Field(
+            default="",
+            description='JSON object of {"model-substring": context_tokens} merged over the built-in table.',
+        )
+        fetch_context_from_modelsdev: bool = Field(
             default=False,
-            description="Display audio tokens (for audio-capable models like gpt-4o-audio).",
+            description="Live context sizes from models.dev (opt-in, cached). Overrides the static table on match.",
         )
-        show_model_name: bool = Field(
-            default=True,
-            description="Display base model name for custom workspace models.",
+        modelsdev_url: str = Field(
+            default="https://models.dev/models.json",
+            description="models.dev endpoint used when fetch_context_from_modelsdev is on.",
+        )
+        modelsdev_ttl: int = Field(
+            default=86400, description="Seconds to cache the fetched models.dev context table (default 24h)."
+        )
+        context_warn_percent: int = Field(default=80, description="Context %% at which the icon turns orange.")
+        context_critical_percent: int = Field(default=95, description="Context %% at which the icon turns red.")
+        llamacpp_url: str = Field(
+            default="",
+            description="Optional llama.cpp base URL (e.g. http://127.0.0.1:8080) for /props n_ctx probe. Empty=off.",
+        )
+        llama_swap_url: str = Field(
+            default="",
+            description="Optional llama-swap base URL to probe /running for --ctx-size. Empty = off.",
+        )
+        context_probe_ttl: int = Field(
+            default=600, description="Seconds to cache a probed/resolved context size."
         )
         debug_mode: bool = Field(
-            default=False,
-            description="Emit an additional status event with raw payload (info/usage/body/metadata keys). Use to diagnose missing widget on 0.9.x.",
+            default=False, description="Emit an extra status event with the raw payload for diagnostics."
         )
 
     class UserValves(BaseModel):
-        enabled: bool = Field(
-            default=True,
-            description="Show token usage stats below responses.",
-        )
+        enabled: bool = Field(default=True, description="Show token usage stats below responses.")
 
     def __init__(self):
         self.valves = self.Valves()
+
+    # --- inlet: record start time + capture context hints ----------------------
 
     async def inlet(
         self,
@@ -137,33 +342,37 @@ class Filter:
         __user__: dict | None = None,
         __metadata__: dict | None = None,
     ) -> dict:
-        """Record the request start time before the LLM call."""
-        # Build a unique key from available identifiers
-        chat_id = ""
-        if __metadata__:
-            chat_id = __metadata__.get("chat_id", "") or ""
-        message_id = ""
-        if __metadata__:
-            message_id = __metadata__.get("message_id", "") or ""
-        key = (
-            f"{chat_id}:{message_id}"
-            if chat_id or message_id
-            else f"fallback:{id(body)}"
-        )
+        """Stash a start timestamp and any context-size hint for the outlet."""
+        chat_id = (__metadata__ or {}).get("chat_id", "") or ""
+        message_id = (__metadata__ or {}).get("message_id", "") or ""
+        key = f"{chat_id}:{message_id}" if (chat_id or message_id) else f"fallback:{id(body)}"
 
         start_time = time.time()
         _request_timings[key] = start_time
 
-        if "metadata" not in body:
+        # num_ctx is only visible in the inbound body (OWUI strips model.info.params).
+        num_ctx = (
+            _first_num(body, "num_ctx")
+            or _first_num(body.get("options", {}) if isinstance(body.get("options"), dict) else {}, "num_ctx")
+            or _first_num(body.get("params", {}) if isinstance(body.get("params"), dict) else {}, "num_ctx")
+        )
+
+        if "metadata" not in body or not isinstance(body.get("metadata"), dict):
             body["metadata"] = {}
         body["metadata"]["_tud_timing_key"] = key
         body["metadata"]["_tud_start"] = start_time
+        if num_ctx:
+            body["metadata"]["_tud_num_ctx"] = int(num_ctx)
 
         if __metadata__ is not None:
             __metadata__["_tud_timing_key"] = key
             __metadata__["_tud_start"] = start_time
+            if num_ctx:
+                __metadata__["_tud_num_ctx"] = int(num_ctx)
 
         return body
+
+    # --- outlet: build and emit the stats line ---------------------------------
 
     async def outlet(
         self,
@@ -173,308 +382,453 @@ class Filter:
         __metadata__: dict | None = None,
         __model__: dict | None = None,
     ) -> dict:
-        """Extract token usage and emit a status event with the stats."""
-
-        # Check if user has disabled this via UserValves
         if __user__ and __user__.get("valves"):
             user_valves = __user__["valves"]
             if hasattr(user_valves, "enabled") and not user_valves.enabled:
                 return body
 
-        # Skip non-chat tasks (title generation, tag generation, etc.)
-        task = None
-        if __metadata__:
-            task = __metadata__.get("task")
-        if task and task in (
+        # Skip non-chat background tasks (title/tag/query/etc.).
+        task = (__metadata__ or {}).get("task")
+        if task in (
             "title_generation",
             "tags_generation",
             "follow_up_generation",
             "emoji_generation",
             "query_generation",
             "autocomplete_generation",
+            "moa_response_generation",
         ):
             return body
 
         messages = body.get("messages", [])
         if not messages:
             return body
-
         assistant_msg = _get_last_assistant_message_obj(messages)
         if not assistant_msg:
             return body
 
-        # --- Extract timing (multi-level fallback: __metadata__ -> body -> module dict) ---
-        elapsed_seconds = None
+        v = self.valves
+
+        elapsed_seconds = self._resolve_wall_clock(body, __metadata__)
+        usage = assistant_msg.get("usage") if isinstance(assistant_msg.get("usage"), dict) else None
+
+        tokens = self._extract_tokens(usage, assistant_msg, messages, body, __model__)
+        timing = self._resolve_timing(usage, elapsed_seconds, tokens["output"])
+        ctx = await self._resolve_context(body, __metadata__, __model__, tokens)
+
+        stats_parts = self._build_stats(v, tokens, timing, ctx, __model__)
+
+        if stats_parts and __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {"description": " · ".join(stats_parts), "done": True},
+                }
+            )
+
+        if v.debug_mode and __event_emitter__:
+            await self._emit_debug(__event_emitter__, task, messages, assistant_msg, usage, tokens, timing, ctx)
+
+        return body
+
+    # --- token extraction ------------------------------------------------------
+
+    def _extract_tokens(
+        self,
+        usage: dict | None,
+        assistant_msg: dict,
+        messages: list,
+        body: dict,
+        model: dict | None,
+    ) -> dict:
+        """Return a normalized bag of token counts across all providers/APIs."""
+        result = {
+            "input": None,
+            "output": None,
+            "total": None,
+            "reasoning": None,
+            "cached": None,
+            "cache_write": None,
+            "audio": None,
+            "is_api": False,
+            "is_anthropic": False,
+        }
+
+        if usage:
+            # Primary: OWUI-normalized triple; provider keys as backup.
+            result["input"] = _first_num(usage, "input_tokens", "prompt_tokens", "prompt_eval_count", "prompt_n")
+            result["output"] = _first_num(usage, "output_tokens", "completion_tokens", "eval_count", "predicted_n")
+            if result["input"] is not None or result["output"] is not None:
+                result["is_api"] = True
+
+            # Reasoning: Chat Completions vs Responses API naming.
+            result["reasoning"] = _detail_num(usage, "completion_tokens_details", "reasoning_tokens") or _detail_num(
+                usage, "output_tokens_details", "reasoning_tokens"
+            )
+
+            # Cached prompt tokens: OpenAI (subset of input) vs Anthropic (extra).
+            openai_cached = _detail_num(usage, "prompt_tokens_details", "cached_tokens") or _detail_num(
+                usage, "input_tokens_details", "cached_tokens"
+            )
+            anth_read = _num(usage.get("cache_read_input_tokens"))
+            anth_write = _num(usage.get("cache_creation_input_tokens"))
+            result["is_anthropic"] = anth_read is not None or anth_write is not None
+            result["cached"] = anth_read if result["is_anthropic"] else openai_cached
+            result["cache_write"] = anth_write
+
+            # Audio tokens (input+output), either naming.
+            audio_out = _detail_num(usage, "completion_tokens_details", "audio_tokens") or _detail_num(
+                usage, "output_tokens_details", "audio_tokens"
+            )
+            audio_in = _detail_num(usage, "prompt_tokens_details", "audio_tokens") or _detail_num(
+                usage, "input_tokens_details", "audio_tokens"
+            )
+            total_audio = (audio_in or 0) + (audio_out or 0)
+            result["audio"] = total_audio or None
+
+        # Fallback estimation when the provider reported no usage.
+        if not result["is_api"] and self.valves.fallback_to_tiktoken and _TIKTOKEN_AVAILABLE:
+            self._estimate_tokens(result, assistant_msg, messages, body, model)
+
+        # Derived total (Anthropic cache is additional to input; OpenAI already inside it).
+        result["total"] = self._compute_total(usage, result)
+        return result
+
+    def _estimate_tokens(
+        self, result: dict, assistant_msg: dict, messages: list, body: dict, model: dict | None
+    ) -> None:
+        """tiktoken estimate of input/output tokens when the provider reported no usage."""
+        model_id = ""
+        if isinstance(model, dict):
+            model_id = model.get("id", "") or ""
+        if not model_id:
+            model_id = body.get("model", "") or ""
+
+        response_text = _message_text(assistant_msg)
+        if response_text:
+            est_out = _count_tokens_tiktoken(response_text, model_id)
+            if est_out is not None:
+                result["output"] = est_out
+
+        if self.valves.count_all_messages_for_input:
+            parts = [_message_text(m) for m in messages if m is not assistant_msg]
+            est_in = _count_tokens_tiktoken(" ".join(p for p in parts if p), model_id)
+        else:
+            est_in = None
+            for m in reversed(messages):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    est_in = _count_tokens_tiktoken(_message_text(m), model_id)
+                    break
+        if est_in is not None:
+            result["input"] = est_in
+
+    def _compute_total(self, usage: dict | None, result: dict) -> int | None:
+        inp = result["input"]
+        out = result["output"]
+        if result["is_anthropic"]:
+            eff = (inp or 0) + (result["cached"] or 0) + (result["cache_write"] or 0)
+            if inp is None and out is None:
+                return None
+            return eff + (out or 0)
+        if usage:
+            total = _num(usage.get("total_tokens"))
+            if total is not None:
+                return int(total)
+        if inp is None and out is None:
+            return None
+        return (inp or 0) + (out or 0)
+
+    # --- timing ----------------------------------------------------------------
+
+    def _resolve_wall_clock(self, body: dict, metadata: dict | None) -> float | None:
+        """Wall-clock seconds from inlet->outlet (multi-level fallback + leak cleanup)."""
         start_time = None
-
-        if __metadata__:
-            start_time = __metadata__.get("_tud_start")
-
+        if metadata:
+            start_time = metadata.get("_tud_start")
         if start_time is None:
             body_meta = body.get("metadata", {})
             if isinstance(body_meta, dict):
                 start_time = body_meta.get("_tud_start")
 
-        if start_time is None:
-            timing_key = None
-            if __metadata__:
-                timing_key = __metadata__.get("_tud_timing_key")
-            if not timing_key:
-                body_meta = body.get("metadata", {})
-                if isinstance(body_meta, dict):
-                    timing_key = body_meta.get("_tud_timing_key")
-            if not timing_key and __metadata__:
-                chat_id = __metadata__.get("chat_id", "") or ""
-                message_id = __metadata__.get("message_id", "") or ""
-                if chat_id or message_id:
-                    timing_key = f"{chat_id}:{message_id}"
-            if timing_key and timing_key in _request_timings:
-                start_time = _request_timings.pop(timing_key)
+        # Reconstruct the module-dict key and ALWAYS pop it (fixes the leak where
+        # the metadata path resolved timing but never released the module entry).
+        timing_key = None
+        if metadata:
+            timing_key = metadata.get("_tud_timing_key")
+        if not timing_key:
+            body_meta = body.get("metadata", {})
+            if isinstance(body_meta, dict):
+                timing_key = body_meta.get("_tud_timing_key")
+        if not timing_key and metadata:
+            chat_id = metadata.get("chat_id", "") or ""
+            message_id = metadata.get("message_id", "") or ""
+            if chat_id or message_id:
+                timing_key = f"{chat_id}:{message_id}"
+        if timing_key:
+            popped = _request_timings.pop(timing_key, None)
+            if start_time is None:
+                start_time = popped
 
-        if start_time is not None:
-            elapsed_seconds = time.time() - start_time
-        else:
-            cutoff = time.time() - 600
-            stale_keys = [k for k, v in _request_timings.items() if v < cutoff]
-            for k in stale_keys:
-                _request_timings.pop(k, None)
+        # Drop stale entries so the module dict cannot grow unbounded.
+        cutoff = time.time() - 600
+        for k in [k for k, ts in _request_timings.items() if ts < cutoff]:
+            _request_timings.pop(k, None)
 
-        # --- Extract token usage ---
-        input_tokens = None
-        output_tokens = None
-        is_api_reported = False
+        return (time.time() - start_time) if start_time is not None else None
 
-        body_usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
-        body_info = body.get("info") if isinstance(body.get("info"), dict) else None
+    def _resolve_timing(self, usage: dict | None, wall_seconds: float | None, output_tokens) -> dict:
+        """Prefer provider-reported generation time/tps; else labeled wall-clock."""
+        gen_seconds = None
+        tps = None
+        source = None
 
-        def _pick_input(src: dict) -> int | None:
-            return (
-                src.get("prompt_eval_count")
-                or src.get("prompt_tokens")
-                or src.get("input_tokens")
-            )
+        if usage:
+            eval_dur = _num(usage.get("eval_duration"))  # Ollama, nanoseconds
+            predicted_ms = _num(usage.get("predicted_ms"))  # llama.cpp
+            if eval_dur and eval_dur > 0:
+                gen_seconds, source = eval_dur / 1e9, "provider"
+            elif predicted_ms and predicted_ms > 0:
+                gen_seconds, source = predicted_ms / 1000.0, "provider"
 
-        def _pick_output(src: dict) -> int | None:
-            return (
-                src.get("eval_count")
-                or src.get("completion_tokens")
-                or src.get("output_tokens")
-            )
+            ollama_tps = usage.get("response_token/s")
+            llama_tps = _num(usage.get("predicted_per_second"))
+            if _num(ollama_tps) is not None:
+                tps = _num(ollama_tps)
+            elif llama_tps is not None:
+                tps = llama_tps
+            elif source == "provider" and output_tokens and gen_seconds:
+                tps = output_tokens / gen_seconds
 
-        # Method 1: Read API-reported usage from assistant message "info" dict
-        info = assistant_msg.get("info", {})
-        if isinstance(info, dict) and info:
-            input_tokens = _pick_input(info)
-            output_tokens = _pick_output(info)
-            if input_tokens is not None or output_tokens is not None:
-                is_api_reported = True
-                input_tokens = input_tokens or 0
-                output_tokens = output_tokens or 0
+        if gen_seconds is None and wall_seconds is not None:
+            gen_seconds, source = wall_seconds, "wall"
+        if tps is None and output_tokens and wall_seconds and wall_seconds > 0:
+            tps = output_tokens / wall_seconds  # approximate; wall-clock includes pre-processing
 
-        # Method 2: Check "usage" key directly on the message
-        if not is_api_reported:
-            usage = assistant_msg.get("usage", {})
-            if isinstance(usage, dict) and usage:
-                input_tokens = _pick_input(usage)
-                output_tokens = _pick_output(usage)
-                if input_tokens is not None or output_tokens is not None:
-                    is_api_reported = True
-                    input_tokens = input_tokens or 0
-                    output_tokens = output_tokens or 0
+        return {"seconds": gen_seconds, "tps": tps, "source": source}
 
-        # Method 2b: Body-level usage/info (0.9.x may surface tokens at body root)
-        if not is_api_reported:
-            for src in (body_usage, body_info):
-                if isinstance(src, dict) and src:
-                    input_tokens = _pick_input(src)
-                    output_tokens = _pick_output(src)
-                    if input_tokens is not None or output_tokens is not None:
-                        is_api_reported = True
-                        input_tokens = input_tokens or 0
-                        output_tokens = output_tokens or 0
-                        break
+    # --- context window --------------------------------------------------------
 
-        # Method 3: Fallback to tiktoken estimation
-        if not is_api_reported and self.valves.fallback_to_tiktoken:
-            model_id = ""
-            if __model__ and isinstance(__model__, dict):
-                model_id = __model__.get("id", "")
-            elif body.get("model"):
-                model_id = body["model"]
+    async def _resolve_context(self, body, metadata, model, tokens) -> dict:
+        if not self.valves.show_context_window:
+            return {"size": None, "used": None}
 
-            # Estimate output tokens from assistant response
-            response_text = _extract_text_content(assistant_msg)
-            if response_text:
-                output_tokens = _count_tokens_tiktoken(response_text, model_id)
+        used = tokens["total"]
+        if used is None:
+            used = (tokens["input"] or 0) + (tokens["output"] or 0) or None
 
-            # Estimate input tokens from conversation messages
-            if self.valves.count_all_messages_for_input:
-                input_text_parts = []
-                for msg in messages:
-                    if msg.get("role") != "assistant" or msg is not assistant_msg:
-                        if msg is not assistant_msg:
-                            input_text_parts.append(_extract_text_content(msg))
-                input_tokens = _count_tokens_tiktoken(
-                    " ".join(input_text_parts), model_id
-                )
-            else:
-                # Just count the last user message
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        input_tokens = _count_tokens_tiktoken(
-                            _extract_text_content(msg), model_id
-                        )
-                        break
+        model_id = ""
+        if isinstance(model, dict):
+            model_id = model.get("id", "") or ""
+        if not model_id:
+            model_id = body.get("model", "") or ""
 
-        # --- Extract detailed token breakdown ---
-        reasoning_tokens = None
-        cached_tokens = None
-        audio_tokens_in = None
-        audio_tokens_out = None
+        size = await self._context_size_for(model_id, metadata)
+        return {"size": size, "used": used}
 
-        for source in (
-            assistant_msg.get("info", {}),
-            assistant_msg.get("usage", {}),
-            body_info or {},
-            body_usage or {},
-        ):
-            if not isinstance(source, dict) or not source:
-                continue
+    async def _context_size_for(self, model_id: str, metadata: dict | None) -> int | None:
+        v = self.valves
+        # 1) Explicit override.
+        if v.context_size_override and v.context_size_override > 0:
+            return int(v.context_size_override)
+        # 2) num_ctx captured at inlet (Ollama/local models).
+        hint = (metadata or {}).get("_tud_num_ctx")
+        if isinstance(hint, int) and hint > 0:
+            return hint
 
-            # completion_tokens_details
-            comp_details = source.get("completion_tokens_details")
-            if isinstance(comp_details, dict):
-                if reasoning_tokens is None:
-                    val = comp_details.get("reasoning_tokens")
-                    if isinstance(val, (int, float)) and val > 0:
-                        reasoning_tokens = int(val)
-                if audio_tokens_out is None:
-                    val = comp_details.get("audio_tokens")
-                    if isinstance(val, (int, float)) and val > 0:
-                        audio_tokens_out = int(val)
+        cache_key = model_id.lower()
+        cached = _ctx_size_cache.get(cache_key)
+        if cached and cached[1] > time.time():
+            return cached[0]
 
-            # prompt_tokens_details
-            prompt_details = source.get("prompt_tokens_details")
-            if isinstance(prompt_details, dict):
-                if cached_tokens is None:
-                    val = prompt_details.get("cached_tokens")
-                    if isinstance(val, (int, float)) and val > 0:
-                        cached_tokens = int(val)
-                if audio_tokens_in is None:
-                    val = prompt_details.get("audio_tokens")
-                    if isinstance(val, (int, float)) and val > 0:
-                        audio_tokens_in = int(val)
+        size = None
+        # 3) Live models.dev lookup (opt-in; cached ~24h).
+        if v.fetch_context_from_modelsdev:
+            size = await self._modelsdev_lookup(model_id)
+        # 4) Static table (+ user map override), matched by substring.
+        if size is None:
+            size = self._table_lookup(model_id)
+        # 5) Optional endpoint probe for local backends (opt-in via valve URL).
+        if size is None and (v.llamacpp_url or v.llama_swap_url):
+            size = await self._probe_context(model_id)
 
-            # Anthropic-style cache fields at top level (read + write)
-            if cached_tokens is None:
-                val = source.get("cache_read_input_tokens")
-                if isinstance(val, (int, float)) and val > 0:
-                    cached_tokens = int(val)
-            if cached_tokens is None:
-                val = source.get("cache_creation_input_tokens")
-                if isinstance(val, (int, float)) and val > 0:
-                    cached_tokens = int(val)
+        if size is not None:
+            _ctx_size_cache[cache_key] = (size, time.time() + max(60, v.context_probe_ttl))
+        return size
 
-        # --- Extract base model name for custom workspace models ---
-        base_model_name = None
-        if self.valves.show_model_name and __model__ and isinstance(__model__, dict):
-            info = __model__.get("info")
-            if isinstance(info, dict):
-                base_model_id = info.get("base_model_id")
-                if base_model_id:
-                    base_model_name = base_model_id
+    async def _modelsdev_map(self) -> dict:
+        """Fetch and cache {model_id -> context_tokens} from models.dev. Non-fatal."""
+        now = time.time()
+        if _modelsdev_cache.get("map") is not None and _modelsdev_cache.get("expiry", 0) > now:
+            return _modelsdev_cache["map"]
 
-        # --- Build stats display ---
-        stats_parts = []
-
-        if self.valves.show_input_tokens and input_tokens is not None:
-            stats_parts.append(f"⬆︎ {input_tokens:,}")
-
-        if self.valves.show_output_tokens and output_tokens is not None:
-            stats_parts.append(f"⬇︎ {output_tokens:,}")
-
-        if (
-            self.valves.show_total_tokens
-            and input_tokens is not None
-            and output_tokens is not None
-        ):
-            total = input_tokens + output_tokens
-            stats_parts.append(f"Σ {total:,}")
-
-        if self.valves.show_reasoning_tokens and reasoning_tokens is not None:
-            stats_parts.append(f"🧠 {reasoning_tokens:,}")
-
-        if self.valves.show_cached_tokens and cached_tokens is not None:
-            stats_parts.append(f"💾 {cached_tokens:,}")
-
-        if self.valves.show_audio_tokens:
-            total_audio = (audio_tokens_in or 0) + (audio_tokens_out or 0)
-            if total_audio > 0:
-                stats_parts.append(f"🔊 {total_audio:,}")
-
-        if self.valves.show_generation_time and elapsed_seconds is not None:
-            stats_parts.append(f"⏱ {_format_duration(elapsed_seconds)}")
-
-        if (
-            self.valves.show_tokens_per_second
-            and output_tokens
-            and elapsed_seconds
-            and elapsed_seconds > 0
-        ):
-            tps = output_tokens / elapsed_seconds
-            stats_parts.append(f"⚡ {tps:.1f} t/s")
-
-        if self.valves.show_model_name and base_model_name:
-            stats_parts.append(f"🤖 {base_model_name}")
-
-        if self.valves.show_data_source and stats_parts:
-            label = "API" if is_api_reported else "est."
-            stats_parts.append(f"[{label}]")
-
-        # --- Emit status event ---
-        if stats_parts and __event_emitter__:
-            stats_string = " · ".join(stats_parts)
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": stats_string,
-                        "done": True,
-                    },
-                }
-            )
-
-        if self.valves.debug_mode and __event_emitter__:
-            debug_payload = {
-                "task": task,
-                "messages_count": len(messages),
-                "assistant_keys": sorted(assistant_msg.keys()),
-                "assistant_info": assistant_msg.get("info"),
-                "assistant_usage": assistant_msg.get("usage"),
-                "body_keys": sorted(body.keys()),
-                "body_usage": body_usage,
-                "body_info": body_info,
-                "metadata_keys": sorted(__metadata__.keys()) if __metadata__ else [],
-                "model_id": (__model__ or {}).get("id"),
-                "is_api_reported": is_api_reported,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "reasoning_tokens": reasoning_tokens,
-                "cached_tokens": cached_tokens,
-                "elapsed_seconds": elapsed_seconds,
-            }
+        result: dict = {}
+        if _AIOHTTP_AVAILABLE:
             try:
-                debug_str = json.dumps(debug_payload, default=str, ensure_ascii=False)
-            except Exception as exc:
-                debug_str = f"serialization error: {exc}"
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"[TUD debug] {debug_str}",
-                        "done": True,
-                    },
-                }
-            )
+                timeout = aiohttp.ClientTimeout(total=5)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(self.valves.modelsdev_url) as resp:
+                        data = await resp.json(content_type=None)
+                if isinstance(data, dict):
+                    for key, entry in data.items():
+                        limit = entry.get("limit") if isinstance(entry, dict) else None
+                        ctx = _num(limit.get("context")) if isinstance(limit, dict) else None
+                        if ctx:
+                            full = str(key).lower()
+                            result[full] = int(ctx)
+                            result.setdefault(full.split("/")[-1], int(ctx))
+            except Exception:
+                result = {}
 
-        return body
+        # Cache success for the full TTL; a failure only briefly so it retries soon.
+        ttl = self.valves.modelsdev_ttl if result else min(300, self.valves.modelsdev_ttl)
+        _modelsdev_cache["map"] = result
+        _modelsdev_cache["expiry"] = now + max(60, ttl)
+        return result
+
+    async def _modelsdev_lookup(self, model_id: str) -> int | None:
+        table = await self._modelsdev_map()
+        if not table:
+            return None
+        mid = (model_id or "").lower()
+        if mid in table:
+            return table[mid]
+        bare = mid.split("/")[-1]
+        if bare in table:
+            return table[bare]
+        for key in sorted(table, key=len, reverse=True):
+            if key in mid:
+                return table[key]
+        return None
+
+    async def _probe_context(self, model_id: str) -> int | None:
+        """Best-effort probe of a local backend for its running context size.
+
+        Fully isolated: any failure returns None and never affects the stats line.
+        """
+        if not _AIOHTTP_AVAILABLE:
+            return None
+        v = self.valves
+        try:
+            timeout = aiohttp.ClientTimeout(total=2)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # llama-swap: /running lists models with their launch command (--ctx-size).
+                if v.llama_swap_url:
+                    try:
+                        async with session.get(v.llama_swap_url.rstrip("/") + "/running") as resp:
+                            data = await resp.json(content_type=None)
+                        size = self._parse_llama_swap(data)
+                        if size:
+                            return size
+                    except Exception:
+                        pass
+                # llama.cpp: /props reports the loaded model's n_ctx.
+                if v.llamacpp_url:
+                    try:
+                        async with session.get(v.llamacpp_url.rstrip("/") + "/props") as resp:
+                            data = await resp.json(content_type=None)
+                        gen = data.get("default_generation_settings") if isinstance(data, dict) else None
+                        n_ctx = _first_num(data, "n_ctx") or _first_num(gen if isinstance(gen, dict) else {}, "n_ctx")
+                        if n_ctx:
+                            return int(n_ctx)
+                    except Exception:
+                        pass
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _parse_llama_swap(data) -> int | None:
+        """Extract --ctx-size from a llama-swap /running payload."""
+        rows = data.get("running", []) if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            cmd = row.get("cmd") or row.get("command") or ""
+            if isinstance(cmd, list):
+                cmd = " ".join(str(c) for c in cmd)
+            match = re.search(r"--ctx-size[= ]+(\d+)", str(cmd))
+            if match:
+                return int(match.group(1))
+        return None
+
+    def _table_lookup(self, model_id: str) -> int | None:
+        table = dict(_STATIC_CONTEXT_SIZES)
+        if self.valves.context_size_map:
+            try:
+                user_map = json.loads(self.valves.context_size_map)
+                if isinstance(user_map, dict):
+                    table.update({str(k).lower(): int(val) for k, val in user_map.items()})
+            except Exception:
+                pass
+        mid = (model_id or "").lower()
+        # Longest key first so specific matches (gpt-4o) beat generic (gpt-4).
+        for key in sorted(table, key=len, reverse=True):
+            if key in mid:
+                return table[key]
+        return None
+
+    # --- display ---------------------------------------------------------------
+
+    def _build_stats(self, v, tokens, timing, ctx, model) -> list:
+        parts: list[str] = []
+
+        if v.show_input_tokens and tokens["input"] is not None:
+            parts.append(f"⬆︎ {int(tokens['input']):,}")
+        if v.show_output_tokens and tokens["output"] is not None:
+            parts.append(f"⬇︎ {int(tokens['output']):,}")
+        if v.show_total_tokens and tokens["total"] is not None:
+            parts.append(f"Σ {int(tokens['total']):,}")
+        if v.show_reasoning_tokens and tokens["reasoning"]:
+            parts.append(f"🧠 {int(tokens['reasoning']):,}")
+        if v.show_cached_tokens and tokens["cached"]:
+            parts.append(f"💾 {int(tokens['cached']):,}")
+        if v.show_audio_tokens and tokens["audio"]:
+            parts.append(f"🔊 {int(tokens['audio']):,}")
+
+        if v.show_context_window and ctx["size"] and ctx["used"] is not None:
+            pct = (ctx["used"] / ctx["size"]) * 100 if ctx["size"] else 0
+            icon = "📐"
+            if pct >= v.context_critical_percent:
+                icon = "🔴"
+            elif pct >= v.context_warn_percent:
+                icon = "🟠"
+            parts.append(f"{icon} {_format_k(ctx['used'])}/{_format_k(ctx['size'])} ({pct:.0f}%)")
+
+        if v.show_generation_time and timing["seconds"] is not None:
+            prefix = "~" if timing["source"] == "wall" else ""
+            parts.append(f"⏱ {prefix}{_format_duration(timing['seconds'])}")
+        if v.show_tokens_per_second and timing["tps"]:
+            parts.append(f"⚡ {timing['tps']:.1f} t/s")
+
+        if v.show_model_name and isinstance(model, dict):
+            info = model.get("info")
+            base = info.get("base_model_id") if isinstance(info, dict) else None
+            if base:
+                parts.append(f"🤖 {base}")
+
+        if v.show_data_source and parts:
+            parts.append(f"[{'API' if tokens['is_api'] else 'est.'}]")
+
+        return parts
+
+    async def _emit_debug(self, emit, task, messages, assistant_msg, usage, tokens, timing, ctx) -> None:
+        content = assistant_msg.get("content")
+        payload = {
+            "task": task,
+            "messages_count": len(messages),
+            "assistant_keys": sorted(assistant_msg.keys()),
+            "usage": usage,
+            "has_output": bool(assistant_msg.get("output")),
+            "content_len": len(content) if isinstance(content, str) else -1,
+            "tokens": tokens,
+            "timing": timing,
+            "ctx": ctx,
+            "tiktoken": _TIKTOKEN_AVAILABLE,
+        }
+        try:
+            text = json.dumps(payload, default=str, ensure_ascii=False)
+        except Exception as exc:
+            text = f"serialization error: {exc}"
+        await emit({"type": "status", "data": {"description": f"[TUD debug] {text}", "done": True}})
