@@ -2,7 +2,7 @@
 title: Token Usage & Cost Display
 author: smetdenis
 version: 2.3.0
-description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The order of these metrics is configurable (admin default + per-user override). Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance, context-window provenance, and a valves snapshot.
+description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """
 
@@ -398,111 +398,153 @@ def _normalize_order(order_str: str) -> tuple[list[str], list[str]]:
     return valid, unknown
 
 
-def _resolve_display_order(admin_order: str, user_order: str) -> list[str]:
-    """Resolve the metric order: non-blank user order wins, else admin, else default.
+def _resolve_display_order(admin_order: str) -> list[str]:
+    """Resolve the admin-configured metric order, else the default.
 
     Returns a permutation of all 13 keys: the parsed (valid) keys first, then the
     remaining keys in default order. Empty input -> _DEFAULT_ORDER unchanged.
     """
-    order_str = (user_order or "").strip() or (admin_order or "").strip()
-    valid, _ = _normalize_order(order_str)
+    valid, _ = _normalize_order(admin_order)
     return valid + [k for k in _DEFAULT_ORDER if k not in valid]
 
 
-def _display_order_debug(admin_order: str, user_order: str) -> dict:
+def _display_order_debug(admin_order: str) -> dict:
     """Provenance of the resolved order for the debug payload (debug_mode only)."""
     au = (admin_order or "").strip()
-    uu = (user_order or "").strip()
-    if uu:
-        source, order_str = "user", uu
-    elif au:
-        source, order_str = "admin", au
-    else:
-        source, order_str = "default", ""
+    source, order_str = ("admin", au) if au else ("default", "")
     valid, unknown = _normalize_order(order_str)
     resolved = valid + [k for k in _DEFAULT_ORDER if k not in valid]
     return {
         "source": source,
         "admin_order": admin_order,
-        "user_order": user_order,
         "parsed": valid,
         "ignored_unknown": unknown,
         "resolved": resolved,
     }
 
 
+# --- icons & number formatting (icon_style / compact_numbers) ------------------
+# Icons are kept OUT of the renderer bodies so a single icon_style switch can swap
+# the whole set. `off` yields "" (bare value); `simple` is monochrome unicode.
+_ICON_EMOJI: dict[str, str] = {
+    "input": "⬆︎", "output": "⬇︎", "total": "Σ", "reasoning": "🧠",
+    "cached": "💾", "audio": "🔊", "time": "⏱", "tps": "⚡",
+    "cost": "💰", "cost_total": "💰Σ", "model": "🤖",
+}
+_ICON_SIMPLE: dict[str, str] = {
+    "input": "↑", "output": "↓", "total": "Σ", "reasoning": "∴",
+    "cached": "≡", "audio": "♪", "time": "◷", "tps": "»",
+    "cost": "", "cost_total": "Σ", "model": "◇",  # cost value already carries "$"
+}
+# context has a severity triplet (normal / warn / critical) instead of a flat icon.
+_CONTEXT_ICONS: dict[str, tuple[str, str, str]] = {
+    "emoji": ("📐", "🟠", "🔴"),
+    "simple": ("○", "◐", "●"),
+    "off": ("", "", ""),
+}
+
+
+def _icon(v, key: str) -> str:
+    """Icon glyph for a metric key under the current icon_style ('' when off/none)."""
+    style = getattr(v, "icon_style", "emoji")
+    if style == "off":
+        return ""
+    table = _ICON_SIMPLE if style == "simple" else _ICON_EMOJI
+    return table.get(key, "")
+
+
+def _with_icon(icon: str, body: str) -> str:
+    """Prefix a value with its icon, or return the bare value when there is no icon."""
+    return f"{icon} {body}" if icon else body
+
+
+def _context_icon(v, pct: float) -> str:
+    """Severity icon for context utilization under the current icon_style."""
+    style = getattr(v, "icon_style", "emoji")
+    normal, warn, crit = _CONTEXT_ICONS.get(style, _CONTEXT_ICONS["emoji"])
+    if pct >= v.context_critical_percent:
+        return crit
+    if pct >= v.context_warn_percent:
+        return warn
+    return normal
+
+
+def _fmt_count(v, n) -> str:
+    """Format a token counter: compact k/M when compact_numbers, else grouped digits."""
+    if getattr(v, "compact_numbers", False):
+        return _format_k(n)
+    return f"{int(n):,}"
+
+
 # --- stats-line renderers (one per metric key; None = omitted) ------------------
-# Each is a verbatim extraction of a _build_stats branch. show_* gating lives here,
-# so a disabled or data-less metric returns None and simply does not appear.
+# show_* gating lives here, so a disabled or data-less metric returns None and simply
+# does not appear. Icons come from _icon/_context_icon; counters from _fmt_count.
 
 
 def _render_input(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_input_tokens and tokens["input"] is not None:
-        return f"⬆︎ {int(tokens['input']):,}"
+        return _with_icon(_icon(v, "input"), _fmt_count(v, tokens["input"]))
     return None
 
 
 def _render_output(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_output_tokens and tokens["output"] is not None:
-        return f"⬇︎ {int(tokens['output']):,}"
+        return _with_icon(_icon(v, "output"), _fmt_count(v, tokens["output"]))
     return None
 
 
 def _render_total(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_total_tokens and tokens["total"] is not None:
-        return f"Σ {int(tokens['total']):,}"
+        return _with_icon(_icon(v, "total"), _fmt_count(v, tokens["total"]))
     return None
 
 
 def _render_reasoning(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_reasoning_tokens and tokens["reasoning"]:
-        return f"🧠 {int(tokens['reasoning']):,}"
+        return _with_icon(_icon(v, "reasoning"), _fmt_count(v, tokens["reasoning"]))
     return None
 
 
 def _render_cached(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_cached_tokens and tokens["cached"]:
-        return f"💾 {int(tokens['cached']):,}"
+        return _with_icon(_icon(v, "cached"), _fmt_count(v, tokens["cached"]))
     return None
 
 
 def _render_audio(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_audio_tokens and tokens["audio"]:
-        return f"🔊 {int(tokens['audio']):,}"
+        return _with_icon(_icon(v, "audio"), _fmt_count(v, tokens["audio"]))
     return None
 
 
 def _render_context(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_context_window and ctx["size"] and ctx["used"] is not None:
         pct = (ctx["used"] / ctx["size"]) * 100 if ctx["size"] else 0
-        icon = "📐"
-        if pct >= v.context_critical_percent:
-            icon = "🔴"
-        elif pct >= v.context_warn_percent:
-            icon = "🟠"
-        return f"{icon} {_format_k(ctx['used'])}/{_format_k(ctx['size'])} ({pct:.0f}%)"
+        body = f"{_format_k(ctx['used'])}/{_format_k(ctx['size'])} ({pct:.0f}%)"
+        return _with_icon(_context_icon(v, pct), body)
     return None
 
 
 def _render_time(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_generation_time and timing["seconds"] is not None:
         prefix = "~" if timing["source"] == "wall" else ""
-        return f"⏱ {prefix}{_format_duration(timing['seconds'])}"
+        return _with_icon(_icon(v, "time"), f"{prefix}{_format_duration(timing['seconds'])}")
     return None
 
 
 def _render_tps(v, tokens, timing, ctx, cost, model) -> str | None:
     if v.show_tokens_per_second and timing["tps"]:
-        return f"⚡ {timing['tps']:.1f} t/s"
+        return _with_icon(_icon(v, "tps"), f"{timing['tps']:.1f} t/s")
     return None
 
 
 def _render_cost(v, tokens, timing, ctx, cost, model) -> str | None:
     # No dedicated show_* flag: visibility is driven by cost_mode via the precomputed
-    # cost dict (message is None when cost_mode == off or no price).
-    if cost["message"] is not None:
+    # cost dict (message is None when cost_mode == off or no price). cost_min_display
+    # additionally hides negligible amounts (default 0.0 hides nothing).
+    if cost["message"] is not None and cost["message"] >= v.cost_min_display:
         prefix = "≈" if cost["message_est"] else ""
-        return f"💰 {prefix}{_format_cost(cost['message'])}"
+        return _with_icon(_icon(v, "cost"), f"{prefix}{_format_cost(cost['message'])}")
     return None
 
 
@@ -510,10 +552,11 @@ def _render_cost_total(v, tokens, timing, ctx, cost, model) -> str | None:
     if (
         cost["cumulative"] is not None
         and v.show_cumulative_cost
+        and cost["cumulative"] >= v.cost_min_display
         and (cost["message"] is None or abs(cost["cumulative"] - (cost["message"] or 0)) > 1e-9)
     ):
         prefix = "≈" if cost["cumulative_est"] else ""
-        return f"💰Σ {prefix}{_format_cost(cost['cumulative'])}"
+        return _with_icon(_icon(v, "cost_total"), f"{prefix}{_format_cost(cost['cumulative'])}")
     return None
 
 
@@ -522,12 +565,13 @@ def _render_model(v, tokens, timing, ctx, cost, model) -> str | None:
         info = model.get("info")
         base = info.get("base_model_id") if isinstance(info, dict) else None
         if base:
-            return f"🤖 {base}"
+            return _with_icon(_icon(v, "model"), base)
     return None
 
 
 def _render_source(v, tokens, timing, ctx, cost, model) -> str | None:
-    # The "not shown on its own" guard lives in _build_stats, not here.
+    # The "not shown on its own" guard lives in _build_stats, not here. No icon in any
+    # style: the [API]/[est.] brackets are self-labeling.
     if v.show_data_source:
         return f"[{'API' if tokens['is_api'] else 'est.'}]"
     return None
@@ -580,6 +624,26 @@ class Filter:
                 "it (use show_* for that) — it just moves to the end, like any enabled-but-unlisted metric."
             ),
         )
+        separator: str = Field(
+            default=" · ",
+            description="String placed between stats items in the line (default ' · ').",
+        )
+        icon_style: Literal["emoji", "simple", "off"] = Field(
+            default="emoji",
+            description=(
+                "Icon rendering: 'emoji' (colorful, default), 'simple' (monochrome unicode symbols), "
+                "'off' (no icons — bare values; pure counters like input/output/total become ambiguous, "
+                "while cost/context/time/tps/source stay self-labeled via $, %, s, t/s, [API])."
+            ),
+        )
+        compact_numbers: bool = Field(
+            default=False,
+            description=(
+                "Abbreviate token counters as k/M (e.g. 12,345 -> 12.3k, 1,234,567 -> 1.2M), matching "
+                "the context-window style. Off = full numbers with thousands separators. Affects only "
+                "the six counters (input, output, total, reasoning, cached, audio)."
+            ),
+        )
         fallback_to_tiktoken: bool = Field(
             default=True, description="Estimate tokens with tiktoken when the API reports no usage (needs tiktoken)."
         )
@@ -609,7 +673,7 @@ class Filter:
         modelsdev_ttl: int = Field(
             default=86400, description="Seconds to cache the fetched models.dev context table (default 24h)."
         )
-        context_warn_percent: int = Field(default=25, description="Context %% at which the icon turns orange.")
+        context_warn_percent: int = Field(default=30, description="Context %% at which the icon turns orange.")
         context_critical_percent: int = Field(default=70, description="Context %% at which the icon turns red.")
         llamacpp_url: str = Field(
             default="",
@@ -634,6 +698,13 @@ class Filter:
         show_cumulative_cost: bool = Field(
             default=True, description="Also show the running total cost for the whole chat."
         )
+        cost_min_display: float = Field(
+            default=0.0,
+            description=(
+                "Hide message/cumulative cost when its USD value is below this threshold. Default 0.0 "
+                "shows everything (including $0.00). E.g. 0.0001 drops negligible sub-$0.0001 costs."
+            ),
+        )
         price_map: str = Field(
             default="",
             description=(
@@ -655,13 +726,6 @@ class Filter:
 
     class UserValves(BaseModel):
         enabled: bool = Field(default=True, description="Show token usage stats below responses.")
-        display_order: str = Field(
-            default="",
-            description=(
-                "Personal metric order (overrides the admin display_order). Empty = inherit the "
-                "global setting. Same keys as the admin display_order."
-            ),
-        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -754,7 +818,7 @@ class Filter:
             model_id = body.get("model", "") or ""
         cost = await self._resolve_cost(usage, tokens, messages, model_id)
 
-        stats_parts = self._build_stats(v, tokens, timing, ctx, cost, __model__, user_valves)
+        stats_parts = self._build_stats(v, tokens, timing, ctx, cost, __model__)
         if v.debug_mode:
             stats_parts.append("(debug)")
 
@@ -762,14 +826,14 @@ class Filter:
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {"description": " · ".join(stats_parts), "done": True},
+                    "data": {"description": v.separator.join(stats_parts), "done": True},
                 }
             )
 
         if v.debug_mode and __event_emitter__:
             await self._emit_debug(
                 __event_emitter__, task, messages, assistant_msg, usage,
-                tokens, timing, ctx, cost, __model__, __metadata__, user_valves,
+                tokens, timing, ctx, cost, __model__, __metadata__,
             )
 
         return body
@@ -1411,15 +1475,13 @@ class Filter:
 
     # --- display ---------------------------------------------------------------
 
-    def _build_stats(self, v, tokens, timing, ctx, cost, model, user_valves=None) -> list:
+    def _build_stats(self, v, tokens, timing, ctx, cost, model) -> list:
         """Assemble the stats parts in the resolved metric order.
 
         show_* still gates visibility (each renderer returns None when off/no-data);
         display_order only reorders. Empty order -> byte-identical to the old output.
         """
-        admin_order = getattr(v, "display_order", "") or ""
-        user_order = getattr(user_valves, "display_order", "") if user_valves is not None else ""
-        order = _resolve_display_order(admin_order, user_order)
+        order = _resolve_display_order(getattr(v, "display_order", "") or "")
 
         rendered: list[tuple[str, str]] = []  # (key, part) — key kept for the source guard
         for key in order:
@@ -1532,7 +1594,6 @@ class Filter:
 
     async def _emit_debug(
         self, emit, task, messages, assistant_msg, usage, tokens, timing, ctx, cost, model, metadata,
-        user_valves=None,
     ) -> None:
         """Diagnostics for troubleshooting, in a copyable and untruncated form.
 
@@ -1558,8 +1619,7 @@ class Filter:
             "percent": percent,
         }
 
-        uv_order = getattr(user_valves, "display_order", "") if user_valves is not None else ""
-        display_order_debug = _display_order_debug(self.valves.display_order or "", uv_order)
+        display_order_debug = _display_order_debug(self.valves.display_order or "")
 
         payload = {
             "task": task,
