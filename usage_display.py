@@ -1,10 +1,12 @@
 """
 title: Token Usage & Cost Display
 author: smetdenis
-version: 2.3.0
-description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance, context-window provenance, and a valves snapshot.
+version: 2.4.0
+description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """
+
+from __future__ import annotations
 
 # NOTE (0.9.0+ target, built around the 0.10.x model, verified against source):
 #   * OWUI runs `normalize_usage`/`merge_usage` on every usage-save path, so a
@@ -19,9 +21,14 @@ required_open_webui_version: 0.9.0
 #   * Detail keys differ by API: Chat Completions -> prompt_tokens_details /
 #     completion_tokens_details; Responses API -> input_tokens_details /
 #     output_tokens_details; Anthropic -> top-level cache_read/creation.
-#   * merge_usage sums input/output/total + *_tokens_details, but NOT top-level
-#     Anthropic cache fields nor Ollama durations -> in multi-round tool turns
-#     those reflect the last round only (an OWUI limitation we surface, not fix).
+#   * merge_usage sums input/output/total + top-level cost (USAGE_COST_KEYS) +
+#     *_tokens_details, but NOT top-level Anthropic cache fields nor Ollama
+#     durations -> in multi-round tool turns the token totals AND the native cost
+#     cover the whole turn (every LLM round-trip is summed), while cache/timing
+#     reflect the last round only (an OWUI limitation we surface, not fix).
+#     -> the displayed 💰 already covers Open-WebUI-orchestrated tool/MCP calls;
+#     what it can't see is a surcharge the provider never puts in usage.cost
+#     (e.g. an OpenRouter BYOK web-search engine billed outside the generation).
 #   * 0.9.0+ compatible: the outlet body carries per-message `usage` since 0.9.0 and
 #     normalize_usage exists since 0.8.0, so tokens/context/timing/estimate all work on
 #     0.9.x. Only NATIVE provider cost (USAGE_COST_KEYS) needs 0.10.0+ -> on 0.9.x use
@@ -32,7 +39,7 @@ required_open_webui_version: 0.9.0
 try:
     import tiktoken
 
-    _TIKTOKEN_AVAILABLE = True
+    _TIKTOKEN_AVAILABLE = True  # pragma: no cover - only reached when tiktoken is installed
 except Exception:  # pragma: no cover - environment dependent
     tiktoken = None
     _TIKTOKEN_AVAILABLE = False
@@ -41,7 +48,7 @@ except Exception:  # pragma: no cover - environment dependent
 try:
     import aiohttp
 
-    _AIOHTTP_AVAILABLE = True
+    _AIOHTTP_AVAILABLE = True  # pragma: no cover - only reached when aiohttp is installed
 except Exception:  # pragma: no cover - environment dependent
     aiohttp = None
     _AIOHTTP_AVAILABLE = False
@@ -50,29 +57,29 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 # --- Module-level state --------------------------------------------------------
 
 # Request start times keyed by chat context (wall-clock fallback timing).
-_request_timings: dict = {}
+_request_timings: dict[str, float] = {}
 
-# Context-window size cache: model_key -> (size, expiry_epoch).
-_ctx_size_cache: dict = {}
+# Context-window size cache: model_key -> (size, expiry_epoch, provenance).
+_ctx_size_cache: dict[str, tuple[int | None, float, dict[str, Any]]] = {}
 
 # Cached models.dev lookup table (id -> context tokens): {"map": dict|None, "expiry": epoch}.
-_modelsdev_cache: dict = {"map": None, "expiry": 0.0}
+_modelsdev_cache: dict[str, Any] = {"map": None, "expiry": 0.0}
 
 # Cached models.dev price map (id -> {input,output,cache_read,cache_write} USD/1M): {"map": dict|None, "expiry": epoch}.
-_modelsdev_prices_cache: dict = {"map": None, "expiry": 0.0}
+_modelsdev_prices_cache: dict[str, Any] = {"map": None, "expiry": 0.0}
 
 # Static context-window table — offline default, seeded from models.dev (2026-07).
 # Matched as a case-insensitive substring of the model id; the LONGEST matching key
 # wins, so specific keys (gpt-4o) override generic ones (gpt-4). Enable the
 # `fetch_context_from_modelsdev` valve for always-current sizes across every model.
-_STATIC_CONTEXT_SIZES: dict = {
+_STATIC_CONTEXT_SIZES: dict[str, int] = {
     # --- OpenAI ---
     "gpt-5.5": 1050000,
     "gpt-5.4": 1050000,
@@ -165,7 +172,7 @@ _STATIC_CONTEXT_SIZES: dict = {
 # `fetch_prices_from_modelsdev` for exact, always-current per-provider prices.
 # NOTE: local/free backends (Ollama, llama.cpp, Meta's free Llama API) are omitted on
 # purpose — their price is $0 or varies by host, so estimating would mislead.
-_STATIC_PRICES: dict = {
+_STATIC_PRICES: dict[str, dict[str, float]] = {
     # --- OpenAI ---
     "gpt-5.5": {"input": 5.00, "output": 30.00, "cache_read": 0.50},
     "gpt-5-mini": {"input": 0.25, "output": 2.00, "cache_read": 0.025},
@@ -217,7 +224,7 @@ _STATIC_PRICES: dict = {
 # --- Helpers -------------------------------------------------------------------
 
 
-def _num(value) -> int | float | None:
+def _num(value: Any) -> int | float | None:
     """Return the value if it is a real (non-bool) number, else None."""
     if isinstance(value, bool):
         return None
@@ -226,7 +233,7 @@ def _num(value) -> int | float | None:
     return None
 
 
-def _first_num(src: dict, *keys: str) -> int | float | None:
+def _first_num(src: Any, *keys: str) -> int | float | None:
     """First present numeric value among keys (0 is valid, unlike `or`-chains)."""
     if not isinstance(src, dict):
         return None
@@ -237,7 +244,7 @@ def _first_num(src: dict, *keys: str) -> int | float | None:
     return None
 
 
-def _detail_num(usage: dict, group: str, key: str) -> int | float | None:
+def _detail_num(usage: Any, group: str, key: str) -> int | float | None:
     """Read usage[group][key] as a number (e.g. completion_tokens_details.reasoning_tokens)."""
     if not isinstance(usage, dict):
         return None
@@ -247,7 +254,7 @@ def _detail_num(usage: dict, group: str, key: str) -> int | float | None:
     return None
 
 
-def _get_last_assistant_message_obj(messages: list) -> dict:
+def _get_last_assistant_message_obj(messages: list[Any]) -> dict[str, Any]:
     """Return the last assistant message dict from the message list."""
     for message in reversed(messages):
         if isinstance(message, dict) and message.get("role") == "assistant":
@@ -255,7 +262,7 @@ def _get_last_assistant_message_obj(messages: list) -> dict:
     return {}
 
 
-def _extract_output_text(output: list) -> str:
+def _extract_output_text(output: Any) -> str:
     """Concatenate visible assistant text from a structured `output` array.
 
     Mirrors OWUI's own convert_output_to_messages: only `message` items and their
@@ -278,13 +285,13 @@ def _extract_output_text(output: list) -> str:
     return "".join(parts)
 
 
-def _message_text(message: dict) -> str:
+def _message_text(message: dict[str, Any]) -> str:
     """Best-effort visible text of a message: content if present, else output."""
     content = message.get("content", "")
     if isinstance(content, str) and content:
         return content
     if isinstance(content, list):
-        chunks = []
+        chunks: list[str] = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
                 chunks.append(item.get("text", ""))
@@ -338,7 +345,13 @@ def _format_cost(usd: float) -> str:
     return f"${usd:,.2f}"
 
 
-def _longest_key_match(table: dict, model_id: str) -> str | None:
+def _url_host(url: str) -> str:
+    """Best-effort lowercased host from an http(s) URL (stdlib `re`, no extra import)."""
+    m = re.match(r"https?://([^/?#]+)", url.strip())
+    return m.group(1).lower() if m else ""
+
+
+def _longest_key_match(table: dict[str, Any], model_id: str) -> str | None:
     """Longest case-insensitive substring key of `table` contained in `model_id`, else None.
 
     Single source of truth for the substring lookup used by both context-size and price
@@ -355,7 +368,7 @@ def _longest_key_match(table: dict, model_id: str) -> str | None:
     return None
 
 
-def _modelsdev_match(table: dict, model_id: str) -> str | None:
+def _modelsdev_match(table: dict[str, Any], model_id: str) -> str | None:
     """models.dev key matching `model_id`: exact -> bare (last path segment) -> longest substring."""
     if not isinstance(table, dict) or not table:
         return None
@@ -373,8 +386,19 @@ def _modelsdev_match(table: dict, model_id: str) -> str | None:
 # The 13 metric keys in their default display order (identical to the historical
 # hard-coded order of _build_stats). Registry populated in the renderers section.
 _DEFAULT_ORDER: list[str] = [
-    "input", "output", "total", "reasoning", "cached", "audio", "context",
-    "time", "tps", "cost", "cost_total", "model", "source",
+    "input",
+    "output",
+    "total",
+    "reasoning",
+    "cached",
+    "audio",
+    "context",
+    "time",
+    "tps",
+    "cost",
+    "cost_total",
+    "model",
+    "source",
 ]
 _STATS_KEYS: frozenset[str] = frozenset(_DEFAULT_ORDER)
 
@@ -408,7 +432,7 @@ def _resolve_display_order(admin_order: str) -> list[str]:
     return valid + [k for k in _DEFAULT_ORDER if k not in valid]
 
 
-def _display_order_debug(admin_order: str) -> dict:
+def _display_order_debug(admin_order: str) -> dict[str, Any]:
     """Provenance of the resolved order for the debug payload (debug_mode only)."""
     au = (admin_order or "").strip()
     source, order_str = ("admin", au) if au else ("default", "")
@@ -427,14 +451,30 @@ def _display_order_debug(admin_order: str) -> dict:
 # Icons are kept OUT of the renderer bodies so a single icon_style switch can swap
 # the whole set. `off` yields "" (bare value); `simple` is monochrome unicode.
 _ICON_EMOJI: dict[str, str] = {
-    "input": "⬆︎", "output": "⬇︎", "total": "Σ", "reasoning": "🧠",
-    "cached": "💾", "audio": "🔊", "time": "⏱", "tps": "⚡",
-    "cost": "💰", "cost_total": "💰Σ", "model": "🤖",
+    "input": "⬆︎",
+    "output": "⬇︎",
+    "total": "Σ",
+    "reasoning": "🧠",
+    "cached": "💾",
+    "audio": "🔊",
+    "time": "⏱",
+    "tps": "⚡",
+    "cost": "💰",
+    "cost_total": "💰Σ",
+    "model": "🤖",
 }
 _ICON_SIMPLE: dict[str, str] = {
-    "input": "↑", "output": "↓", "total": "Σ", "reasoning": "∴",
-    "cached": "≡", "audio": "♪", "time": "◷", "tps": "»",
-    "cost": "", "cost_total": "Σ", "model": "◇",  # cost value already carries "$"
+    "input": "↑",
+    "output": "↓",
+    "total": "Σ",
+    "reasoning": "∴",
+    "cached": "≡",
+    "audio": "♪",
+    "time": "◷",
+    "tps": "»",
+    "cost": "",
+    "cost_total": "Σ",
+    "model": "◇",  # cost value already carries "$"
 }
 # context has a severity triplet (normal / warn / critical) instead of a flat icon.
 _CONTEXT_ICONS: dict[str, tuple[str, str, str]] = {
@@ -444,7 +484,7 @@ _CONTEXT_ICONS: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _icon(v, key: str) -> str:
+def _icon(v: Filter.Valves, key: str) -> str:
     """Icon glyph for a metric key under the current icon_style ('' when off/none)."""
     style = getattr(v, "icon_style", "emoji")
     if style == "off":
@@ -458,7 +498,7 @@ def _with_icon(icon: str, body: str) -> str:
     return f"{icon} {body}" if icon else body
 
 
-def _context_icon(v, pct: float) -> str:
+def _context_icon(v: Filter.Valves, pct: float) -> str:
     """Severity icon for context utilization under the current icon_style."""
     style = getattr(v, "icon_style", "emoji")
     normal, warn, crit = _CONTEXT_ICONS.get(style, _CONTEXT_ICONS["emoji"])
@@ -469,7 +509,7 @@ def _context_icon(v, pct: float) -> str:
     return normal
 
 
-def _fmt_count(v, n) -> str:
+def _fmt_count(v: Filter.Valves, n: Any) -> str:
     """Format a token counter: compact k/M when compact_numbers, else grouped digits."""
     if getattr(v, "compact_numbers", False):
         return _format_k(n)
@@ -481,43 +521,92 @@ def _fmt_count(v, n) -> str:
 # does not appear. Icons come from _icon/_context_icon; counters from _fmt_count.
 
 
-def _render_input(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_input(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_input_tokens and tokens["input"] is not None:
         return _with_icon(_icon(v, "input"), _fmt_count(v, tokens["input"]))
     return None
 
 
-def _render_output(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_output(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_output_tokens and tokens["output"] is not None:
         return _with_icon(_icon(v, "output"), _fmt_count(v, tokens["output"]))
     return None
 
 
-def _render_total(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_total(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_total_tokens and tokens["total"] is not None:
         return _with_icon(_icon(v, "total"), _fmt_count(v, tokens["total"]))
     return None
 
 
-def _render_reasoning(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_reasoning(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_reasoning_tokens and tokens["reasoning"]:
         return _with_icon(_icon(v, "reasoning"), _fmt_count(v, tokens["reasoning"]))
     return None
 
 
-def _render_cached(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_cached(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_cached_tokens and tokens["cached"]:
         return _with_icon(_icon(v, "cached"), _fmt_count(v, tokens["cached"]))
     return None
 
 
-def _render_audio(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_audio(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_audio_tokens and tokens["audio"]:
         return _with_icon(_icon(v, "audio"), _fmt_count(v, tokens["audio"]))
     return None
 
 
-def _render_context(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_context(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_context_window and ctx["size"] and ctx["used"] is not None:
         pct = (ctx["used"] / ctx["size"]) * 100 if ctx["size"] else 0
         body = f"{_format_k(ctx['used'])}/{_format_k(ctx['size'])} ({pct:.0f}%)"
@@ -525,20 +614,41 @@ def _render_context(v, tokens, timing, ctx, cost, model) -> str | None:
     return None
 
 
-def _render_time(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_time(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_generation_time and timing["seconds"] is not None:
         prefix = "~" if timing["source"] == "wall" else ""
         return _with_icon(_icon(v, "time"), f"{prefix}{_format_duration(timing['seconds'])}")
     return None
 
 
-def _render_tps(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_tps(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_tokens_per_second and timing["tps"]:
         return _with_icon(_icon(v, "tps"), f"{timing['tps']:.1f} t/s")
     return None
 
 
-def _render_cost(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_cost(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     # No dedicated show_* flag: visibility is driven by cost_mode via the precomputed
     # cost dict (message is None when cost_mode == off or no price). cost_min_display
     # additionally hides negligible amounts (default 0.0 hides nothing).
@@ -548,7 +658,14 @@ def _render_cost(v, tokens, timing, ctx, cost, model) -> str | None:
     return None
 
 
-def _render_cost_total(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_cost_total(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if (
         cost["cumulative"] is not None
         and v.show_cumulative_cost
@@ -560,7 +677,14 @@ def _render_cost_total(v, tokens, timing, ctx, cost, model) -> str | None:
     return None
 
 
-def _render_model(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_model(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     if v.show_model_name and isinstance(model, dict):
         info = model.get("info")
         base = info.get("base_model_id") if isinstance(info, dict) else None
@@ -569,7 +693,14 @@ def _render_model(v, tokens, timing, ctx, cost, model) -> str | None:
     return None
 
 
-def _render_source(v, tokens, timing, ctx, cost, model) -> str | None:
+def _render_source(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
     # The "not shown on its own" guard lives in _build_stats, not here. No icon in any
     # style: the [API]/[est.] brackets are self-labeling.
     if v.show_data_source:
@@ -577,7 +708,7 @@ def _render_source(v, tokens, timing, ctx, cost, model) -> str | None:
     return None
 
 
-_STATS_RENDERERS: dict = {
+_STATS_RENDERERS: dict[str, Any] = {
     "input": _render_input,
     "output": _render_output,
     "total": _render_total,
@@ -611,9 +742,7 @@ class Filter:
         show_cached_tokens: bool = Field(default=True, description="Display cached prompt tokens (cache hits).")
         show_audio_tokens: bool = Field(default=False, description="Display audio tokens (gpt-4o-audio etc.).")
         show_model_name: bool = Field(default=True, description="Display base model name for workspace models.")
-        show_data_source: bool = Field(
-            default=False, description="Append [API]/[est.] to indicate token count source."
-        )
+        show_data_source: bool = Field(default=False, description="Append [API]/[est.] to indicate token count source.")
         display_order: str = Field(
             default=", ".join(_DEFAULT_ORDER),
             description=(
@@ -683,9 +812,7 @@ class Filter:
             default="",
             description="Optional llama-swap base URL to probe /running for --ctx-size. Empty = off.",
         )
-        context_probe_ttl: int = Field(
-            default=600, description="Seconds to cache a probed/resolved context size."
-        )
+        context_probe_ttl: int = Field(default=600, description="Seconds to cache a probed/resolved context size.")
         # --- Cost ---
         cost_mode: Literal["off", "auto", "estimate"] = Field(
             default="auto",
@@ -714,7 +841,10 @@ class Filter:
         )
         fetch_prices_from_modelsdev: bool = Field(
             default=True,
-            description="In estimate mode, fetch live per-provider prices from models.dev (cached ~24h). Off = static table only.",
+            description=(
+                "In estimate mode, fetch live per-provider prices from models.dev (cached ~24h). "
+                "Off = static table only."
+            ),
         )
         modelsdev_api_url: str = Field(
             default="https://models.dev/api.json",
@@ -727,17 +857,17 @@ class Filter:
     class UserValves(BaseModel):
         enabled: bool = Field(default=True, description="Show token usage stats below responses.")
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.valves = self.Valves()
 
     # --- inlet: record start time + capture context hints ----------------------
 
     async def inlet(
         self,
-        body: dict,
-        __user__: dict | None = None,
-        __metadata__: dict | None = None,
-    ) -> dict:
+        body: dict[str, Any],
+        __user__: dict[str, Any] | None = None,
+        __metadata__: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Stash a start timestamp and any context-size hint for the outlet."""
         chat_id = (__metadata__ or {}).get("chat_id", "") or ""
         message_id = (__metadata__ or {}).get("message_id", "") or ""
@@ -772,12 +902,12 @@ class Filter:
 
     async def outlet(
         self,
-        body: dict,
-        __user__: dict | None = None,
-        __event_emitter__: Callable[[dict], Awaitable[None]] | None = None,
-        __metadata__: dict | None = None,
-        __model__: dict | None = None,
-    ) -> dict:
+        body: dict[str, Any],
+        __user__: dict[str, Any] | None = None,
+        __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        __metadata__: dict[str, Any] | None = None,
+        __model__: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         user_valves = __user__.get("valves") if __user__ else None
         if user_valves is not None and hasattr(user_valves, "enabled") and not user_valves.enabled:
             return body
@@ -809,14 +939,20 @@ class Filter:
 
         tokens = self._extract_tokens(usage, assistant_msg, messages, body, __model__)
         timing = self._resolve_timing(usage, elapsed_seconds, tokens["output"])
-        ctx = await self._resolve_context(body, __metadata__, __model__, tokens)
+        try:
+            ctx = await self._resolve_context(body, __metadata__, __model__, tokens)
+        except Exception:
+            ctx = {"size": None, "used": None, "source": "error", "matched_key": None}
 
         model_id = ""
         if isinstance(__model__, dict):
             model_id = __model__.get("id", "") or ""
         if not model_id:
             model_id = body.get("model", "") or ""
-        cost = await self._resolve_cost(usage, tokens, messages, model_id)
+        try:
+            cost = await self._resolve_cost(usage, tokens, messages, model_id)
+        except Exception:
+            cost = {"message": None, "message_est": False, "cumulative": None, "cumulative_est": False}
 
         stats_parts = self._build_stats(v, tokens, timing, ctx, cost, __model__)
         if v.debug_mode:
@@ -832,8 +968,17 @@ class Filter:
 
         if v.debug_mode and __event_emitter__:
             await self._emit_debug(
-                __event_emitter__, task, messages, assistant_msg, usage,
-                tokens, timing, ctx, cost, __model__, __metadata__,
+                __event_emitter__,
+                task,
+                messages,
+                assistant_msg,
+                usage,
+                tokens,
+                timing,
+                ctx,
+                cost,
+                __model__,
+                __metadata__,
             )
 
         return body
@@ -842,14 +987,14 @@ class Filter:
 
     def _extract_tokens(
         self,
-        usage: dict | None,
-        assistant_msg: dict,
-        messages: list,
-        body: dict,
-        model: dict | None,
-    ) -> dict:
+        usage: dict[str, Any] | None,
+        assistant_msg: dict[str, Any],
+        messages: list[Any],
+        body: dict[str, Any],
+        model: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         """Return a normalized bag of token counts across all providers/APIs."""
-        result = {
+        result: dict[str, Any] = {
             "input": None,
             "output": None,
             "total": None,
@@ -902,7 +1047,12 @@ class Filter:
         return result
 
     def _estimate_tokens(
-        self, result: dict, assistant_msg: dict, messages: list, body: dict, model: dict | None
+        self,
+        result: dict[str, Any],
+        assistant_msg: dict[str, Any],
+        messages: list[Any],
+        body: dict[str, Any],
+        model: dict[str, Any] | None,
     ) -> None:
         """tiktoken estimate of input/output tokens when the provider reported no usage."""
         model_id = ""
@@ -930,7 +1080,7 @@ class Filter:
             result["input"] = est_in
 
     @staticmethod
-    def _cache_and_fresh(usage: dict, reported_input) -> dict:
+    def _cache_and_fresh(usage: dict[str, Any], reported_input: Any) -> dict[str, Any]:
         """Cache read/write tokens + whether the reported input already includes them.
 
         Cache is reported with two different semantics depending on provider/proxy shape:
@@ -970,7 +1120,7 @@ class Filter:
             "fresh_input": fresh_input,
         }
 
-    def _compute_total(self, result: dict) -> int | None:
+    def _compute_total(self, result: dict[str, Any]) -> int | None:
         """Total tokens = fresh input + cache (read + write) + output.
 
         Equals the provider's total for subset-cache shapes (OpenAI/DeepSeek/Gemini/LiteLLM),
@@ -988,7 +1138,7 @@ class Filter:
 
     # --- timing ----------------------------------------------------------------
 
-    def _resolve_wall_clock(self, body: dict, metadata: dict | None) -> float | None:
+    def _resolve_wall_clock(self, body: dict[str, Any], metadata: dict[str, Any] | None) -> float | None:
         """Wall-clock seconds from inlet->outlet (multi-level fallback + leak cleanup)."""
         start_time = None
         if metadata:
@@ -1024,7 +1174,9 @@ class Filter:
 
         return (time.time() - start_time) if start_time is not None else None
 
-    def _resolve_timing(self, usage: dict | None, wall_seconds: float | None, output_tokens) -> dict:
+    def _resolve_timing(
+        self, usage: dict[str, Any] | None, wall_seconds: float | None, output_tokens: Any
+    ) -> dict[str, Any]:
         """Prefer provider-reported generation time/tps; else labeled wall-clock."""
         gen_seconds = None
         tps = None
@@ -1056,7 +1208,13 @@ class Filter:
 
     # --- context window --------------------------------------------------------
 
-    async def _resolve_context(self, body, metadata, model, tokens) -> dict:
+    async def _resolve_context(
+        self,
+        body: dict[str, Any],
+        metadata: dict[str, Any] | None,
+        model: dict[str, Any] | None,
+        tokens: dict[str, Any],
+    ) -> dict[str, Any]:
         if not self.valves.show_context_window:
             return {"size": None, "used": None, "source": "disabled", "matched_key": None}
 
@@ -1073,7 +1231,9 @@ class Filter:
         size, prov = await self._context_size_for(model_id, metadata)
         return {"size": size, "used": used, "source": prov["source"], "matched_key": prov["matched_key"]}
 
-    async def _context_size_for(self, model_id: str, metadata: dict | None) -> tuple[int | None, dict]:
+    async def _context_size_for(
+        self, model_id: str, metadata: dict[str, Any] | None
+    ) -> tuple[int | None, dict[str, Any]]:
         """Resolve context size + provenance ({source, matched_key}). Provenance is debug-only.
 
         Resolution order (unchanged): override -> num_ctx hint -> live models.dev -> static
@@ -1120,13 +1280,14 @@ class Filter:
             _ctx_size_cache[cache_key] = (size, time.time() + max(60, v.context_probe_ttl), prov)
         return size, prov
 
-    async def _modelsdev_map(self) -> dict:
+    async def _modelsdev_map(self) -> dict[str, Any]:
         """Fetch and cache {model_id -> context_tokens} from models.dev. Non-fatal."""
         now = time.time()
-        if _modelsdev_cache.get("map") is not None and _modelsdev_cache.get("expiry", 0) > now:
-            return _modelsdev_cache["map"]
+        cached_map = _modelsdev_cache.get("map")
+        if cached_map is not None and _modelsdev_cache.get("expiry", 0) > now:
+            return cached_map  # type: ignore[no-any-return]
 
-        result: dict = {}
+        result: dict[str, Any] = {}
         if _AIOHTTP_AVAILABLE:
             try:
                 timeout = aiohttp.ClientTimeout(total=5)
@@ -1187,7 +1348,7 @@ class Filter:
         return None
 
     @staticmethod
-    def _parse_llama_swap(data) -> int | None:
+    def _parse_llama_swap(data: Any) -> int | None:
         """Extract --ctx-size from a llama-swap /running payload."""
         rows = data.get("running", []) if isinstance(data, dict) else data
         if not isinstance(rows, list):
@@ -1203,7 +1364,7 @@ class Filter:
                 return int(match.group(1))
         return None
 
-    def _context_table(self) -> dict:
+    def _context_table(self) -> dict[str, Any]:
         """Static context table merged with the user's context_size_map valve (user wins)."""
         table = dict(_STATIC_CONTEXT_SIZES)
         if self.valves.context_size_map:
@@ -1217,13 +1378,15 @@ class Filter:
 
     # --- cost ------------------------------------------------------------------
 
-    async def _resolve_cost(self, usage: dict | None, tokens: dict, messages: list, model_id: str) -> dict:
+    async def _resolve_cost(
+        self, usage: dict[str, Any] | None, tokens: dict[str, Any], messages: list[Any], model_id: str
+    ) -> dict[str, Any]:
         """Cost of this message + running chat total. Native (provider) first, else estimate.
 
         cost_mode: off -> nothing; auto -> native only (no fetch/estimate);
         estimate -> native first, else approximate from models.dev prices (marked ≈).
         """
-        result = {"message": None, "message_est": False, "cumulative": None, "cumulative_est": False}
+        result: dict[str, Any] = {"message": None, "message_est": False, "cumulative": None, "cumulative_est": False}
         mode = self.valves.cost_mode
         if mode == "off":
             return result
@@ -1272,6 +1435,7 @@ class Filter:
             result["debug"] = {
                 "mode": mode,
                 "native": {"found": native is not None, "value": native, "source_key": native_key},
+                "cost_details": self._native_cost_details(usage),
                 "price": {
                     "source": price_prov["source"],
                     "matched_key": price_prov["matched_key"],
@@ -1282,7 +1446,24 @@ class Filter:
         return result
 
     @staticmethod
-    def _native_cost(usage: dict | None) -> tuple[float | None, str | None]:
+    def _native_cost_details(usage: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Provider cost breakdown when present, e.g. OpenRouter `cost_details`.
+
+        OpenRouter reports `usage.cost_details` alongside `usage.cost` — typically
+        `upstream_inference_cost` (what the upstream provider charged) and `cache_discount`.
+        The displayed cost uses the authoritative top-level `cost`; this is diagnostics only,
+        showing the provider vs upstream split. Numeric values only, so it stays serializable.
+        """
+        if not isinstance(usage, dict):
+            return None
+        details = usage.get("cost_details")
+        if not isinstance(details, dict):
+            return None
+        cleaned = {k: v for k, v in details.items() if _num(v) is not None}
+        return cleaned or None
+
+    @staticmethod
+    def _native_cost(usage: dict[str, Any] | None) -> tuple[float | None, str | None]:
         """Provider/proxy-reported cost + the key it came from (OpenRouter, LiteLLM, ...)."""
         if not isinstance(usage, dict):
             return None, None
@@ -1297,9 +1478,9 @@ class Filter:
         return None, None
 
     @staticmethod
-    def _usage_token_bag(usage: dict) -> dict:
+    def _usage_token_bag(usage: Any) -> dict[str, Any]:
         """Minimal cache-aware token bag from a usage dict (for cost of historical messages)."""
-        bag = {
+        bag: dict[str, Any] = {
             "input": None,
             "output": None,
             "cached": None,
@@ -1321,7 +1502,7 @@ class Filter:
         return bag
 
     @staticmethod
-    def _cost_components(bag: dict, price: dict | None) -> dict | None:
+    def _cost_components(bag: dict[str, Any], price: dict[str, Any] | None) -> dict[str, Any] | None:
         """Per-component token counts + USD from a token bag and per-1M price dict.
 
         Single source of truth for the cost math: `_estimate_cost` returns its `total_usd`,
@@ -1380,12 +1561,12 @@ class Filter:
         }
 
     @staticmethod
-    def _estimate_cost(bag: dict, price: dict | None) -> float | None:
+    def _estimate_cost(bag: dict[str, Any], price: dict[str, Any] | None) -> float | None:
         """Estimate USD from a token bag and a per-1M price dict. None if not computable."""
         components = Filter._cost_components(bag, price)
         return components["total_usd"] if components else None
 
-    async def _resolve_price(self, model_id: str) -> tuple[dict | None, dict]:
+    async def _resolve_price(self, model_id: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """Per-1M price + provenance ({source, matched_key}): manual map -> models.dev -> static.
 
         Provenance is debug-only; the returned price is what the hot path uses. Order and
@@ -1405,7 +1586,7 @@ class Filter:
             return _STATIC_PRICES[skey], {"source": "static", "matched_key": skey}
         return None, {"source": "none", "matched_key": None}
 
-    def _price_map_table(self) -> dict:
+    def _price_map_table(self) -> dict[str, Any]:
         """Parse the user's price_map valve into {model-substring(lower) -> price dict}. Non-fatal."""
         raw = self.valves.price_map
         if not raw:
@@ -1418,13 +1599,14 @@ class Filter:
             return {}
         return {str(k).lower(): v for k, v in user_map.items() if isinstance(v, dict)}
 
-    async def _modelsdev_prices_map(self) -> dict:
+    async def _modelsdev_prices_map(self) -> dict[str, Any]:
         """Fetch and cache {model_id -> price dict} from models.dev api.json. Non-fatal."""
         now = time.time()
-        if _modelsdev_prices_cache.get("map") is not None and _modelsdev_prices_cache.get("expiry", 0) > now:
-            return _modelsdev_prices_cache["map"]
+        cached_map = _modelsdev_prices_cache.get("map")
+        if cached_map is not None and _modelsdev_prices_cache.get("expiry", 0) > now:
+            return cached_map  # type: ignore[no-any-return]
 
-        result: dict = {}
+        result: dict[str, Any] = {}
         if _AIOHTTP_AVAILABLE:
             try:
                 timeout = aiohttp.ClientTimeout(total=5)
@@ -1441,18 +1623,18 @@ class Filter:
         return result
 
     @staticmethod
-    def _parse_prices(data) -> dict:
+    def _parse_prices(data: Any) -> dict[str, Any]:
         """Flatten models.dev api.json to {model_id(lower) -> price}. Tolerant of shape.
 
         Expected: {provider: {"models": {model_id: {..., "cost": {...}}}}}; also accepts a
         flat {model_id: {..., "cost": {...}}}. Prices are USD per 1M tokens.
         """
-        out: dict = {}
+        out: dict[str, Any] = {}
 
-        def add(model_id, cost) -> None:
+        def add(model_id: Any, cost: Any) -> None:
             if not isinstance(cost, dict):
                 return
-            price = {}
+            price: dict[str, Any] = {}
             for field in ("input", "output", "cache_read", "cache_write"):
                 val = _num(cost.get(field))
                 if val is not None:
@@ -1475,7 +1657,15 @@ class Filter:
 
     # --- display ---------------------------------------------------------------
 
-    def _build_stats(self, v, tokens, timing, ctx, cost, model) -> list:
+    def _build_stats(
+        self,
+        v: Filter.Valves,
+        tokens: dict[str, Any],
+        timing: dict[str, Any],
+        ctx: dict[str, Any],
+        cost: dict[str, Any],
+        model: dict[str, Any] | None,
+    ) -> list[str]:
         """Assemble the stats parts in the resolved metric order.
 
         show_* still gates visibility (each renderer returns None when off/no-data);
@@ -1498,7 +1688,7 @@ class Filter:
         return [part for _, part in rendered]
 
     @staticmethod
-    def _provider_guess(model: dict | None, model_id: str) -> str:
+    def _provider_guess(model: dict[str, Any] | None, model_id: str) -> str:
         """Best-effort provider label from outlet-visible fields (no base_url/api-key exist here).
 
         Local backends and an admin-set `provider` are authoritative; otherwise the family is
@@ -1543,7 +1733,9 @@ class Filter:
                 return label
         return owned or "unknown"
 
-    def _sanitize_model(self, model: dict | None, metadata: dict | None, resolved_id: str) -> dict:
+    def _sanitize_model(
+        self, model: dict[str, Any] | None, metadata: dict[str, Any] | None, resolved_id: str
+    ) -> dict[str, Any]:
         """Whitelist of shareable model/provider fields — NO secrets, prompt, user ids, or grants.
 
         Only known-safe keys are copied out; raw __model__/__metadata__ (which carry user_message,
@@ -1552,8 +1744,9 @@ class Filter:
         explicitly via gen_params_available rather than silently omitted.
         """
         m = model if isinstance(model, dict) else {}
-        info = m.get("info") if isinstance(m.get("info"), dict) else {}
-        params: dict = {}
+        info_raw = m.get("info")
+        info: dict[str, Any] = info_raw if isinstance(info_raw, dict) else {}
+        params: dict[str, Any] = {}
         function_calling = None
         if isinstance(metadata, dict) and isinstance(metadata.get("params"), dict):
             mp = metadata["params"]
@@ -1581,7 +1774,7 @@ class Filter:
             "note": "generation params (temperature/top_p/max_tokens/system/reasoning) removed by OWUI before outlet",
         }
 
-    def _valves_snapshot(self) -> dict:
+    def _valves_snapshot(self) -> dict[str, Any]:
         """Full valve dump for reproducing issues; the two local-backend URLs are masked."""
         try:
             data = self.valves.model_dump()
@@ -1592,8 +1785,63 @@ class Filter:
                 data[key] = "******"
         return data
 
+    @staticmethod
+    def _web_search_debug(assistant_msg: dict[str, Any]) -> dict[str, Any]:
+        """Hint whether the response used server-side web search (url_citation -> OWUI `sources`).
+
+        Why it matters for cost: Open-WebUI-orchestrated tool/MCP calls are pure tokens and already
+        summed into `usage.cost`. But a provider's OWN server-side web search / tools (OpenRouter's
+        `web` plugin / `openrouter:web_search`, `:online`) can add a surcharge on top of tokens, and a
+        BYOK engine (e.g. Firecrawl) bills entirely outside the OpenRouter generation. So when a
+        response carries web citations, the shown cost may be incomplete — cross-check the provider's
+        Activity page. This is a diagnostic flag only; it never changes the displayed number.
+
+        Detection is conservative: OWUI turns `url_citation` annotations into `sources` whose entries
+        carry an http(s) URL (RAG/file sources do not), so an http host is the tell-tale of web search.
+        """
+        sources = assistant_msg.get("sources")
+        hosts: list[str] = []
+        if isinstance(sources, list):
+            for src in sources:
+                if not isinstance(src, dict):
+                    continue
+                candidates: list[Any] = []
+                inner = src.get("source")
+                if isinstance(inner, dict):
+                    candidates.append(inner.get("url"))
+                meta = src.get("metadata")
+                if isinstance(meta, list):
+                    for m in meta:
+                        if isinstance(m, dict):
+                            candidates.extend((m.get("source"), m.get("url")))
+                host = next((h for h in (_url_host(c) for c in candidates if isinstance(c, str)) if h), "")
+                if host:
+                    hosts.append(host)
+        return {
+            "detected": bool(hosts),
+            "citation_count": len(hosts),
+            "domains": sorted(set(hosts))[:10],
+            "note": (
+                "Response has web-search citations; a provider-side search/tool surcharge may not be "
+                "fully in usage.cost (BYOK engines bill outside OpenRouter). Cross-check the Activity page."
+                if hosts
+                else None
+            ),
+        }
+
     async def _emit_debug(
-        self, emit, task, messages, assistant_msg, usage, tokens, timing, ctx, cost, model, metadata,
+        self,
+        emit: Callable[[dict[str, Any]], Awaitable[None]],
+        task: Any,
+        messages: list[Any],
+        assistant_msg: dict[str, Any],
+        usage: dict[str, Any] | None,
+        tokens: dict[str, Any],
+        timing: dict[str, Any],
+        ctx: dict[str, Any],
+        cost: dict[str, Any],
+        model: dict[str, Any] | None,
+        metadata: dict[str, Any] | None,
     ) -> None:
         """Diagnostics for troubleshooting, in a copyable and untruncated form.
 
@@ -1635,6 +1883,7 @@ class Filter:
             "timing": timing,
             "cost": {k: val for k, val in cost.items() if k != "debug"},
             "cost_debug": cost.get("debug"),
+            "web_search": self._web_search_debug(assistant_msg),
             "context_debug": context_debug,
             "display_order": display_order_debug,
             "tiktoken": _TIKTOKEN_AVAILABLE,
