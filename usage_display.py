@@ -1,7 +1,7 @@
 """
 title: Token Usage & Cost Display
 author: smetdenis
-version: 2.5.0
+version: 2.5.1
 description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """
@@ -812,7 +812,10 @@ class Filter:
         )
         context_size_map: str = Field(
             default="",
-            description='JSON object of {"model-substring": context_tokens} merged over the built-in table.',
+            description=(
+                'JSON object of {"model-substring": context_tokens}. An explicit override: checked '
+                "BEFORE the models.dev fetch and the built-in table, so it always wins on a match."
+            ),
         )
         fetch_context_from_modelsdev: bool = Field(
             default=False,
@@ -1247,17 +1250,26 @@ class Filter:
     ) -> tuple[int | None, dict[str, Any]]:
         """Resolve context size + provenance ({source, matched_key}). Provenance is debug-only.
 
-        Resolution order (unchanged): override -> num_ctx hint -> live models.dev -> static
-        table (+ user map) -> local-backend probe.
+        Resolution order: override -> num_ctx hint -> user context_size_map -> live models.dev ->
+        static table -> local-backend probe. The user's context_size_map is an explicit override,
+        so it beats the automatic models.dev fetch (mirrors how price_map wins over models.dev).
         """
         v = self.valves
         # 1) Explicit override.
         if v.context_size_override and v.context_size_override > 0:
             return int(v.context_size_override), {"source": "override", "matched_key": None}
-        # 2) num_ctx captured at inlet (Ollama/local models).
+        # 2) num_ctx captured at inlet (Ollama/local models — the actual running window, ground truth).
         hint = (metadata or {}).get("_tud_num_ctx")
         if isinstance(hint, int) and hint > 0:
             return hint, {"source": "num_ctx", "matched_key": None}
+        # 3) User context_size_map — an explicit manual override, checked BEFORE the live models.dev
+        #    fetch (mirrors how price_map beats models.dev for cost). Returned uncached, like
+        #    override/num_ctx, so valve edits take effect at once and are never masked by a stale
+        #    _ctx_size_cache entry. Falsy sizes (e.g. 0) fall through to the automatic sources.
+        user_map = self._context_size_map_table()
+        umkey = _longest_key_match(user_map, model_id)
+        if umkey is not None and user_map[umkey]:
+            return int(user_map[umkey]), {"source": "user_map", "matched_key": umkey}
 
         cache_key = model_id.lower()
         cached = _ctx_size_cache.get(cache_key)
@@ -1267,21 +1279,21 @@ class Filter:
 
         size = None
         prov = {"source": "none", "matched_key": None}
-        # 3) Live models.dev lookup (opt-in; cached ~24h).
+        # 4) Live models.dev lookup (opt-in; cached ~24h).
         if v.fetch_context_from_modelsdev:
             table = await self._modelsdev_map()
             key = _modelsdev_match(table, model_id)
             if key is not None:
                 size = table[key]
                 prov = {"source": "modelsdev", "matched_key": key}
-        # 4) Static table (+ user map override), matched by substring.
+        # 5) Static table, matched by substring.
         if size is None:
             table = self._context_table()
             key = _longest_key_match(table, model_id)
             if key is not None:
                 size = table[key]
                 prov = {"source": "static_table", "matched_key": key}
-        # 5) Optional endpoint probe for local backends (opt-in via valve URL).
+        # 6) Optional endpoint probe for local backends (opt-in via valve URL).
         if size is None and (v.llamacpp_url or v.llama_swap_url):
             size = await self._probe_context(model_id)
             if size is not None:
@@ -1375,17 +1387,39 @@ class Filter:
                 return int(match.group(1))
         return None
 
-    def _context_table(self) -> dict[str, Any]:
-        """Static context table merged with the user's context_size_map valve (user wins)."""
-        table = dict(_STATIC_CONTEXT_SIZES)
-        if self.valves.context_size_map:
+    def _context_size_map_table(self) -> dict[str, int]:
+        """Parse the user's context_size_map valve into {model-substring(lower) -> tokens}. Non-fatal.
+
+        Mirrors _price_map_table: a per-entry-tolerant parse (one bad value drops only that entry,
+        not the whole map). Applied as its own resolution tier ABOVE models.dev in
+        _context_size_for, so an explicit user override beats the automatic remote lookup — exactly
+        like price_map wins over models.dev for cost.
+        """
+        raw = self.valves.context_size_map
+        if not raw:
+            return {}
+        try:
+            user_map = json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(user_map, dict):
+            return {}
+        result: dict[str, int] = {}
+        for key, val in user_map.items():
             try:
-                user_map = json.loads(self.valves.context_size_map)
-                if isinstance(user_map, dict):
-                    table.update({str(k).lower(): int(val) for k, val in user_map.items()})
-            except Exception:
-                pass
-        return table
+                result[str(key).lower()] = int(val)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _context_table(self) -> dict[str, Any]:
+        """Static context table (offline default).
+
+        The user's context_size_map is NO longer merged here — it is resolved as a higher-priority
+        tier in _context_size_for (above models.dev), so merging it into the static fallback would
+        be dead code. A copy is returned so callers can't mutate the module-level table.
+        """
+        return dict(_STATIC_CONTEXT_SIZES)
 
     # --- cost ------------------------------------------------------------------
 

@@ -1594,9 +1594,10 @@ def test_context_workspace_model_matches_via_base_model_id(
     assert ctx["matched_key"] == "gpt-4o"
 
 
-def test_context_size_map_valve_overrides_static(
+def test_context_size_map_valve_wins_as_user_map_tier(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """context_size_map resolves in its own 'user_map' tier (above models.dev/static), not merged."""
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)
     f.valves.context_size_map = '{"gpt-4o": 999}'
@@ -1609,22 +1610,67 @@ def test_context_size_map_valve_overrides_static(
         )
     )
     assert ctx["size"] == 999
+    assert ctx["source"] == "user_map"
+    assert ctx["matched_key"] == "gpt-4o"
+
+
+def test_context_size_map_beats_modelsdev(usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reported bug: an explicit context_size_map wins over the live models.dev fetch.
+
+    models.dev is monkeypatched to a match AND fetch is enabled, yet the user's map takes
+    precedence — mirroring how price_map beats models.dev for cost.
+    """
+    f = usage_display_module.Filter()
+
+    async def _map() -> dict[str, Any]:
+        return {"stepfun/step-3.7-flash": 256000}  # what models.dev would report
+
+    monkeypatch.setattr(f, "_modelsdev_map", _map)
+    f.valves.fetch_context_from_modelsdev = True
+    f.valves.context_size_map = '{"stepfun/step-3.7-flash:free": 260000}'  # user override
+    size, prov = run_async(f._context_size_for("stepfun/step-3.7-flash:free-mapwins-check", None))
+    assert size == 260000
+    assert prov["source"] == "user_map"
+    assert prov["matched_key"] == "stepfun/step-3.7-flash:free"
+
+
+def test_context_size_map_zero_value_falls_through(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A falsy map size (0) is skipped and resolution falls through to the automatic sources."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    f.valves.context_size_map = '{"gpt-4o": 0}'
+    ctx = run_async(
+        f._resolve_context(
+            make_body(model="gpt-4o-mapzero-check"),
+            {},
+            make_model_dict("gpt-4o-mapzero-check"),
+            make_tokens(total=100),
+        )
+    )
+    assert ctx["size"] == 128000  # static gpt-4o, not the 0 from the map
     assert ctx["source"] == "static_table"
 
 
-def test_context_table_size_map_non_dict_json_ignored(usage_display_module: ModuleType) -> None:
-    """Valid JSON that isn't an object (e.g. a list) is ignored, not merged."""
+def test_context_size_map_table_parsing(usage_display_module: ModuleType) -> None:
+    """_context_size_map_table: per-entry tolerant, lowercased keys; bad shapes -> empty."""
     f = usage_display_module.Filter()
-    f.valves.context_size_map = "[1, 2, 3]"
-    table = f._context_table()
-    assert table == usage_display_module._STATIC_CONTEXT_SIZES
-
-
-def test_context_table_size_map_malformed_json_ignored(usage_display_module: ModuleType) -> None:
-    f = usage_display_module.Filter()
+    f.valves.context_size_map = '{"GPT-4o": 999, "bad": "nope", "b": 200}'
+    assert f._context_size_map_table() == {"gpt-4o": 999, "b": 200}  # bad value dropped, keys lowered
+    f.valves.context_size_map = "[1, 2, 3]"  # valid JSON, not an object
+    assert f._context_size_map_table() == {}
     f.valves.context_size_map = "{not valid json"
-    table = f._context_table()
-    assert table == usage_display_module._STATIC_CONTEXT_SIZES
+    assert f._context_size_map_table() == {}
+    f.valves.context_size_map = ""
+    assert f._context_size_map_table() == {}
+
+
+def test_context_table_is_static_only(usage_display_module: ModuleType) -> None:
+    """_context_table no longer merges the user map (map is its own tier now)."""
+    f = usage_display_module.Filter()
+    f.valves.context_size_map = '{"gpt-4o": 999}'
+    assert f._context_table() == usage_display_module._STATIC_CONTEXT_SIZES
 
 
 def test_context_unknown_model_no_match_no_probe(
