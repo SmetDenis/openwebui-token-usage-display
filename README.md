@@ -8,6 +8,11 @@ A filter plugin for [Open WebUI](https://openwebui.com) that shows detailed toke
 timing and cost statistics below each AI response — token counts (input/output/total, reasoning,
 cached, audio), context-window utilization, generation time, tokens/second and message/chat cost.
 
+Recommended in the official Open WebUI documentation — see the
+[Community Plugins catalog](https://docs.openwebui.com/features/extensibility/community/). Install
+it from the [community store post](https://openwebui.com/posts/token_usage_display_a94ea72f) or
+straight from this repo.
+
 ![Token usage & cost stats line under an Open WebUI response](docs/screenshot.png)
 
 ```text
@@ -148,7 +153,9 @@ under the message (also mirrored to the server log). Its `cost_debug`, `context_
 
 ## Links
 
-- Open WebUI community post: <https://openwebui.com/posts/a94ea72f-8a84-4686-ad36-dd51342cc45d>
+- Open WebUI community post: <https://openwebui.com/posts/token_usage_display_a94ea72f>
+- Official Open WebUI docs — Community Plugins catalog:
+  <https://docs.openwebui.com/features/extensibility/community/>
 - Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## Contributing
