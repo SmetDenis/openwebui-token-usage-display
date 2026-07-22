@@ -1,3 +1,6 @@
+# Claude Code (machine-local instructions)
+CLAUDE.local.md
+
 # Python
 __pycache__/
 *.py[cod]
