@@ -1,7 +1,7 @@
 """
 title: Token Usage & Cost Display
 author: smetdenis
-version: 2.4.0
+version: 2.5.0
 description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """
@@ -379,6 +379,29 @@ def _modelsdev_match(table: dict[str, Any], model_id: str) -> str | None:
     if bare in table:
         return bare
     return _longest_key_match(table, model_id)
+
+
+def _resolve_model_id(model: dict[str, Any] | None, body: dict[str, Any] | None = None) -> str:
+    """Model id used for provider-table matching (context size, price, tiktoken).
+
+    Prefers a workspace model's `info.base_model_id` — the real underlying LLM — over the
+    top-level `id`, which for a custom/agent model is an arbitrary user label (e.g. "research")
+    that carries no provider token and so never matches the context/price tables. This mirrors
+    what OWUI itself does (it swaps in base_model_id for the actual LLM call) and what the
+    model-name metric already displays, so one map entry keyed on the base model covers every
+    agent built on it. Falls back to the top-level id, then body["model"], then "".
+    """
+    if isinstance(model, dict):
+        info = model.get("info")
+        base = info.get("base_model_id") if isinstance(info, dict) else None
+        if base:
+            return str(base)
+        mid = model.get("id", "") or ""
+        if mid:
+            return str(mid)
+    if isinstance(body, dict):
+        return body.get("model", "") or ""
+    return ""
 
 
 # --- stats-line order (see configurable-order design doc) ----------------------
@@ -944,11 +967,7 @@ class Filter:
         except Exception:
             ctx = {"size": None, "used": None, "source": "error", "matched_key": None}
 
-        model_id = ""
-        if isinstance(__model__, dict):
-            model_id = __model__.get("id", "") or ""
-        if not model_id:
-            model_id = body.get("model", "") or ""
+        model_id = _resolve_model_id(__model__, body)
         try:
             cost = await self._resolve_cost(usage, tokens, messages, model_id)
         except Exception:
@@ -1055,11 +1074,7 @@ class Filter:
         model: dict[str, Any] | None,
     ) -> None:
         """tiktoken estimate of input/output tokens when the provider reported no usage."""
-        model_id = ""
-        if isinstance(model, dict):
-            model_id = model.get("id", "") or ""
-        if not model_id:
-            model_id = body.get("model", "") or ""
+        model_id = _resolve_model_id(model, body)
 
         response_text = _message_text(assistant_msg)
         if response_text:
@@ -1222,11 +1237,7 @@ class Filter:
         if used is None:
             used = (tokens["input"] or 0) + (tokens["output"] or 0) or None
 
-        model_id = ""
-        if isinstance(model, dict):
-            model_id = model.get("id", "") or ""
-        if not model_id:
-            model_id = body.get("model", "") or ""
+        model_id = _resolve_model_id(model, body)
 
         size, prov = await self._context_size_for(model_id, metadata)
         return {"size": size, "used": used, "source": prov["source"], "matched_key": prov["matched_key"]}
@@ -1854,7 +1865,7 @@ class Filter:
         """
         content = assistant_msg.get("content")
         output = assistant_msg.get("output")
-        resolved_id = model.get("id", "") or "" if isinstance(model, dict) else ""
+        resolved_id = _resolve_model_id(model)
 
         size = ctx.get("size")
         used = ctx.get("used")

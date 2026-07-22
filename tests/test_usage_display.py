@@ -416,6 +416,23 @@ def test_modelsdev_match_empty_or_non_dict_table_returns_none(usage_display_modu
     assert fn(None, "gpt-4o") is None
 
 
+def test_resolve_model_id_prefers_base_model_id(usage_display_module: ModuleType) -> None:
+    fn = usage_display_module._resolve_model_id
+    # Workspace/custom model: base_model_id (real LLM) wins over the top-level agent id.
+    assert fn({"id": "research", "info": {"base_model_id": "stepfun/step-3.7-flash:free"}}) == (
+        "stepfun/step-3.7-flash:free"
+    )
+    # No base -> top-level id. Empty base string is falsy -> also falls back to id.
+    assert fn({"id": "gpt-4o"}) == "gpt-4o"
+    assert fn({"id": "gpt-4o", "info": {"base_model_id": ""}}) == "gpt-4o"
+    assert fn({"id": "gpt-4o", "info": None}) == "gpt-4o"
+    # No usable model dict -> body["model"] fallback, then "".
+    assert fn(None, {"model": "gpt-4o"}) == "gpt-4o"
+    assert fn({}, {"model": "gpt-4o"}) == "gpt-4o"
+    assert fn(None) == ""
+    assert fn({}) == ""
+
+
 def test_normalize_order_dedups_and_flags_unknown(usage_display_module: ModuleType) -> None:
     valid, unknown = usage_display_module._normalize_order(" input, COST , input , bogus, ")
     assert valid == ["input", "cost"]  # deduped, lowercased, order-preserved
@@ -1558,6 +1575,23 @@ def test_context_static_table_match(usage_display_module: ModuleType, monkeypatc
     assert ctx["source"] == "static_table"
     assert ctx["matched_key"] == "gpt-4o"
     assert ctx["used"] == 100
+
+
+def test_context_workspace_model_matches_via_base_model_id(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A custom/agent model whose id carries no provider token resolves via its base_model_id.
+
+    Regression for the reported bug: id="research-base-check" matches nothing, but the base model
+    "gpt-4o-base-check" hits the static gpt-4o entry, so context resolves without a per-agent map.
+    """
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    model = make_model_dict("research-base-check", base="gpt-4o-base-check")
+    ctx = run_async(f._resolve_context(make_body(model="research-base-check"), {}, model, make_tokens(total=100)))
+    assert ctx["size"] == 128000
+    assert ctx["source"] == "static_table"
+    assert ctx["matched_key"] == "gpt-4o"
 
 
 def test_context_size_map_valve_overrides_static(
