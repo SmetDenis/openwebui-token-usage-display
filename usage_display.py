@@ -1,8 +1,11 @@
 """
 title: Token Usage & Cost Display
 author: smetdenis
-version: 2.5.1
-description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
+author_url: https://github.com/SmetDenis
+git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
+version: 2.5.2
+license: MIT
+description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """
 
@@ -13,9 +16,9 @@ from __future__ import annotations
 #     saved `message["usage"]` is GUARANTEED to carry input_tokens/output_tokens/
 #     total_tokens, while provider-native keys/detail dicts are preserved.
 #     -> primary token read is the normalized triple; provider keys are backup.
-#   * `message["content"]` is NOT persisted for streaming chats (text lives in the
-#     structured `message["output"]` array); it IS present for non-streaming.
-#     -> tiktoken fallback reads content first, then walks `output`.
+#   * `message["content"]` is NOT persisted at 0.10.x — both streaming and
+#     non-streaming save paths write only the structured `message["output"]`
+#     array. -> tiktoken fallback reads content first (0.9.x), then walks `output`.
 #   * `message["info"]` is a redundant mirror ({"usage": ...}) of top-level usage
 #     on persisted chats -> intentionally ignored to avoid double counting.
 #   * Detail keys differ by API: Chat Completions -> prompt_tokens_details /

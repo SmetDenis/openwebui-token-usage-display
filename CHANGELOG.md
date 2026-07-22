@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format loosely foll
 `version:` field in the `usage_display.py` docstring.
 
 
+## [2.5.2]
+
+- **Metadata refresh (no behavior changes).** The docstring frontmatter gains `author_url`, `git_url` and `license`, so the pasted file carries its own provenance, and the description now mentions that workspace/custom ("agent") models resolve context and cost via their base model. The NOTE assumption block was re-verified against Open WebUI v0.10.2 and one stale clause corrected: `message["content"]` is not persisted for *non-streaming* completions either — at 0.10.x both save paths write only the structured `output` array. Comment-only: the content-first / `output`-fallback extraction order already handled this correctly.
+
 ## [2.5.1]
 
 - **`context_size_map` now takes precedence over the live models.dev fetch.** It was previously merged into the built-in table, which is consulted *after* the models.dev lookup — so with `fetch_context_from_modelsdev` enabled, an automatic remote match silently overrode your explicit manual entry. It's now resolved in its own tier, right after `override`/`num_ctx` and **before** models.dev and the static table (source `user_map` in the debug payload), matching how `price_map` already beats models.dev for cost. Consequences: a map entry now wins outright on any substring match (even against a longer static/models.dev key — the same semantics as `price_map`); a falsy size (`0`) is skipped and falls through; parsing is per-entry tolerant (one bad value drops only that entry). It's returned uncached, so edits take effect immediately.
