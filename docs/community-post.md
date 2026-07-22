@@ -14,11 +14,9 @@ Shows token counts, reasoning/cached breakdowns, context-window utilization, gen
 
 ## Full text
 
+> **GitHub:** [github.com/SmetDenis/openwebui-token-usage-display](https://github.com/SmetDenis/openwebui-token-usage-display) - source code, full documentation, changelog and issue tracker. Please, star it.
+
 **Token Usage & Cost Display** is a filter plugin for Open WebUI that shows detailed token usage statistics below each AI response - rebuilt around Open WebUI's **0.10.x** data model (structured output + normalized usage), compatible back to **0.9.0**, and covering both of OpenAI's APIs, Anthropic, Gemini, Ollama and llama.cpp.
-
-**GitHub:** [github.com/SmetDenis/openwebui-token-usage-display](https://github.com/SmetDenis/openwebui-token-usage-display) - source code, full documentation, changelog and issue tracker.
-
-> **Works on Open WebUI 0.9.0+.** It's built for the 0.10.x data model but degrades gracefully on 0.9.x - the only limitation there is provider-reported cost in `auto` mode, which needs 0.10.0+ (use `estimate` on older versions). `tiktoken` is **optional** - the plugin loads fine without it (only used for estimation when a provider reports no usage).
 
 ### What it displays
 
