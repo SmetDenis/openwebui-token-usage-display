@@ -1,5 +1,5 @@
 pytest>=9.1.1
 pytest-cov>=7.1.0
-ruff>=0.15.22
+ruff>=0.16.1
 mypy>=2.3.0
 pydantic==2.13.4  # mirror OWUI 0.10.2's pin; the plugin runs against this pydantic in production (test-only dep)
