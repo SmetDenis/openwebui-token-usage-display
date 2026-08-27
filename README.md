@@ -104,6 +104,9 @@ In `estimate` mode the price is resolved as: your manual **`price_map`** valve �
 Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - Debug info"** source under the message (also mirrored to the server log). Its `cost_debug`, `context_debug`, `model` and
 `valves` blocks name the exact broken link.
 
+- **Nothing shows below the response, but `debug_mode` prints a full payload with correct tokens to the server log.** The plugin ran fine - Open WebUI is hiding the line. Its frontend renders the status line only when the model's **Status Updates** capability is on, and the debug panel only when
+  **Citations** is on (Workspace → Models → *your model* → Capabilities). This hits workspace/"agent"
+  models, which store an explicit capability set; plain connection models default to on.
 - **Nothing shows below the response (no tokens).** The provider returned no `usage`. In streaming, most OpenAI-compatible endpoints only send a usage chunk when asked - enable the model's **Usage** capability
   (Workspace → Models → *your model* → Capabilities → **Usage**). Behind LiteLLM, set
   `general_settings: { always_include_stream_usage: true }`.

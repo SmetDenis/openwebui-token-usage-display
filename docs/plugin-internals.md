@@ -23,8 +23,10 @@ Orchestration order (each step degrades gracefully, never raises out):
 1. **UserValves kill-switch** (`:940-942`) — `enabled=False` returns the body untouched.
 2. **Background-task guard** (`:945-955`) — skips the 7 `metadata["task"]` values
    (`title_generation`, `tags_generation`, `follow_up_generation`, `emoji_generation`,
-   `query_generation`, `autocomplete_generation`, `moa_response_generation`). Defensive only: at
-   OWUI v0.10.2 task requests never run filter functions at all (see `docs/owui-map.md`).
+   `query_generation`, `autocomplete_generation`, `moa_response_generation`). Defensive only: task
+   requests never run filter functions at all, through v0.11.1 (see `docs/owui-map.md`). The guard
+   list is a subset: OWUI's `TASKS` enum gained `image_prompt_generation` and `function_calling`,
+   so it now has 9 members — harmless while the requests never reach filters.
 3. **Message gates** (`:957-962`) — empty `messages` or no assistant message → return.
 4. `_resolve_wall_clock` (`:966`) → `_extract_tokens` (`:969`) → `_resolve_timing` (`:970`).
 5. `_resolve_context` (`:971-974`) and `_resolve_cost` (`:977-980`) — each wrapped in its own
@@ -37,17 +39,19 @@ Orchestration order (each step degrades gracefully, never raises out):
 
 ## The OWUI contract (NOTE block) and its verification status
 
-The NOTE block at `usage_display.py:14-38` is the source-verified contract with OWUI. Verified
-against OWUI v0.10.2 (2026-07):
+The NOTE block at `usage_display.py:14-41` is the source-verified contract with OWUI. Re-verified
+against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
 
-- Normalized triple guaranteed on every save path — **confirmed** (`utils/response.py:13-51,104`).
-- `info` is a redundant mirror of `usage` — **confirmed** (`models/chat_messages.py:303-305`).
+- Normalized triple guaranteed on every save path — **confirmed** (`utils/response.py:14-51,105`).
+- `info` is a redundant mirror of `usage` — **confirmed** (`models/chat_messages.py:370-371`).
 - Detail keys differ per API shape, passed through untouched — **confirmed**.
 - `merge_usage` sums tokens/cost/details but last-wins for Anthropic top-level cache and Ollama
   durations — **confirmed** (they are in none of the merge key sets).
-- `content` is not persisted at 0.10.x for either mode (`''` placeholder; every save path writes
-  `output` only) — **confirmed**; the NOTE block was corrected accordingly in v2.5.2 (an earlier
-  clause wrongly claimed `content` is present for non-streaming responses).
+- `content` is still not **persisted** at 0.11.x for either mode (every save path writes `output`
+  only) — **confirmed**. What changed: the **outlet body** now carries a non-empty `content`,
+  synthesized per message as `content or get_output_text(output)` while the body is assembled
+  (`middleware.py:3479`). The NOTE block was updated accordingly — a content-first reader must
+  still fall through to `output`, which is the only source on 0.10.x.
 
 Any change to token/cost/context reading must be reconciled against this block AND re-verified
 against real OWUI source of the version being targeted — never against memory or docs.
@@ -173,8 +177,8 @@ against models.dev. All three aiohttp fetchers catch broad `Exception` and degra
 ## Debug payload — `_emit_debug` (`:1903+`)
 
 - Ships as a `citation` event (copyable Markdown modal, persisted with the message) + stdout
-  mirror, because the status line is `line-clamp-1`/unselectable and `content` is invisible when
-  `output` is non-empty (see `docs/owui-map.md`, frontend constraints).
+  mirror, because the status line is `line-clamp-1` plain text inside a toggle `<button>` and
+  `content` is invisible when `output` is non-empty (see `docs/owui-map.md`, frontend constraints).
 - **Provenance-first**: `source`/`matched_key`/rates come from the real resolvers
   (`_resolve_price`, `_context_size_for` return provenance), so debug can never drift from the
   actual logic. `matched_key: null` = table-matching miss, the #1 support diagnosis.
@@ -232,5 +236,15 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | secret-bearing model/metadata dicts | whitelist copy-out only | `:1784-1823` | `test_sanitize_model_whitelist_only_no_secrets` |
 | RAG/file sources in web-search detect | non-http sources excluded | `:1836-1878` | `test_web_search_debug_ignores_non_web_sources` |
 
-Not handled by design: temporary chats (`local:` chat ids) are not branched on — the plugin works
-purely on what inlet/outlet receive, persistence differences don't affect it.
+Not handled by design: non-persistent chats (`temporary:` at 0.11.x, legacy `local:`, and
+`channel:`) are not branched on — the plugin works purely on what inlet/outlet receive, persistence
+differences don't affect it.
+
+**Not detectable from inside the plugin's own logic — the #1 "it runs but nothing shows" cause.**
+OWUI's frontend gates the whole status line on the model's **Status Updates** capability and the
+debug citation on **Citations** (`ResponseMessage.svelte:683,882`). With either off, the plugin
+emits normally, the backend persists normally, and the user sees nothing — only the stdout
+`[TUD debug]` mirror survives. Workspace/preset models are the ones affected (they store an
+explicit `info.meta.capabilities`; plain connection models have no `info` and default to on).
+`__model__["info"]["meta"]["capabilities"]` **is** readable in outlet, so the debug payload could
+surface this directly — not implemented yet, see `docs/owui-map.md` → frontend constraints.

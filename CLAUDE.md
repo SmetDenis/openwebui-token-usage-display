@@ -32,7 +32,7 @@ and listed in the official Open WebUI docs Community Plugins catalog
 - Plugin internals — pipeline, valves, resolution chains, token/cache semantics, debug payload,
   edge-case catalog with covering tests: @docs/plugin-internals.md
 - Open WebUI source map — filter machinery, request lifecycle, usage normalization, persistence,
-  events, frontend constraints (verified against v0.10.2): @docs/owui-map.md
+  events, frontend constraints (verified against v0.11.1): @docs/owui-map.md
 
 ## Commands
 

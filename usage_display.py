@@ -11,14 +11,17 @@ required_open_webui_version: 0.9.0
 
 from __future__ import annotations
 
-# NOTE (0.9.0+ target, built around the 0.10.x model, verified against source):
+# NOTE (0.9.0+ target, built around the 0.10.x/0.11.x model, verified against source):
 #   * OWUI runs `normalize_usage`/`merge_usage` on every usage-save path, so a
 #     saved `message["usage"]` is GUARANTEED to carry input_tokens/output_tokens/
 #     total_tokens, while provider-native keys/detail dicts are preserved.
 #     -> primary token read is the normalized triple; provider keys are backup.
-#   * `message["content"]` is NOT persisted at 0.10.x — both streaming and
+#   * `message["content"]` is NOT persisted at 0.10.x/0.11.x — both streaming and
 #     non-streaming save paths write only the structured `message["output"]`
-#     array. -> tiktoken fallback reads content first (0.9.x), then walks `output`.
+#     array. At 0.11.x the OUTLET BODY nonetheless carries a non-empty `content`:
+#     it is synthesized per message as `content or get_output_text(output)` while
+#     the body is assembled. -> tiktoken fallback reads content first (0.9.x and
+#     0.11.x outlet), then walks `output` (the only source on 0.10.x).
 #   * `message["info"]` is a redundant mirror ({"usage": ...}) of top-level usage
 #     on persisted chats -> intentionally ignored to avoid double counting.
 #   * Detail keys differ by API: Chat Completions -> prompt_tokens_details /
