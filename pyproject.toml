@@ -18,7 +18,9 @@ dev = [
 
 [tool.uv]
 package = false            # a single pasted file, not an installable package
-required-version = ">=0.12.13"
+# Floor, not the newest: Dependabot's updater bundles its own uv (0.12.7 on 2026-09-15) and refuses to run
+# when it falls below this. uv 0.12.7 verified to produce this exact lock (`uv lock --check`).
+required-version = ">=0.12.7"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

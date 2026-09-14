@@ -10,7 +10,7 @@ Open WebUI. Everything else in this repo is the test harness, docs, and CI aroun
 
 ## Requirements
 
-- [uv](https://docs.astral.sh/uv/) 0.12.13+ (it provides Python 3.11+ itself if needed)
+- [uv](https://docs.astral.sh/uv/) 0.12.7+ (it provides Python 3.11+ itself if needed)
 - `make`
 
 ## Setup
