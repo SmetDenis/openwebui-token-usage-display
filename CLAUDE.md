@@ -20,8 +20,9 @@ and listed in the official Open WebUI docs Community Plugins catalog
   `pip install` inside OWUI that fails in uvx/LXC deployments and blocks the plugin from loading
   (real user bug reports) — soft imports exist precisely to avoid it.
 - **Do not reflow the docstring frontmatter.** OWUI parses strictly one `key: value` per line
-  (`utils/plugin.py:extract_frontmatter`); wrapping a long line truncates the metadata. This is
-  why `E501` is ignored for `usage_display.py`.
+  (`utils/plugin.py:extract_frontmatter`); wrapping a long line truncates the metadata, and the
+  first line must stay bare `"""`. This is why the closing `"""` carries
+  `# noqa: D205, D212, D415, E501` (ruff reads a multi-line string's noqa from its last line).
 - **Verify every claim about OWUI behavior against real OWUI source, not memory or docs.** The
   data model shifts between versions. A read-only local clone path and freshness-check commands
   live in `CLAUDE.local.md`; the verified map is in the imported `docs/owui-map.md`. If the clone
@@ -36,11 +37,16 @@ and listed in the official Open WebUI docs Community Plugins catalog
 
 ## Commands
 
-The dev environment lives in `.venv`; the `Makefile` drives everything through `.venv/bin/python`.
+Dev tooling is managed by **uv**: the `dev` dependency group in `pyproject.toml` plus the committed
+`uv.lock` (exact versions). The `Makefile` runs every tool as `uv run --locked …`, which fails if the
+lock is stale, so local runs and CI use identical ruff/mypy/pytest versions. There is no
+`requirements-dev.txt` any more.
 
 ```bash
-python -m venv .venv && make install-dev   # one-time setup
+make install-dev                           # one-time setup: uv sync --locked (creates .venv)
 make pre-commit                            # the full gate: lint + typecheck + test-cov
+make lock        # re-lock after editing [dependency-groups]
+make upgrade     # bump every locked tool to its latest allowed version (then run the gate)
 make lint        # ruff check + ruff format --check
 make format      # ruff format + ruff check --fix (auto-fix)
 make typecheck   # mypy --strict
@@ -50,9 +56,11 @@ make test-cov    # pytest with coverage (term-missing + HTML in htmlcov/)
 
 `make pre-commit` must be green before any change is done. It enforces **mypy strict** and a
 **coverage floor of 95%** (`pyproject.toml` `fail_under = 95`). CI (`.github/workflows/ci.yml`,
-single `gate` job) runs the same gate across Python 3.11–3.14 on pushes to `main` and all PRs.
+single `gate` job) runs the same gate across Python 3.11–3.14 on pushes to `main` and all PRs,
+installing tools with `astral-sh/setup-uv` (pinned by commit SHA — it publishes no floating major
+tag) and `uv sync --locked`.
 
-Run a single test: `.venv/bin/python -m pytest tests/test_usage_display.py::test_render_input`
+Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_render_input`
 (or `-k <substring>`). The suite has no network and no Open WebUI runtime — it is fast.
 
 ## Releasing a change
@@ -75,8 +83,8 @@ Run a single test: `.venv/bin/python -m pytest tests/test_usage_display.py::test
 - Config is two Pydantic models: `Valves` (admin — all toggles, ordering, cost/context maps and
   URLs) and `UserValves` (per-user `enabled` kill-switch only; per-user customization was
   deliberately rolled back).
-- The stats line is a dispatch table (`_STATS_RENDERERS`, 14 metric keys, fixed 6-arg renderer
-  signature). Key rule: **`show_*` valves gate visibility; `display_order` only sorts.**
+- The stats line is a dispatch table (`_STATS_RENDERERS`, 14 metric keys, every renderer takes one
+  frozen `_Stats` object). Key rule: **`show_*` valves gate visibility; `display_order` only sorts.**
 - Context, price and model identity resolve through priority-ordered fallback chains
   (short-circuit on first hit); table lookups use longest-key case-insensitive substring match.
   Workspace/"agent" models resolve via **`base_model_id`**.
@@ -93,19 +101,22 @@ Run a single test: `.venv/bin/python -m pytest tests/test_usage_display.py::test
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (182 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (185 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
-and `make_*` builders live at the top of the test file). `pydantic` is pinned in
-`requirements-dev.txt` to the version OWUI ships (`2.13.4` for OWUI 0.10.2), so the plugin is
-tested against the same pydantic it runs on in production — keep that pin tracking OWUI's, and
-don't let a Dependabot bump drift it silently (Dependabot runs weekly for pip and GitHub Actions).
+and `make_*` builders live at the top of the test file). `pydantic` is pinned (`==`) in the `dev`
+dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.11.3), so the plugin
+is tested against the same pydantic it runs on in production — keep that pin tracking OWUI's, and
+don't merge a Dependabot bump that drifts it (Dependabot runs weekly for the `uv` and
+`github-actions` ecosystems).
 
 ## Conventions
 
-- Line length 120; ruff lint is broad (see `pyproject.toml` `[tool.ruff.lint]`). The per-file
-  ignores on `usage_display.py` (`E501`, `PLR0913`, `PLR0912`, `PLR2004`, `SIM117`) are
-  intentional and documented inline.
-- Non-ASCII glyphs (`·`, emoji icons, `≈`, `Σ`) in strings are intentional (`RUF001/2/3` ignored).
+- Line length 120; ruff runs with **`select = ["ALL"]`** (Google docstring convention). Every
+  exclusion in `pyproject.toml` carries its reason; `usage_display.py` excludes only `ANN401`
+  (parsed provider JSON). Fix the cause first (split a complex function, name a magic number,
+  narrow an `except`); a justified one-off gets a per-line `# noqa: RULE - reason`, not a wider
+  ignore list. The intentional `except Exception` guards (the plugin must never break the
+  response) are exactly the `# noqa: BLE001` lines.
 - `_STATIC_CONTEXT_SIZES` and `_STATIC_PRICES` are hand-maintained offline seed tables (from
   models.dev, seeded 2026-07) — refresh them periodically; keep the `llama` family out of
   `_STATIC_PRICES` on purpose (free on Meta's API, paid on Groq/Together — a hardcoded $0 would

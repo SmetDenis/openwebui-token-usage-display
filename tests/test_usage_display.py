@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any, Self
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import ModuleType
 
 
 def test_module_loads_and_exposes_filter(usage_display_module: ModuleType) -> None:
@@ -149,7 +152,7 @@ class CapturingEmitter:
 
 
 class _FakeEncoding:
-    def __init__(self, per_word: bool) -> None:
+    def __init__(self, *, per_word: bool) -> None:
         self._per_word = per_word
 
     def encode(self, text: str) -> list[int]:
@@ -158,21 +161,21 @@ class _FakeEncoding:
 
 
 class _FakeTiktoken:
-    def __init__(self, per_word: bool) -> None:
+    def __init__(self, *, per_word: bool) -> None:
         self._per_word = per_word
 
     def encoding_for_model(self, model: str) -> _FakeEncoding:
         if not model:
             raise KeyError(model)
-        return _FakeEncoding(self._per_word)
+        return _FakeEncoding(per_word=self._per_word)
 
-    def get_encoding(self, name: str) -> _FakeEncoding:
-        return _FakeEncoding(self._per_word)
+    def get_encoding(self, name: str) -> _FakeEncoding:  # noqa: ARG002 - mirrors tiktoken.get_encoding
+        return _FakeEncoding(per_word=self._per_word)
 
 
 def install_fake_tiktoken(monkeypatch: pytest.MonkeyPatch, mod: ModuleType, *, per_word: bool = True) -> None:
     """Make the plugin's tiktoken path live: 1 token per whitespace-word (deterministic)."""
-    monkeypatch.setattr(mod, "tiktoken", _FakeTiktoken(per_word), raising=False)
+    monkeypatch.setattr(mod, "tiktoken", _FakeTiktoken(per_word=per_word), raising=False)
     monkeypatch.setattr(mod, "_TIKTOKEN_AVAILABLE", True, raising=False)
 
 
@@ -182,15 +185,15 @@ class _FakeAiohttpResponse:
     def __init__(self, payload: Any) -> None:
         self._payload = payload
 
-    async def __aenter__(self) -> _FakeAiohttpResponse:
+    async def __aenter__(self) -> Self:
         if isinstance(self._payload, Exception):
             raise self._payload
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         return None
 
-    async def json(self, content_type: Any = None) -> Any:
+    async def json(self, content_type: str | None = None) -> Any:  # noqa: ARG002 - mirrors aiohttp
         return self._payload
 
 
@@ -200,10 +203,10 @@ class _FakeAiohttpSession:
     def __init__(self, responses: dict[str, Any]) -> None:
         self._responses = responses
 
-    async def __aenter__(self) -> _FakeAiohttpSession:
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         return None
 
     def get(self, url: str, **_kw: Any) -> _FakeAiohttpResponse:
@@ -222,10 +225,10 @@ class _FakeAiohttpModule:
         self._responses = responses or {}
         self._session_error = session_error
 
-    def ClientTimeout(self, **_kw: Any) -> Any:  # mirrors aiohttp's real API name
+    def ClientTimeout(self, **_kw: Any) -> object:  # noqa: N802 - mirrors aiohttp's real API name
         return object()
 
-    def ClientSession(self, **_kw: Any) -> _FakeAiohttpSession:  # mirrors aiohttp's real API name
+    def ClientSession(self, **_kw: Any) -> _FakeAiohttpSession:  # noqa: N802 - mirrors aiohttp's real API name
         if self._session_error is not None:
             raise self._session_error
         return _FakeAiohttpSession(self._responses)
@@ -264,7 +267,7 @@ def test_num_rejects_bool_and_nonnumbers(usage_display_module: ModuleType) -> No
     assert _num(5) == 5
     assert _num(1.5) == 1.5
     assert _num(0) == 0  # 0 is valid, not falsy-dropped
-    assert _num(True) is None  # bool is not a number here
+    assert _num(True) is None  # noqa: FBT003 - bool is not a number here
     assert _num("5") is None
     assert _num(None) is None
     assert _num(float("nan")) is None  # non-finite: would crash int() in _compute_total
@@ -474,6 +477,12 @@ def valves(usage_display_module: ModuleType) -> Any:
     return usage_display_module.Filter().valves
 
 
+def renderer(mod: ModuleType, name: str) -> Callable[..., str | None]:
+    """A `_render_*(stats)` renderer, called here as `r(valves, tokens, timing, ctx, cost, model)`."""
+    render = getattr(mod, name)
+    return lambda *fields: render(mod._Stats(*fields))
+
+
 def test_icon_styles(usage_display_module: ModuleType, valves: Any) -> None:
     _icon = usage_display_module._icon
     valves.icon_style = "emoji"
@@ -517,7 +526,7 @@ def test_fmt_count_compact_toggle(usage_display_module: ModuleType, valves: Any)
 
 
 def test_render_input(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_input
+    r = renderer(usage_display_module, "_render_input")
     valves.icon_style = "emoji"
     assert r(valves, make_tokens(input=100), make_timing(), make_ctx(), make_cost(), None) == "⬆︎ 100"
     valves.show_input_tokens = False
@@ -527,7 +536,7 @@ def test_render_input(usage_display_module: ModuleType, valves: Any) -> None:
 
 
 def test_render_output(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_output
+    r = renderer(usage_display_module, "_render_output")
     assert r(valves, make_tokens(output=50), make_timing(), make_ctx(), make_cost(), None) == "⬇︎ 50"
     assert r(valves, make_tokens(output=None), make_timing(), make_ctx(), make_cost(), None) is None
     valves.show_output_tokens = False
@@ -535,7 +544,7 @@ def test_render_output(usage_display_module: ModuleType, valves: Any) -> None:
 
 
 def test_render_total(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_total
+    r = renderer(usage_display_module, "_render_total")
     assert r(valves, make_tokens(total=150), make_timing(), make_ctx(), make_cost(), None) == "Σ 150"
     assert r(valves, make_tokens(total=None), make_timing(), make_ctx(), make_cost(), None) is None
     valves.show_total_tokens = False
@@ -543,7 +552,7 @@ def test_render_total(usage_display_module: ModuleType, valves: Any) -> None:
 
 
 def test_render_tokens_total_dedupes_and_marks_estimate(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_tokens_total
+    r = renderer(usage_display_module, "_render_tokens_total")
     valves.icon_style = "emoji"
     shown = make_tokens(total=150, cumulative=4200)
     assert r(valves, shown, make_timing(), make_ctx(), make_cost(), None) == "🧮 4,200"
@@ -563,7 +572,7 @@ def test_render_tokens_total_dedupes_and_marks_estimate(usage_display_module: Mo
 
 
 def test_render_reasoning_hidden_when_zero_or_none(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_reasoning
+    r = renderer(usage_display_module, "_render_reasoning")
     assert r(valves, make_tokens(reasoning=32), make_timing(), make_ctx(), make_cost(), None) == "🧠 32"
     # reasoning uses truthiness: 0 and None both omit
     assert r(valves, make_tokens(reasoning=0), make_timing(), make_ctx(), make_cost(), None) is None
@@ -573,7 +582,7 @@ def test_render_reasoning_hidden_when_zero_or_none(usage_display_module: ModuleT
 
 
 def test_render_cached(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_cached
+    r = renderer(usage_display_module, "_render_cached")
     assert r(valves, make_tokens(cached=64), make_timing(), make_ctx(), make_cost(), None) == "💾 64"
     assert r(valves, make_tokens(cached=0), make_timing(), make_ctx(), make_cost(), None) is None
     assert r(valves, make_tokens(cached=None), make_timing(), make_ctx(), make_cost(), None) is None
@@ -582,7 +591,7 @@ def test_render_cached(usage_display_module: ModuleType, valves: Any) -> None:
 
 
 def test_render_audio_default_hidden_flag(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_audio
+    r = renderer(usage_display_module, "_render_audio")
     assert valves.show_audio_tokens is False  # default off
     assert r(valves, make_tokens(audio=10), make_timing(), make_ctx(), make_cost(), None) is None
     valves.show_audio_tokens = True
@@ -592,7 +601,7 @@ def test_render_audio_default_hidden_flag(usage_display_module: ModuleType, valv
 
 
 def test_render_context(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_context
+    r = renderer(usage_display_module, "_render_context")
     valves.icon_style = "emoji"
     out = r(valves, make_tokens(), make_timing(), make_ctx(size=200_000, used=50_000), make_cost(), None)
     assert out == "📐 50.0k/200.0k (25%)"
@@ -607,7 +616,7 @@ def test_render_context(usage_display_module: ModuleType, valves: Any) -> None:
 
 
 def test_render_time_wall_prefix(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_time
+    r = renderer(usage_display_module, "_render_time")
     assert r(valves, make_tokens(), make_timing(seconds=2.5, source="usage"), make_ctx(), make_cost(), None) == "⏱ 2.5s"
     assert r(valves, make_tokens(), make_timing(seconds=2.5, source="wall"), make_ctx(), make_cost(), None) == "⏱ ~2.5s"
     assert r(valves, make_tokens(), make_timing(seconds=None), make_ctx(), make_cost(), None) is None
@@ -616,7 +625,7 @@ def test_render_time_wall_prefix(usage_display_module: ModuleType, valves: Any) 
 
 
 def test_render_tps(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_tps
+    r = renderer(usage_display_module, "_render_tps")
     assert r(valves, make_tokens(), make_timing(tps=42.37), make_ctx(), make_cost(), None) == "⚡ 42.4 t/s"
     assert r(valves, make_tokens(), make_timing(tps=0), make_ctx(), make_cost(), None) is None
     valves.show_tokens_per_second = False
@@ -624,7 +633,7 @@ def test_render_tps(usage_display_module: ModuleType, valves: Any) -> None:
 
 
 def test_render_cost_estimate_marker_and_threshold(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_cost
+    r = renderer(usage_display_module, "_render_cost")
     assert r(valves, make_tokens(), make_timing(), make_ctx(), make_cost(message=1.5), None) == "💰 $1.50"
     assert (
         r(valves, make_tokens(), make_timing(), make_ctx(), make_cost(message=1.5, message_est=True), None)
@@ -636,7 +645,7 @@ def test_render_cost_estimate_marker_and_threshold(usage_display_module: ModuleT
 
 
 def test_render_cost_total_dedupes_when_equal_to_message(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_cost_total
+    r = renderer(usage_display_module, "_render_cost_total")
     # cumulative == message -> omitted (no point repeating)
     assert r(valves, make_tokens(), make_timing(), make_ctx(), make_cost(message=1.5, cumulative=1.5), None) is None
     # cumulative > message -> shown
@@ -659,7 +668,7 @@ def test_render_cost_total_dedupes_when_equal_to_message(usage_display_module: M
 
 
 def test_render_model_uses_base_model_id(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_model
+    r = renderer(usage_display_module, "_render_model")
     model = make_model_dict("my-workspace-model", base="gpt-4o")
     assert r(valves, make_tokens(), make_timing(), make_ctx(), make_cost(), model) == "🤖 gpt-4o"
     assert r(valves, make_tokens(), make_timing(), make_ctx(), make_cost(), make_model_dict()) is None  # no info
@@ -669,7 +678,7 @@ def test_render_model_uses_base_model_id(usage_display_module: ModuleType, valve
 
 
 def test_render_source_api_vs_estimate(usage_display_module: ModuleType, valves: Any) -> None:
-    r = usage_display_module._render_source
+    r = renderer(usage_display_module, "_render_source")
     valves.show_data_source = True
     assert r(valves, make_tokens(is_api=True), make_timing(), make_ctx(), make_cost(), None) == "[API]"
     assert r(valves, make_tokens(is_api=False), make_timing(), make_ctx(), make_cost(), None) == "[est.]"
@@ -1208,27 +1217,48 @@ def test_parse_prices_nested_shape_skips_non_dict_entry(usage_display_module: Mo
 def test_parse_llama_swap_extracts_ctx_size_from_running(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     data = {"running": [{"cmd": "llama-server --model foo.gguf --ctx-size 8192 --port 8080"}]}
-    assert f._parse_llama_swap(data) == 8192
+    assert f._parse_llama_swap(data, "some-model") == 8192
 
 
 def test_parse_llama_swap_skips_non_dict_rows(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     data = {"running": [123, {"cmd": "--ctx-size 999"}]}
-    assert f._parse_llama_swap(data) == 999
+    assert f._parse_llama_swap(data, "some-model") == 999
 
 
 def test_parse_llama_swap_cmd_as_list(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     data = {"running": [{"cmd": ["llama-server", "--ctx-size", "4096"]}]}
-    assert f._parse_llama_swap(data) == 4096
+    assert f._parse_llama_swap(data, "some-model") == 4096
 
 
 def test_parse_llama_swap_malformed_input_returns_none(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
-    assert f._parse_llama_swap(None) is None
-    assert f._parse_llama_swap({"running": []}) is None
-    assert f._parse_llama_swap({"running": "not-a-list"}) is None
-    assert f._parse_llama_swap({"running": [{"cmd": "llama-server --no-ctx-flag"}]}) is None
+    assert f._parse_llama_swap(None, "some-model") is None
+    assert f._parse_llama_swap({"running": []}, "some-model") is None
+    assert f._parse_llama_swap({"running": "not-a-list"}, "some-model") is None
+    assert f._parse_llama_swap({"running": [{"cmd": "llama-server --no-ctx-flag"}]}, "some-model") is None
+
+
+def test_parse_llama_swap_picks_the_called_model_among_several(usage_display_module: ModuleType) -> None:
+    """llama-swap runs model groups side by side; the window must be the called model's, not the first row's."""
+    f = usage_display_module.Filter()
+    data = {
+        "running": [
+            {"model": "gemma-3-4b", "cmd": "llama-server --ctx-size 8192"},
+            {"model": "qwen3-30b", "cmd": "llama-server --ctx-size 32768"},
+        ]
+    }
+    assert f._parse_llama_swap(data, "qwen3-30b") == 32768  # exact id
+    assert f._parse_llama_swap(data, "llama-swap.qwen3-30b") == 32768  # OWUI connection prefix: substring match
+    assert f._parse_llama_swap(data, "mistral-7b") is None  # several rows, none matches: no guessing
+
+
+def test_parse_llama_swap_single_row_is_used_despite_id_mismatch(usage_display_module: ModuleType) -> None:
+    """One running model is unambiguous, so an alias or differently-spelled OWUI id still gets its window."""
+    f = usage_display_module.Filter()
+    data = {"running": [{"model": "qwen3-30b", "cmd": "llama-server --ctx-size 32768"}]}
+    assert f._parse_llama_swap(data, "my-alias") == 32768
 
 
 # --- stats assembly, provider guess, sanitize, valves snapshot ----------------- #
@@ -1239,9 +1269,8 @@ def test_build_stats_respects_display_order_and_gating(usage_display_module: Mod
     f.valves.display_order = "output, input"
     f.valves.show_total_tokens = False
     f.valves.icon_style = "off"
-    parts = f._build_stats(
-        f.valves, make_tokens(input=100, output=50, total=150), make_timing(), make_ctx(), make_cost(), None
-    )
+    tokens = make_tokens(input=100, output=50, total=150)
+    parts = f._build_stats(usage_display_module._Stats(f.valves, tokens, make_timing(), make_ctx(), make_cost(), None))
     assert parts[0] == "50"  # output before input
     assert parts[1] == "100"
     assert "150" not in parts  # total gated off
@@ -1485,7 +1514,7 @@ def test_resolve_wall_clock_reconstructs_key_from_chat_and_message_id(usage_disp
 
 
 def test_resolve_wall_clock_metadata_present_without_chat_or_message_id(usage_display_module: ModuleType) -> None:
-    """metadata is a real, truthy dict, but carries no chat_id/message_id to reconstruct a key from."""
+    """A real, truthy metadata dict that carries no chat_id/message_id to reconstruct a key from."""
     f = usage_display_module.Filter()
     metadata = {"some_other_key": "value"}
     assert f._resolve_wall_clock(make_body(), metadata) is None
@@ -1963,7 +1992,7 @@ def test_resolve_cost_auto_native_key_used(usage_display_module: ModuleType, mon
 def test_resolve_cost_auto_no_native_key_never_estimates(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """auto mode must never fall back to estimation, even when tokens/price would allow it."""
+    """Auto mode must never fall back to estimation, even when tokens/price would allow it."""
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)
     f.valves.cost_mode = "auto"
@@ -1976,7 +2005,7 @@ def test_resolve_cost_auto_no_native_key_never_estimates(
 def test_resolve_cost_estimate_no_price_and_cumulative_disabled(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """estimate mode, no price found anywhere, show_cumulative_cost off -> message stays None, no cumulative work."""
+    """Estimate mode, no price found anywhere, show_cumulative_cost off -> message stays None, no cumulative work."""
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)
     f.valves.cost_mode = "estimate"
@@ -1993,9 +2022,10 @@ def test_resolve_cost_estimate_no_price_and_cumulative_disabled(
 def test_resolve_cost_cumulative_mixes_native_and_estimated_messages(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Native cost wins for the current message; cumulative still resolves a price to estimate
+    """Native cost wins for the current message, while the chat total still estimates the rest.
 
-    the cost of OTHER historical messages that carry no native cost of their own.
+    The cumulative walk resolves a price to estimate OTHER historical messages that carry no
+    native cost of their own.
     """
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)
@@ -2019,9 +2049,9 @@ def test_resolve_cost_cumulative_mixes_native_and_estimated_messages(
 def test_resolve_cost_cumulative_skips_non_estimable_message_and_continues_loop(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A historical message with no native cost AND an empty (non-estimable) token bag contributes
+    """A non-estimable historical message contributes nothing, and the loop still continues.
 
-    nothing, but the loop still continues on to price the next message.
+    The message has no native cost AND an empty token bag; the next message is still priced.
     """
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)
@@ -2202,21 +2232,11 @@ def test_emit_debug_json_dumps_failure_falls_back_to_error_string(
 
     monkeypatch.setattr(mod.json, "dumps", _boom)
     emitter = CapturingEmitter()
-    run_async(
-        f._emit_debug(
-            emitter,
-            None,
-            [],
-            make_message("a", usage=make_usage()),
-            make_usage(),
-            make_tokens(),
-            make_timing(),
-            make_ctx(),
-            make_cost(),
-            None,
-            None,
-        )
+    turn = mod._Turn(
+        task=None, messages=[], assistant_msg=make_message("a", usage=make_usage()), usage=make_usage(), metadata=None
     )
+    stats = mod._Stats(f.valves, make_tokens(), make_timing(), make_ctx(), make_cost(), None)
+    run_async(f._emit_debug(emitter, turn, stats))
     citation = next(e for e in emitter.events if e.get("type") == "citation")
     doc = citation["data"]["document"][0]
     assert "serialization error" in doc
@@ -2361,6 +2381,22 @@ def test_probe_context_llama_swap_success(usage_display_module: ModuleType, monk
     f.valves.llama_swap_url = "http://localhost:8090"
     install_fake_aiohttp(monkeypatch, mod, {"http://localhost:8090/running": {"running": [{"cmd": "--ctx-size 4096"}]}})
     assert run_async(f._probe_context("some-model")) == 4096
+
+
+def test_probe_context_llama_swap_unmatched_model_falls_back_to_llamacpp(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    f.valves.llama_swap_url = "http://localhost:8090"
+    f.valves.llamacpp_url = "http://localhost:8080"
+    running = {"running": [{"model": "a", "cmd": "--ctx-size 1024"}, {"model": "b", "cmd": "--ctx-size 2048"}]}
+    install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {"http://localhost:8090/running": running, "http://localhost:8080/props": {"n_ctx": 8192}},
+    )
+    assert run_async(f._probe_context("some-model")) == 8192
 
 
 def test_probe_context_llama_swap_no_match_and_no_llamacpp_returns_none(

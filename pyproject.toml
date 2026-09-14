@@ -1,8 +1,24 @@
 [project]
 name = "openwebui-token-usage-display"
-version = "2.6.0"
+version = "2.6.1"
 description = "Open WebUI filter plugin: token usage & cost display below each response"
 requires-python = ">=3.11"
+
+# Dev tooling only: the plugin itself has zero runtime dependencies (see CLAUDE.md). Exact
+# versions live in uv.lock, which CI installs with `uv sync --locked`, so local and CI tools match.
+[dependency-groups]
+dev = [
+  "pytest>=9.1.1",
+  "pytest-cov>=7.1.0",
+  "ruff>=0.16.7",
+  "mypy>=2.3.1",
+  # Mirrors the pin Open WebUI ships (0.10.2 through 0.11.3): the plugin runs against this pydantic.
+  "pydantic==2.13.4",
+]
+
+[tool.uv]
+package = false            # a single pasted file, not an installable package
+required-version = ">=0.12.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -21,6 +37,7 @@ exclude_lines = [
   "pragma: no cover",
   "if __name__ == .__main__.:",
   "raise NotImplementedError",
+  "if TYPE_CHECKING:",
 ]
 
 [tool.ruff]
@@ -28,23 +45,32 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET", "RUF", "PT", "PL", "ANN", "C4", "T20"]
+# Every rule is on; each exclusion below names why it does not fit this project. Prefer a per-line
+# `# noqa: RULE - reason` for a justified one-off over widening these lists. New rules arrive only
+# with a deliberate ruff bump in uv.lock, where CI shows them before merge.
+select = ["ALL"]
 ignore = [
-  "ANN401",   # any-type — Any is acceptable around the usage/json helpers.
-  "RUF001",   # ambiguous-unicode in strings — glyphs like '·' are intentional.
-  "RUF002",   # ambiguous-unicode in docstrings.
-  "RUF003",   # ambiguous-unicode in comments.
+  "CPY001",   # copyright header per file — the repo is MIT-licensed via LICENSE; the plugin header is OWUI frontmatter.
+  "COM812",   # trailing commas — conflicts with `ruff format` (ruff's own formatter-compatibility guidance).
 ]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "usage_display.py" = [
-  "E501",     # docstring frontmatter: OWUI parses one `key: value` per line — wrapping truncates it.
-  "PLR0913",  # the 13 _render_* + _build_stats share a fixed 6-arg signature for uniform dispatch.
-  "PLR0912",  # too-many-branches — provider/API-shape handling has many conditionals.
-  "PLR2004",  # magic-value — formatting/threshold constants are pinned to spec.
-  "SIM117",   # nested `async with` in the aiohttp probes reads clearer than a combined form.
+  "ANN401",   # Any for parsed provider JSON (usage/output/model dicts): the payload shape is what the code validates.
 ]
-"tests/*" = ["PLR2004", "ANN", "S101", "T201", "PLR0913", "PLC0415"]
+"tests/*" = [
+  "D1",       # test names are the documentation; docstrings only where a case needs explaining.
+  "S101",     # pytest asserts.
+  "SLF001",   # the plugin is a single file of private helpers; the tests exercise them directly by design.
+  "INP001",   # tests/ is a pytest rootdir, not an importable package.
+  "PLR2004",  # literal expected values in assertions are the point of a test.
+  "ANN401",   # fakes and builders accept arbitrary JSON-like payloads.
+  "TRY003",   # fakes raise ad-hoc errors with inline messages to simulate failures.
+  "EM101",    # same: inline exception messages in simulated failures.
+]
 
 [tool.mypy]
 python_version = "3.11"

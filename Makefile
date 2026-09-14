@@ -1,22 +1,29 @@
-PY := .venv/bin/python
-PYTEST := $(PY) -m pytest
-RUFF := $(PY) -m ruff
-MYPY := $(PY) -m mypy
+# Every tool runs from the uv-managed .venv at the exact versions in uv.lock (--locked fails if
+# the lockfile is out of date with pyproject.toml), so `make` and CI use identical tooling.
+RUN := uv run --locked
+PYTEST := $(RUN) pytest
+RUFF := $(RUN) ruff
+MYPY := $(RUN) mypy
 
 HASH := \#
 PY_LINT_TARGETS := usage_display.py tests
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install-dev test test-cov lint format typecheck pre-commit clean
+.PHONY: help install-dev lock upgrade test test-cov lint format typecheck pre-commit clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?$(HASH)$(HASH) .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?$(HASH)$(HASH) "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-install-dev:  ## Install dev dependencies (pip + requirements-dev.txt)
-	$(PY) -m pip install --upgrade pip
-	$(PY) -m pip install -r requirements-dev.txt
+install-dev:  ## Create/sync .venv with the exact dev tools from uv.lock
+	uv sync --locked
+
+lock:  ## Re-lock after editing [dependency-groups] in pyproject.toml
+	uv lock
+
+upgrade:  ## Upgrade every locked dev tool to its latest allowed version
+	uv lock --upgrade
 
 test:  ## Run pytest suite
 	$(PYTEST) tests

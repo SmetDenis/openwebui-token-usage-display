@@ -91,15 +91,18 @@ when non-obvious:
 `_STATS_RENDERERS` (`:737-751`) maps 14 keys (`input`, `output`, `total`, `tokens_total`,
 `reasoning`, `cached`, `audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `model`, `source`)
 to `_render_*`
-functions sharing a fixed 6-arg signature `(v, tokens, timing, ctx, cost, model)` — the reason
-`PLR0913` is suppressed. `_build_stats` (`:1708-1736`) walks the resolved order, drops `None`
-results, and suppresses a line consisting solely of `source` parts (`:1734-1735`).
+functions with one signature `(s: _Stats) -> str | None`. `_Stats` is a frozen dataclass bundling
+`valves`, `tokens`, `timing`, `ctx`, `cost`, `model` (v2.6.1; it replaced a fixed 6-positional-arg
+signature that forced suppressing `PLR0913`/`PLR0917` and left every renderer with unused
+arguments). `_build_stats` walks the resolved order, drops `None` results, and suppresses a line
+consisting solely of `source` parts. `_emit_debug` takes the same `_Stats` plus a `_Turn` (task,
+messages, assistant message, usage, metadata).
 
 Rules: **`show_*` valves gate visibility; `display_order` only sorts.** `_resolve_display_order`
 (`:451-458`) always returns a full 14-key permutation — removed keys move to the end, unknown keys
 are ignored (surfaced only in the debug payload). To add a metric: add a `show_*` valve, write a
-6-arg `_render_*`, register it in `_STATS_RENDERERS`, append the key to `_DEFAULT_ORDER`, add an
-icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
+`_render_*(s: _Stats)`, register it in `_STATS_RENDERERS`, append the key to `_DEFAULT_ORDER`, add
+an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
 
 ## Resolution chains
 
@@ -110,6 +113,14 @@ icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
 7. llama.cpp/llama-swap probe (opt-in). Tiers 1–3 return **uncached** on purpose (valve edits take
 effect immediately); only 5–7 results are cached (`max(60, context_probe_ttl)`). The user map was
 promoted above models.dev in v2.5.1 — an explicit user entry must never lose to a live lookup.
+Since v2.6.1 the tiers live in `_explicit_context_size` (1–3) and `_automatic_context_size` (5–7).
+
+The probe (`_probe_context` → `_probe_llama_swap`, then `_probe_llamacpp`) asks llama-swap first.
+llama-swap's `/running` lists every running model (`model`, `cmd`, …; verified against
+`internal/server/api.go:handleRunning` in `mostlygeek/llama-swap`), so `_parse_llama_swap` matches the
+row to the called model id with `_modelsdev_match` semantics. One running row is taken as is (an OWUI
+connection prefix or alias may make the ids differ); several rows with no match return `None` and
+fall through to llama.cpp — never another model's window (the pre-2.6.1 bug).
 
 ### Cost — `_resolve_cost` (`:1429-1494`)
 
@@ -117,7 +128,7 @@ promoted above models.dev in v2.5.1 — an explicit user entry must never lose t
 - `auto` (default) — **only** `_native_cost(usage)`: the provider/proxy-reported cost that survives
   OWUI's `USAGE_COST_KEYS` merge (OpenRouter, LiteLLM). Never estimates, never touches the network.
 - `estimate` — native first, else `_estimate_cost(tokens, price)` marked `≈`.
-- **Cumulative** (`💰Σ`): recomputed each turn by summing per-message `usage` over
+- **Cumulative** (`💰Σ`, `_cumulative_cost`): recomputed each turn by summing per-message `usage` over
   `body["messages"]` — deliberately NOT a module-level accumulator (survives restarts, follows the
   active branch on regenerate/edit). Suppressed when equal to the message cost. Caveat: historical
   messages without native cost are estimated at the *current* model's price (history carries no
@@ -273,6 +284,8 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | mixed native/estimated history | summed; `≈` if any estimated | `:1459-1479` | `test_resolve_cost_cumulative_mixes_native_and_estimated_messages` |
 | malformed models.dev `api.json` | tolerant per-entry parse | `:1673-1704` | `test_parse_prices_malformed_input_yields_empty_map` |
 | malformed llama-swap `/running` | regex miss → `None` | `:1376-1391` | `test_parse_llama_swap_malformed_input_returns_none` |
+| several llama-swap models running (v2.6.1) | row matched to the called model id; no match → `None` → llama.cpp | `_parse_llama_swap` | `test_parse_llama_swap_picks_the_called_model_among_several`, `test_probe_context_llama_swap_unmatched_model_falls_back_to_llamacpp` |
+| one llama-swap model, id differs (alias/prefix) | that row is used | `_parse_llama_swap` | `test_parse_llama_swap_single_row_is_used_despite_id_mismatch` |
 | `display_order` unknown/dup/empty | ignored+debug / dedup / default | `:432-458` | `test_normalize_order_dedups_and_flags_unknown` |
 | reasoning/cached/audio == 0 | hidden (truthiness); context `used=0` still renders | `:597-636` | `test_render_reasoning_hidden_when_zero_or_none`, `test_render_context` |
 | only `source` parts rendered | whole line suppressed | `:1734-1735` | (build_stats tests) |

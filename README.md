@@ -137,8 +137,8 @@ Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - 
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). In short: `python -m venv .venv && make install-dev`, then
-`make pre-commit` (ruff + mypy strict + pytest, coverage ≥ 95%).
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short: install [uv](https://docs.astral.sh/uv/), run
+`make install-dev`, then `make pre-commit` (ruff + mypy strict + pytest, coverage ≥ 95%).
 
 ## License
 

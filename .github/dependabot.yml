@@ -7,7 +7,8 @@ updates:
     commit-message:
       prefix: ci
 
-  - package-ecosystem: pip
+  # Updates the [dependency-groups] constraints in pyproject.toml together with uv.lock.
+  - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly

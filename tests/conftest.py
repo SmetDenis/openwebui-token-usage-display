@@ -6,9 +6,12 @@ import importlib.machinery
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from types import ModuleType
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 USAGE_DISPLAY_PATH = REPO_ROOT / "usage_display.py"

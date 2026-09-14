@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.6.1]
+
+- **Fixed: the llama-swap probe could show another model's context window.** llama-swap can run several models at once (groups), and its `/running` endpoint lists each with its own `--ctx-size`; the probe took the first row regardless of which model Open WebUI called. It now picks the row whose `model` matches the called model id (exact, then last path segment, then longest substring - so an Open WebUI connection prefix still matches). A single running model is used as before, even when the ids differ (an alias). With several running models and no match, the probe reports nothing and falls through to the `llama.cpp` URL, if set, instead of guessing. Only affects the opt-in `llama_swap_url` valve.
+- **Internal (no other behavior change):** stricter linting (ruff with every rule enabled), the stats-line renderers take a single `_Stats` object instead of six positional arguments, and the four most branchy resolvers were split into helpers. Development tooling moved from `requirements-dev.txt` to uv with a committed `uv.lock`, so CI runs exactly the locally locked ruff/mypy/pytest versions (see CONTRIBUTING.md).
+
 ## [2.6.0]
 
 - **Running chat token total (`🧮`).** A new metric shows how many tokens the chat has consumed so far: the sum of every response's `Σ` on the current branch - the token twin of the `💰Σ` cost total, and the only chat-wide number for models that report no cost (Ollama, llama.cpp, other local or free models). Because the model re-reads the whole history on every turn, it counts *processed* tokens and grows much faster than the context window - it is not the size of the chat (that is `📐`). Details:

@@ -10,15 +10,20 @@ Open WebUI. Everything else in this repo is the test harness, docs, and CI aroun
 
 ## Requirements
 
-- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) 0.12.13+ (it provides Python 3.11+ itself if needed)
 - `make`
 
 ## Setup
 
 ```bash
-python -m venv .venv
-make install-dev
+make install-dev   # uv sync --locked: creates .venv with the exact tool versions from uv.lock
 ```
+
+Dev tools (ruff, mypy, pytest, pytest-cov, pydantic) are declared in the `dev` dependency group of
+`pyproject.toml` and pinned exactly in the committed `uv.lock`. Every `make` target runs them through
+`uv run --locked`, so an out-of-date lock fails loudly instead of silently using different versions.
+After editing the dependency group run `make lock`; to take newer tool versions run `make upgrade`
+and then `make pre-commit`.
 
 ## The quality gate
 
@@ -34,6 +39,32 @@ runs the whole gate:
 
 Individual targets: `make lint`, `make format`, `make typecheck`, `make test`, `make test-cov`.
 CI (`.github/workflows/ci.yml`) runs the same gate across Python 3.11–3.14 on every push and PR.
+
+ruff runs with every rule enabled (`select = ["ALL"]`). When it flags something, fix the cause
+(split the function, name the constant, narrow the `except`). If a case is genuinely justified, add
+a per-line `# noqa: RULE - reason`; widen the ignore lists in `pyproject.toml` only for a rule that
+does not fit the project as a whole, with the reason next to it.
+
+## Tooling decisions
+
+Recorded so they are not re-litigated without new information (2026-09):
+
+- **uv + `uv.lock` instead of `requirements-dev.txt` with `>=` bounds.** The `>=` bounds let CI
+  install whatever was newest while contributors kept older versions; ruff 0.16 then stabilized
+  `PLR0917` and every Dependabot PR failed CI at the lint step while local runs passed. A committed
+  lock makes CI and local tooling identical; alternatives considered: `==` pins in the requirements
+  file (no transitive pinning) and pip-tools (an extra tool with no advantage over uv here).
+  Dependabot updates the lock through its `uv` ecosystem.
+- **`select = ["ALL"]` with reasoned exclusions instead of a hand-picked rule list.** New rules show
+  up only with a deliberate ruff bump in the lock, where CI reports them before merge.
+- **Renderers take one `_Stats` object.** The former shared 6-positional-argument signature needed
+  `PLR0913`/`PLR0917` suppressions and left each renderer with unused arguments (`ARG001`); a
+  parameter object removes the cause instead of silencing it.
+- **`except Exception` stays only where the plugin must not fail** (loading optional imports,
+  resolver guards in `outlet`, optional network fetches, unguarded debug output), each marked with
+  `# noqa: BLE001`; JSON parsing of valve maps catches `ValueError` only.
+- **pydantic stays `==`-pinned to Open WebUI's own pin**, even though it is a dev dependency: the
+  plugin runs on OWUI's pydantic in production. Do not merge a bump that drifts from it.
 
 ## How the tests load the plugin
 
