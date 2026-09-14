@@ -21,6 +21,7 @@ Shows token counts, reasoning/cached breakdowns, context-window utilization, gen
 ### What it displays
 
 - **Input / output / total** token counts
+- **Running chat token total** (`🧮`) - the sum of every response's `Σ` in the chat, the token twin of the `💰Σ` cost total and the only chat-wide number for local/free models that report no cost. The model re-reads the history on every turn, so it counts *processed* tokens and grows much faster than the context window. Hidden on the first turn (it equals `Σ`) and in temporary chats, whose history carries no usage
 - **Reasoning / thinking** tokens - OpenAI o3/o4-mini & GPT-5, Gemini 2.5/3 thinking, DeepSeek R1, Claude thinking, etc. (read from both the Chat Completions and the newer Responses API shapes)
 - **Cached prompt** tokens - OpenAI prompt cache and Anthropic `cache_read` / `cache_creation` (Anthropic cache is correctly counted as *additional* to input)
 - **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable via `context_warn_percent` / `context_critical_percent`)
@@ -30,7 +31,7 @@ Shows token counts, reasoning/cached breakdowns, context-window utilization, gen
 
 **Example output:**
 
-`⬆︎ 8,204 · ⬇︎ 586 · Σ 8,790 · 🧠 412 · 💾 4,096 · 📐 8.8k/200k (4%) · ⏱ 3.1s · ⚡ 189.0 t/s · 💰 $0.0284 · 💰Σ $0.1120`
+`⬆︎ 8,204 · ⬇︎ 586 · Σ 8,790 · 🧮 31,460 · 🧠 412 · 💾 4,096 · 📐 8.8k/200k (4%) · ⏱ 3.1s · ⚡ 189.0 t/s · 💰 $0.0284 · 💰Σ $0.1120`
 
 Each metric only appears when it has a value, so the line stays clean for models that don't report detailed breakdowns.
 
@@ -81,8 +82,8 @@ What no client-side display can capture is a surcharge the provider charges *on 
 
 - Every metric can be toggled on/off via admin **Valves**.
 - Users can disable the display entirely through **UserValves**.
-- **Metric order is configurable** via the admin `display_order` valve (comma-separated keys: `input, output, total, reasoning, cached, audio, context, time, tps, cost, cost_total, model, source`). The field comes **pre-filled with the default order** — just reorder or trim it (empty also means default). It only *reorders*: visibility stays governed by the `show_*` toggles, so removing a key does **not** hide it — the metric just moves to the end, like any enabled-but-unlisted one.
-- **Line appearance is configurable** (admin): `separator` (string between items, default ` · `), `icon_style` (`emoji` default / `simple` monochrome unicode / `off` bare values), and `compact_numbers` (abbreviate the six token counters as `k`/`M`, e.g. `12,345 → 12.3k`, matching the context style).
+- **Metric order is configurable** via the admin `display_order` valve (comma-separated keys: `input, output, total, tokens_total, reasoning, cached, audio, context, time, tps, cost, cost_total, model, source`). The field comes **pre-filled with the default order** — just reorder or trim it (empty also means default). It only *reorders*: visibility stays governed by the `show_*` toggles, so removing a key does **not** hide it — the metric just moves to the end, like any enabled-but-unlisted one.
+- **Line appearance is configurable** (admin): `separator` (string between items, default ` · `), `icon_style` (`emoji` default / `simple` monochrome unicode / `off` bare values), and `compact_numbers` (abbreviate the seven token counters as `k`/`M`, e.g. `12,345 → 12.3k`, matching the context style).
 - Context detection is configurable: manual size override, a custom `{"model-substring": tokens}` map, the live models.dev fetch toggle, and optional llama.cpp / llama-swap URLs.
 - Cost is configurable: `cost_mode` (`off` / `auto` / `estimate`), a running chat-total toggle, a `cost_min_display` threshold that hides negligible amounts (default `0.0` shows everything), a manual `price_map`, and the live models.dev price-fetch toggle.
 - Audio tokens are off by default since few models use them.

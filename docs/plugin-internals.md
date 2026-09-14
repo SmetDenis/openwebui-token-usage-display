@@ -1,7 +1,8 @@
 # usage_display.py internals (maintainer reference)
 
 How the plugin works end-to-end, why it is designed this way, and the edge-case catalog with the
-covering tests. Line numbers refer to plugin v2.5.2 (1959 lines); treat them as anchors, not gospel.
+covering tests. `:NNN` line numbers refer to plugin v2.5.2 (1959 lines) and have drifted since; treat
+them as anchors, not gospel. Entries added in v2.6.0 cite function names instead.
 
 ## Pipeline
 
@@ -39,7 +40,7 @@ Orchestration order (each step degrades gracefully, never raises out):
 
 ## The OWUI contract (NOTE block) and its verification status
 
-The NOTE block at `usage_display.py:14-41` is the source-verified contract with OWUI. Re-verified
+The NOTE block at `usage_display.py:14-46` is the source-verified contract with OWUI. Re-verified
 against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
 
 - Normalized triple guaranteed on every save path — **confirmed** (`utils/response.py:14-51,105`).
@@ -52,6 +53,9 @@ against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
   synthesized per message as `content or get_output_text(output)` while the body is assembled
   (`middleware.py:3479`). The NOTE block was updated accordingly — a content-first reader must
   still fall through to `output`, which is the only source on 0.10.x.
+- Only saved chats carry history `usage` into outlet; unsaved chats rebuild history as
+  role+content — **confirmed** in v0.11.0 and v0.11.3 (`outlet_filter_handler`, added to the NOTE
+  block in v2.6.0 for the chat totals).
 
 Any change to token/cost/context reading must be reconciled against this block AND re-verified
 against real OWUI source of the version being targeted — never against memory or docs.
@@ -62,11 +66,12 @@ Grouped inventory (`Valves` at `:755-884`, `UserValves` at `:886-887`). Defaults
 when non-obvious:
 
 - **Visibility** — `show_input_tokens`, `show_output_tokens`, `show_total_tokens`,
+  `show_cumulative_tokens` (True, v2.6.0),
   `show_generation_time`, `show_tokens_per_second`, `show_reasoning_tokens`, `show_cached_tokens`,
   `show_audio_tokens` (False), `show_model_name`, `show_data_source` (False),
   `show_context_window`, `show_cumulative_cost`. Message cost has **no** `show_*` — its visibility
   is `cost_mode` itself.
-- **Presentation** — `display_order` (pre-filled full 13-key order), `separator` (`" · "`),
+- **Presentation** — `display_order` (pre-filled full 14-key order), `separator` (`" · "`),
   `icon_style` (`emoji`/`simple`/`off`), `compact_numbers` (False).
 - **Estimation** — `fallback_to_tiktoken` (True), `count_all_messages_for_input` (True).
 - **Context** — `context_size_override` (0 = auto), `context_size_map` (JSON string),
@@ -83,14 +88,15 @@ when non-obvious:
 
 ## Renderer dispatch
 
-`_STATS_RENDERERS` (`:737-751`) maps 13 keys (`input`, `output`, `total`, `reasoning`, `cached`,
-`audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `model`, `source`) to `_render_*`
+`_STATS_RENDERERS` (`:737-751`) maps 14 keys (`input`, `output`, `total`, `tokens_total`,
+`reasoning`, `cached`, `audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `model`, `source`)
+to `_render_*`
 functions sharing a fixed 6-arg signature `(v, tokens, timing, ctx, cost, model)` — the reason
 `PLR0913` is suppressed. `_build_stats` (`:1708-1736`) walks the resolved order, drops `None`
 results, and suppresses a line consisting solely of `source` parts (`:1734-1735`).
 
 Rules: **`show_*` valves gate visibility; `display_order` only sorts.** `_resolve_display_order`
-(`:451-458`) always returns a full 13-key permutation — removed keys move to the end, unknown keys
+(`:451-458`) always returns a full 14-key permutation — removed keys move to the end, unknown keys
 are ignored (surfaced only in the debug payload). To add a metric: add a `show_*` valve, write a
 6-arg `_render_*`, register it in `_STATS_RENDERERS`, append the key to `_DEFAULT_ORDER`, add an
 icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
@@ -151,6 +157,14 @@ models.dev tables. Classic failure: `claude-opus-4.8` (dot) does not substring-m
   cache into details) cache is a *subset*: `fresh_input = max(input − cached − cache_write, 0)`.
   Getting this wrong double-counts behind LiteLLM (fixed in v2.2.0).
 - `_compute_total` (`:1144-1158`): `fresh_input + cached + cache_write + output`.
+- **Running chat total — `_cumulative_tokens`** (v2.6.0, called at the end of `_extract_tokens`):
+  fills `tokens["cumulative"]` / `tokens["cumulative_est"]`, rendered as `🧮` by
+  `_render_tokens_total`. Past assistant turns: `_compute_total(_usage_token_bag(usage))`, i.e. the
+  same cache-aware `Σ` each of them displayed; the current turn: the already-resolved `total` (so a
+  tiktoken-estimated `Σ` counts as shown and sets `cumulative_est` → `≈`). Past turns without usage
+  (and a current turn with no `total`) are counted in `messages_skipped_no_usage`, never re-estimated,
+  so `messages_counted + messages_skipped_no_usage` equals the number of assistant messages. Also re-run by `_emit_debug` as
+  `cumulative_tokens_debug`, so the debug provenance cannot drift from the displayed number.
 - **tiktoken fallback** (`:1066-1101`): only when no API-reported tokens AND
   `fallback_to_tiktoken` AND tiktoken importable. `_message_text` (`:291-306`) prefers `content`,
   falls through to walking the structured `output` array (`_extract_output_text:268-288` — only
@@ -160,6 +174,32 @@ models.dev tables. Classic failure: `claude-opus-4.8` (dot) does not substring-m
   `eval_duration`/`response_token/s`, llama.cpp `predicted_ms`/`predicted_per_second`), else
   wall-clock marked `~`. Wall-clock includes OWUI-side RAG/web-search time — a platform limitation
   (no hook right before the LLM call).
+
+### Chat token total — design decisions (v2.6.0)
+
+Ported from the idea in fork `ArtyCooL/openwebui-token-usage-display@f73c618` and redesigned:
+
+- **What is summed: the per-response `Σ` (cache included), not fresh-only input or output only.**
+  The number is then verifiable by hand against the lines already on screen, and it matches what
+  the provider processed. Rejected: excluding cache reads (no longer equals the sum of visible `Σ`,
+  confusing); output only (says nothing about load/context).
+- **It measures processed tokens, not chat size.** Every turn re-reads the history, so it grows
+  roughly quadratically; the valve description says so to avoid confusion with `📐`.
+- **On by default**, like `show_cumulative_cost` — the owner chose discoverability over an
+  unchanged line (accepted risk: the `line-clamp-1` status line gets one item longer after the
+  update).
+- **Deduped against the message `Σ`**, like `💰Σ` against `💰`: no repeated number on the first turn
+  or in unsaved chats.
+- **Placed right after `total`** so all token counters stay grouped. Saved custom orders get it at
+  the end (standard `display_order` semantics), noted in the CHANGELOG.
+- **Key `tokens_total`, valve `show_cumulative_tokens`, bag keys `cumulative`/`cumulative_est`** —
+  mirrors `cost_total` / `show_cumulative_cost` / `cost["cumulative"]`.
+- **No re-estimation of history without usage**: unsaved chats carry no history usage at all, and
+  re-tokenizing the whole history on every response would be quadratic.
+- **The current turn comes from the resolved bag, not from `usage`** — the fork read only
+  persisted usage, so a tiktoken-estimated current turn silently fell out of the sum.
+- **Computed unconditionally** (not gated on the valve, unlike cumulative cost, whose gate exists to
+  avoid a price fetch): it is a pure O(n) walk and the debug block needs it regardless.
 
 ## Module state
 
@@ -198,6 +238,8 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | any of the 7 background tasks | early return | `:945-955` | `test_outlet_skips_every_background_task_string` |
 | empty `messages` / no assistant msg | early return | `:957-962` | `test_outlet_no_messages_or_no_assistant` |
 | `usage` `None`/`{}`/non-numeric/negative | all-`None` bag, no crash | `:1036`, `:230-247` | `test_outlet_survives_malformed_usage` |
+| `NaN`/`±inf` in current or past `usage` (v2.6.0) | rejected by `_num` → field omitted, no `int()` crash | `_num` | `test_outlet_survives_non_finite_usage_in_history_and_current`, `test_num_rejects_bool_and_nonnumbers` |
+| `Infinity` value in `context_size_map` | entry skipped (`OverflowError` caught) | `_context_size_map_table` | `test_context_size_map_table_skips_infinite_entry` |
 | streaming: no `content`, text in `output` | content-first, fall through to output walk | `:291-306` | `test_message_text_prefers_content_then_output` |
 | `output` malformed (non-list, non-dict items, non-str text) | items skipped / coerced | `:268-288` | `test_extract_output_text_*` (4 tests) |
 | `reasoning` items in `output` | excluded from token estimate | `:278` | `test_extract_output_text_only_message_output_text` |
@@ -224,6 +266,9 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | price missing `input`+`output` rates | cost `None` | `:1561-1564` | `test_cost_components_none_price_or_no_rates` |
 | cache rates missing | default to `input` rate | `:1567-1572` | `test_cost_components_cache_defaults_to_input_rate` |
 | cost below `cost_min_display` | hidden | `:681, :698` | `test_render_cost_estimate_marker_and_threshold` |
+| chat token total == message `Σ` | `🧮` suppressed | `_render_tokens_total` | `test_render_tokens_total_dedupes_and_marks_estimate` |
+| past turns without/with malformed usage (unsaved chats) | skipped + counted in debug | `_cumulative_tokens` | `test_cumulative_tokens_skips_history_without_usage` |
+| current turn tiktoken-estimated | included, `🧮 ≈` | `_cumulative_tokens` | `test_cumulative_tokens_estimated_current_turn_and_empty`, `test_outlet_chat_token_total_marks_estimated_current_turn` |
 | cumulative == message cost | `💰Σ` suppressed | `:695-699` | `test_render_cost_total_dedupes_when_equal_to_message` |
 | mixed native/estimated history | summed; `≈` if any estimated | `:1459-1479` | `test_resolve_cost_cumulative_mixes_native_and_estimated_messages` |
 | malformed models.dev `api.json` | tolerant per-entry parse | `:1673-1704` | `test_parse_prices_malformed_input_yields_empty_map` |

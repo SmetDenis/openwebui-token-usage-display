@@ -3,9 +3,9 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.5.2
+version: 2.6.0
 license: MIT
-description: Shows token counts (input/output/total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
+description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """
 
@@ -22,6 +22,12 @@ from __future__ import annotations
 #     it is synthesized per message as `content or get_output_text(output)` while
 #     the body is assembled. -> tiktoken fallback reads content first (0.9.x and
 #     0.11.x outlet), then walks `output` (the only source on 0.10.x).
+#   * Only SAVED chats reload the active branch from the DB for outlet, so past
+#     messages carry their persisted `usage`. Unsaved chats (temporary:/local:/
+#     channel:, and API requests with no chat_id) rebuild the history from the
+#     request as role+content only (0.11.x outlet_filter_handler) -> no per-message
+#     usage on past turns, so both chat totals (💰Σ cost, 🧮 tokens) collapse to
+#     the current message there.
 #   * `message["info"]` is a redundant mirror ({"usage": ...}) of top-level usage
 #     on persisted chats -> intentionally ignored to avoid double counting.
 #   * Detail keys differ by API: Chat Completions -> prompt_tokens_details /
@@ -60,6 +66,7 @@ except Exception:  # pragma: no cover - environment dependent
     _AIOHTTP_AVAILABLE = False
 
 import json
+import math
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -231,10 +238,16 @@ _STATIC_PRICES: dict[str, dict[str, float]] = {
 
 
 def _num(value: Any) -> int | float | None:
-    """Return the value if it is a real (non-bool) number, else None."""
+    """Return the value if it is a real, finite (non-bool) number, else None.
+
+    NaN/±inf are rejected at this single intake: Python's json accepts them, and one would crash
+    the int() in _compute_total (or poison every sum) on the unguarded token path of outlet.
+    """
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
         return value
     return None
 
@@ -412,12 +425,13 @@ def _resolve_model_id(model: dict[str, Any] | None, body: dict[str, Any] | None 
 
 # --- stats-line order (see configurable-order design doc) ----------------------
 
-# The 13 metric keys in their default display order (identical to the historical
+# The 14 metric keys in their default display order (identical to the historical
 # hard-coded order of _build_stats). Registry populated in the renderers section.
 _DEFAULT_ORDER: list[str] = [
     "input",
     "output",
     "total",
+    "tokens_total",
     "reasoning",
     "cached",
     "audio",
@@ -454,7 +468,7 @@ def _normalize_order(order_str: str) -> tuple[list[str], list[str]]:
 def _resolve_display_order(admin_order: str) -> list[str]:
     """Resolve the admin-configured metric order, else the default.
 
-    Returns a permutation of all 13 keys: the parsed (valid) keys first, then the
+    Returns a permutation of all 14 keys: the parsed (valid) keys first, then the
     remaining keys in default order. Empty input -> _DEFAULT_ORDER unchanged.
     """
     valid, _ = _normalize_order(admin_order)
@@ -483,6 +497,7 @@ _ICON_EMOJI: dict[str, str] = {
     "input": "⬆︎",
     "output": "⬇︎",
     "total": "Σ",
+    "tokens_total": "🧮",
     "reasoning": "🧠",
     "cached": "💾",
     "audio": "🔊",
@@ -496,14 +511,15 @@ _ICON_SIMPLE: dict[str, str] = {
     "input": "↑",
     "output": "↓",
     "total": "Σ",
+    "tokens_total": "ΣΣ",
     "reasoning": "∴",
     "cached": "≡",
     "audio": "♪",
     "time": "◷",
     "tps": "»",
-    "cost": "",
+    "cost": "",  # cost value already carries "$"
     "cost_total": "Σ",
-    "model": "◇",  # cost value already carries "$"
+    "model": "◇",
 }
 # context has a severity triplet (normal / warn / critical) instead of a flat icon.
 _CONTEXT_ICONS: dict[str, tuple[str, str, str]] = {
@@ -586,6 +602,22 @@ def _render_total(
 ) -> str | None:
     if v.show_total_tokens and tokens["total"] is not None:
         return _with_icon(_icon(v, "total"), _fmt_count(v, tokens["total"]))
+    return None
+
+
+def _render_tokens_total(
+    v: Filter.Valves,
+    tokens: dict[str, Any],
+    timing: dict[str, Any],
+    ctx: dict[str, Any],
+    cost: dict[str, Any],
+    model: dict[str, Any] | None,
+) -> str | None:
+    # Token twin of cost_total: omitted when it equals the message Σ (first turn, unsaved chats).
+    # ≈ marks a total that includes a tiktoken-estimated current turn.
+    if v.show_cumulative_tokens and tokens["cumulative"] is not None and tokens["cumulative"] != tokens["total"]:
+        prefix = "≈" if tokens["cumulative_est"] else ""
+        return _with_icon(_icon(v, "tokens_total"), f"{prefix}{_fmt_count(v, tokens['cumulative'])}")
     return None
 
 
@@ -741,6 +773,7 @@ _STATS_RENDERERS: dict[str, Any] = {
     "input": _render_input,
     "output": _render_output,
     "total": _render_total,
+    "tokens_total": _render_tokens_total,
     "reasoning": _render_reasoning,
     "cached": _render_cached,
     "audio": _render_audio,
@@ -763,6 +796,13 @@ class Filter:
         show_input_tokens: bool = Field(default=True, description="Display input (prompt) token count.")
         show_output_tokens: bool = Field(default=True, description="Display output (completion) token count.")
         show_total_tokens: bool = Field(default=True, description="Display total token count.")
+        show_cumulative_tokens: bool = Field(
+            default=True,
+            description=(
+                "Also show the running token total for the whole chat (the sum of every response's Σ). "
+                "Each turn re-reads the history, so it grows much faster than the context window."
+            ),
+        )
         show_generation_time: bool = Field(default=True, description="Display generation time.")
         show_tokens_per_second: bool = Field(default=True, description="Display output tokens per second.")
         show_reasoning_tokens: bool = Field(
@@ -776,7 +816,7 @@ class Filter:
             default=", ".join(_DEFAULT_ORDER),
             description=(
                 "Comma-separated metric order, pre-filled with the default order — reorder or trim "
-                "to taste (empty also means default). Keys: input, output, total, reasoning, cached, "
+                "to taste (empty also means default). Keys: input, output, total, tokens_total, reasoning, cached, "
                 "audio, context, time, tps, cost, cost_total, model, source. This only sorts: "
                 "visibility is governed by the show_* toggles, and removing a key here does NOT hide "
                 "it (use show_* for that) — it just moves to the end, like any enabled-but-unlisted metric."
@@ -799,7 +839,7 @@ class Filter:
             description=(
                 "Abbreviate token counters as k/M (e.g. 12,345 -> 12.3k, 1,234,567 -> 1.2M), matching "
                 "the context-window style. Off = full numbers with thousands separators. Affects only "
-                "the six counters (input, output, total, reasoning, cached, audio)."
+                "the seven counters (input, output, total, tokens_total, reasoning, cached, audio)."
             ),
         )
         fallback_to_tiktoken: bool = Field(
@@ -1034,6 +1074,8 @@ class Filter:
             "is_anthropic": False,
             "input_has_cache": False,
             "fresh_input": None,
+            "cumulative": None,
+            "cumulative_est": False,
         }
 
         if usage:
@@ -1072,6 +1114,11 @@ class Filter:
 
         # Derived total: fresh input + cache (read+write) + output — correct for every shape.
         result["total"] = self._compute_total(result)
+
+        # Running chat total — derived after `total`, so the current turn counts exactly as displayed.
+        cumulative = self._cumulative_tokens(messages, assistant_msg, result)
+        result["cumulative"] = cumulative["total"]
+        result["cumulative_est"] = cumulative["estimated"]
         return result
 
     def _estimate_tokens(
@@ -1159,6 +1206,44 @@ class Filter:
         if fresh is None:
             fresh = inp
         return int((fresh or 0) + (result["cached"] or 0) + (result["cache_write"] or 0) + (out or 0))
+
+    def _cumulative_tokens(
+        self, messages: list[Any], assistant_msg: dict[str, Any], current: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Running chat token total: the Σ of every assistant turn on the branch, plus provenance.
+
+        The token twin of the cumulative-cost walk in _resolve_cost. The current turn comes from the
+        already-resolved bag, so a tiktoken-estimated Σ counts as displayed and marks the total
+        estimated; past turns re-derive the same cache-aware total from their persisted `usage`.
+        Past turns without usage are skipped, not re-estimated: unsaved chats carry no history usage
+        at all (see the NOTE block), and re-tokenizing the whole history on every response would be
+        quadratic. Every turn re-reads the history, so this counts processed tokens — it grows much
+        faster than the context window and is not "the size of the chat".
+        """
+        total = 0
+        counted = 0
+        skipped = 0
+        for m in messages:
+            if not (isinstance(m, dict) and m.get("role") == "assistant") or m is assistant_msg:
+                continue
+            turn = self._compute_total(self._usage_token_bag(m.get("usage")))
+            if turn is None:
+                skipped += 1
+                continue
+            total += turn
+            counted += 1
+        current_total = current["total"]
+        if current_total is not None:
+            total += current_total
+            counted += 1
+        else:
+            skipped += 1  # keeps counted + skipped == number of assistant messages
+        return {
+            "total": total if counted else None,
+            "estimated": current_total is not None and not current["is_api"],
+            "messages_counted": counted,
+            "messages_skipped_no_usage": skipped,
+        }
 
     # --- timing ----------------------------------------------------------------
 
@@ -1414,7 +1499,7 @@ class Filter:
         for key, val in user_map.items():
             try:
                 result[str(key).lower()] = int(val)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):  # OverflowError: JSON Infinity
                 continue
         return result
 
@@ -1934,6 +2019,7 @@ class Filter:
             "timing": timing,
             "cost": {k: val for k, val in cost.items() if k != "debug"},
             "cost_debug": cost.get("debug"),
+            "cumulative_tokens_debug": self._cumulative_tokens(messages, assistant_msg, tokens),
             "web_search": self._web_search_debug(assistant_msg),
             "context_debug": context_debug,
             "display_order": display_order_debug,

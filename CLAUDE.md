@@ -75,12 +75,12 @@ Run a single test: `.venv/bin/python -m pytest tests/test_usage_display.py::test
 - Config is two Pydantic models: `Valves` (admin — all toggles, ordering, cost/context maps and
   URLs) and `UserValves` (per-user `enabled` kill-switch only; per-user customization was
   deliberately rolled back).
-- The stats line is a dispatch table (`_STATS_RENDERERS`, 13 metric keys, fixed 6-arg renderer
+- The stats line is a dispatch table (`_STATS_RENDERERS`, 14 metric keys, fixed 6-arg renderer
   signature). Key rule: **`show_*` valves gate visibility; `display_order` only sorts.**
 - Context, price and model identity resolve through priority-ordered fallback chains
   (short-circuit on first hit); table lookups use longest-key case-insensitive substring match.
   Workspace/"agent" models resolve via **`base_model_id`**.
-- The **NOTE block** at `usage_display.py:14-38` is the source-verified contract with OWUI's data
+- The **NOTE block** at `usage_display.py:14-46` is the source-verified contract with OWUI's data
   model. Reconcile any token/cost/context change against it — and re-verify it against real OWUI
   source for the targeted version.
 - Live network access (models.dev context/prices, llama.cpp probe) is opt-in via valves and
@@ -93,7 +93,7 @@ Run a single test: `.venv/bin/python -m pytest tests/test_usage_display.py::test
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (172 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (182 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
 and `make_*` builders live at the top of the test file). `pydantic` is pinned in
 `requirements-dev.txt` to the version OWUI ships (`2.13.4` for OWUI 0.10.2), so the plugin is

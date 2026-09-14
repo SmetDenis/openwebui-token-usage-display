@@ -129,6 +129,13 @@ instead.
    synthesized from `output`** — plus `info`, `output`, `usage`, `sources`, `:3473-3489`), runs
    `process_filter_functions(filter_type="outlet")`, persists any message whose content/output the
    filter actually changed (`:3534-3559`, also writing `originalContent`) and emits `chat:outlet`.
+   **Unsaved chats (`temporary:`/`local:`/`channel:`, and an empty `chat_id` — raw API requests,
+   since `is_saved_chat_id` requires a non-empty id) take a different branch**: the history is
+   rebuilt from the request `form_data` as `{role, content}` only, plus the current assistant
+   message — so past messages carry **no `usage`**, and chat-wide sums (`💰Σ`, `🧮`) see only the
+   current message. Saved chats walk the active branch via `utils/misc.py:get_message_list`
+   (parentId chain up to `message_id`). Verified in v0.11.0 and v0.11.3
+   (`outlet_filter_handler`, `is_unsaved_chat`).
    Called from both the non-streaming handler (`:3703`) and end-of-stream (`:5551`); the raw-API
    path is gated by `ENABLE_API_OUTLET_FILTERS` (`:3735`, default on).
    `POST /api/chat/completed` still exists (`main.py:1976` → `utils/chat.py:chat_completed:313`,

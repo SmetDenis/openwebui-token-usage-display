@@ -24,7 +24,9 @@ def test_module_loads_and_exposes_filter(usage_display_module: ModuleType) -> No
     assert f.valves.icon_style == "emoji"
     assert f.valves.cost_mode == "auto"
     assert mod._DEFAULT_ORDER[0] == "input"
-    assert len(mod._DEFAULT_ORDER) == 13
+    assert len(mod._DEFAULT_ORDER) == 14
+    assert mod._DEFAULT_ORDER.index("tokens_total") == mod._DEFAULT_ORDER.index("total") + 1  # tokens grouped
+    assert f.valves.show_cumulative_tokens is True  # on by default, like show_cumulative_cost
 
 
 def run_async(coro: Any) -> Any:
@@ -103,6 +105,8 @@ def make_tokens(**over: Any) -> dict[str, Any]:
         "is_anthropic": False,
         "input_has_cache": False,
         "fresh_input": 100,
+        "cumulative": None,
+        "cumulative_est": False,
     }
     base.update(over)
     return base
@@ -263,6 +267,9 @@ def test_num_rejects_bool_and_nonnumbers(usage_display_module: ModuleType) -> No
     assert _num(True) is None  # bool is not a number here
     assert _num("5") is None
     assert _num(None) is None
+    assert _num(float("nan")) is None  # non-finite: would crash int() in _compute_total
+    assert _num(float("inf")) is None
+    assert _num(float("-inf")) is None
 
 
 def test_first_num_returns_first_present_including_zero(usage_display_module: ModuleType) -> None:
@@ -449,8 +456,8 @@ def test_resolve_display_order_is_full_permutation(usage_display_module: ModuleT
     assert mod._resolve_display_order("") == mod._DEFAULT_ORDER  # empty -> default
     resolved = mod._resolve_display_order("cost, model")
     assert resolved[:2] == ["cost", "model"]
-    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all 13, no dupes
-    assert len(resolved) == len(set(resolved)) == 13
+    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all 14, no dupes
+    assert len(resolved) == len(set(resolved)) == 14
 
 
 def test_display_order_debug_provenance(usage_display_module: ModuleType) -> None:
@@ -474,6 +481,7 @@ def test_icon_styles(usage_display_module: ModuleType, valves: Any) -> None:
     valves.icon_style = "simple"
     assert _icon(valves, "input") == "↑"
     assert _icon(valves, "cost") == ""  # simple cost has no icon ($ self-labels)
+    assert _icon(valves, "tokens_total") == "ΣΣ"
     valves.icon_style = "off"
     assert _icon(valves, "input") == ""
     assert _icon(valves, "unknown_key") == ""
@@ -504,7 +512,7 @@ def test_fmt_count_compact_toggle(usage_display_module: ModuleType, valves: Any)
 
 
 # --------------------------------------------------------------------------- #
-# Group A cont. — all 13 stats-line renderers, each individually
+# Group A cont. — all 14 stats-line renderers, each individually
 # --------------------------------------------------------------------------- #
 
 
@@ -532,6 +540,26 @@ def test_render_total(usage_display_module: ModuleType, valves: Any) -> None:
     assert r(valves, make_tokens(total=None), make_timing(), make_ctx(), make_cost(), None) is None
     valves.show_total_tokens = False
     assert r(valves, make_tokens(total=150), make_timing(), make_ctx(), make_cost(), None) is None
+
+
+def test_render_tokens_total_dedupes_and_marks_estimate(usage_display_module: ModuleType, valves: Any) -> None:
+    r = usage_display_module._render_tokens_total
+    valves.icon_style = "emoji"
+    shown = make_tokens(total=150, cumulative=4200)
+    assert r(valves, shown, make_timing(), make_ctx(), make_cost(), None) == "🧮 4,200"
+    # equal to the message Σ (first turn / unsaved chat) -> omitted, like 💰Σ
+    assert r(valves, make_tokens(total=150, cumulative=150), make_timing(), make_ctx(), make_cost(), None) is None
+    # no data -> omitted
+    assert r(valves, make_tokens(cumulative=None), make_timing(), make_ctx(), make_cost(), None) is None
+    # current turn has no Σ at all but history does -> still shown
+    assert r(valves, make_tokens(total=None, cumulative=900), make_timing(), make_ctx(), make_cost(), None) == "🧮 900"
+    estimated = make_tokens(total=150, cumulative=4200, cumulative_est=True)
+    assert r(valves, estimated, make_timing(), make_ctx(), make_cost(), None) == "🧮 ≈4,200"
+    valves.compact_numbers = True
+    valves.icon_style = "simple"
+    assert r(valves, shown, make_timing(), make_ctx(), make_cost(), None) == "ΣΣ 4.2k"
+    valves.show_cumulative_tokens = False
+    assert r(valves, shown, make_timing(), make_ctx(), make_cost(), None) is None
 
 
 def test_render_reasoning_hidden_when_zero_or_none(usage_display_module: ModuleType, valves: Any) -> None:
@@ -805,6 +833,67 @@ def test_compute_total(usage_display_module: ModuleType) -> None:
     # fresh_input None -> falls back to input
     t2 = make_tokens(input=100, output=50, fresh_input=None, cached=None, cache_write=None)
     assert f._compute_total(t2) == 150
+
+
+# --- running chat token total ----------------------------------------------------- #
+
+
+def test_cumulative_tokens_sums_history_and_current_cache_aware(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    anthropic_native = {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 30}  # cache on top
+    openai_subset = make_usage(input_tokens=100, output_tokens=50, prompt_tokens_details={"cached_tokens": 40})
+    current = make_message("now", usage=make_usage())
+    messages = [
+        make_message("q1", role="user"),
+        make_message("a1", usage=anthropic_native),
+        make_message("q2", role="user"),
+        make_message("a2", usage=openai_subset),
+        current,
+    ]
+    cum = f._cumulative_tokens(messages, current, make_tokens(total=150, is_api=True))
+    # 180 (100+30+50) + 150 (cache is a subset) + 150 (current Σ as displayed)
+    assert cum == {"total": 480, "estimated": False, "messages_counted": 3, "messages_skipped_no_usage": 0}
+
+
+def test_cumulative_tokens_skips_history_without_usage(usage_display_module: ModuleType) -> None:
+    """Unsaved chats hand outlet a role+content-only history; malformed entries are skipped, never fatal."""
+    f = usage_display_module.Filter()
+    current = make_message("now", usage=make_usage())
+    messages: list[Any] = [
+        "not-a-dict",
+        make_message("a0"),  # no usage key (temporary chat history)
+        make_message("a1", usage="bad"),  # type: ignore[arg-type]
+        make_message("a2", usage={"input_tokens": "bad"}),
+        make_message("a3", usage=make_usage(input_tokens=10, output_tokens=5)),
+        current,
+    ]
+    cum = f._cumulative_tokens(messages, current, make_tokens(total=150))
+    assert cum["total"] == 165
+    assert cum["messages_counted"] == 2
+    assert cum["messages_skipped_no_usage"] == 3
+
+
+def test_cumulative_tokens_estimated_current_turn_and_empty(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    current = make_message("now")
+    history = make_message("a1", usage=make_usage())
+    est = f._cumulative_tokens([history, current], current, make_tokens(total=12, is_api=False))
+    assert est["total"] == 162
+    assert est["estimated"] is True
+    # nothing countable anywhere -> None (renderer omits), not a misleading 0
+    empty = f._cumulative_tokens([current], current, make_tokens(total=None, input=None, output=None, is_api=False))
+    # the data-less current turn is reported as skipped, so the counters add up to the assistant messages
+    assert empty == {"total": None, "estimated": False, "messages_counted": 0, "messages_skipped_no_usage": 1}
+
+
+def test_extract_tokens_fills_cumulative(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    current = make_message("a2", usage=make_usage(input_tokens=300, output_tokens=20))
+    messages = [make_message("a1", usage=make_usage()), make_message("q", role="user"), current]
+    t = f._extract_tokens(current["usage"], current, messages, make_body(messages), None)
+    assert t["total"] == 320
+    assert t["cumulative"] == 470
+    assert t["cumulative_est"] is False
 
 
 # --- timing ------------------------------------------------------------------ #
@@ -1428,6 +1517,64 @@ def test_outlet_emits_status_line(usage_display_module: ModuleType, monkeypatch:
     assert "1,000" in desc  # input counter present
     assert "200" in desc  # output counter present
     assert "%" in desc  # context utilization from static gpt-4o=128000 (1200/128000 rounds to 1%)
+    assert "🧮" not in desc  # single turn: chat total == message Σ -> deduped
+
+
+def test_outlet_status_line_shows_chat_token_total_after_total(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    messages = [
+        make_message("q1", role="user"),
+        make_message("a1", usage=make_usage(input_tokens=1000, output_tokens=200)),
+        make_message("q2", role="user"),
+        make_message("a2", usage=make_usage(input_tokens=1300, output_tokens=100)),
+    ]
+    emitter = CapturingEmitter()
+    run_async(f.outlet(make_body(messages, model="gpt-4o"), __event_emitter__=emitter, __model__=make_model_dict()))
+    parts = emitter.statuses()[0]["data"]["description"].split(f.valves.separator)
+    assert parts[2:4] == ["Σ 1,400", "🧮 2,600"]  # 1,200 + 1,400, right after the message Σ
+
+
+def test_outlet_chat_token_total_marks_estimated_current_turn(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """API history + a usage-less current turn estimated by tiktoken -> the chat total reaches the line as ≈."""
+    mod = usage_display_module
+    install_fake_tiktoken(monkeypatch, mod)  # 1 token per word
+    f = mod.Filter()
+    _patch_no_network(monkeypatch, f)
+    messages = [
+        make_message("q1", role="user"),
+        make_message("a1", usage=make_usage(input_tokens=1000, output_tokens=200)),
+        make_message("q2", role="user"),
+        make_message("three word answer"),  # current turn: no usage
+    ]
+    emitter = CapturingEmitter()
+    run_async(f.outlet(make_body(messages, model="gpt-4o"), __event_emitter__=emitter, __model__=make_model_dict()))
+    desc = emitter.statuses()[0]["data"]["description"]
+    # estimate: input = q1 a1 q2 (3 words), output = 3 words -> Σ 6; chat total 1,200 + 6
+    assert "Σ 6" in desc
+    assert "🧮 ≈1,206" in desc
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_outlet_survives_non_finite_usage_in_history_and_current(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch, bad: float
+) -> None:
+    """A non-finite count (valid in Python json) used to raise from int() on the unguarded token path."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    monkeypatch.setattr(usage_display_module, "_TIKTOKEN_AVAILABLE", False, raising=False)
+    history = make_message("a1", usage=make_usage(input_tokens=bad, output_tokens=7))
+    current = make_message("a2", usage=make_usage(input_tokens=100, output_tokens=bad))
+    emitter = CapturingEmitter()
+    body = make_body([history, make_message("q", role="user"), current], model="gpt-4o")
+    run_async(f.outlet(body, __event_emitter__=emitter, __model__=make_model_dict()))
+    desc = emitter.statuses()[0]["data"]["description"]
+    assert "⬆︎ 100" in desc  # the finite counters still render
+    assert "🧮 107" in desc  # 7 (history, bad input dropped) + 100 (current, bad output dropped)
 
 
 def test_outlet_falls_back_to_body_model_when_no_model_dict(
@@ -1651,6 +1798,12 @@ def test_context_size_map_zero_value_falls_through(
     )
     assert ctx["size"] == 128000  # static gpt-4o, not the 0 from the map
     assert ctx["source"] == "static_table"
+
+
+def test_context_size_map_table_skips_infinite_entry(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    f.valves.context_size_map = '{"bad": Infinity, "good": 4096}'  # json.loads accepts Infinity
+    assert f._context_size_map_table() == {"good": 4096}
 
 
 def test_context_size_map_table_parsing(usage_display_module: ModuleType) -> None:
@@ -2033,6 +2186,8 @@ def test_outlet_debug_payload_reports_web_search_and_cost_details(
     assert "nytimes.com" in doc
     assert "cost_details" in doc
     assert "upstream_inference_cost" in doc
+    assert '"cumulative_tokens_debug"' in doc
+    assert '"messages_counted": 1' in doc
 
 
 def test_emit_debug_json_dumps_failure_falls_back_to_error_string(

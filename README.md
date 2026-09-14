@@ -4,7 +4,7 @@
 [![Open WebUI 0.9.0+](https://img.shields.io/badge/Open%20WebUI-0.9.0%2B-1a1a2e)](https://openwebui.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A filter plugin for [Open WebUI](https://openwebui.com) that shows detailed token, context, timing and cost statistics below each AI response - token counts (input/output/total, reasoning, cached, audio), context-window utilization, generation time, tokens/second and message/chat cost.
+A filter plugin for [Open WebUI](https://openwebui.com) that shows detailed token, context, timing and cost statistics below each AI response - token counts (input/output/total, running chat total, reasoning, cached, audio), context-window utilization, generation time, tokens/second and message/chat cost.
 
 Recommended in the official Open WebUI documentation - see the
 [Community Plugins catalog](https://docs.openwebui.com/features/extensibility/community/). Install it from the [community store post](https://openwebui.com/posts/token_usage_display_a94ea72f) or straight from this repo.
@@ -12,7 +12,7 @@ Recommended in the official Open WebUI documentation - see the
 ![Token usage & cost stats line under an Open WebUI response](docs/screenshot.png)
 
 ```text
-⬆︎ 8,204 · ⬇︎ 586 · Σ 8,790 · 🧠 412 · 💾 4,096 · 📐 8.8k/200k (4%) · ⏱ 3.1s · ⚡ 189.0 t/s · 💰 $0.0284 · 💰Σ $0.1120
+⬆︎ 8,204 · ⬇︎ 586 · Σ 8,790 · 🧮 31,460 · 🧠 412 · 💾 4,096 · 📐 8.8k/200k (4%) · ⏱ 3.1s · ⚡ 189.0 t/s · 💰 $0.0284 · 💰Σ $0.1120
 ```
 
 Each metric only appears when it has a value, so the line stays clean for models that don't report detailed breakdowns.
@@ -34,6 +34,9 @@ tokens when a provider reports no usage; the plugin loads fine without it.
 ## What it displays
 
 - **Input / output / total** token counts
+- **Running chat token total** (`🧮`) - the sum of every response's `Σ` in the chat, the token twin of `💰Σ`
+  (handy for local/free models with no cost). The model re-reads the history each turn, so it counts
+  *processed* tokens and grows much faster than the context window
 - **Reasoning / thinking** tokens - OpenAI o3/o4-mini & GPT-5, Gemini thinking, DeepSeek R1, Claude thinking, etc. (read from both the Chat Completions and the newer Responses API shapes)
 - **Cached prompt** tokens - OpenAI prompt cache and Anthropic `cache_read` / `cache_creation`
   (Anthropic cache is correctly counted as *additional* to input)
@@ -119,6 +122,9 @@ Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - 
 ## Notes & limitations
 
 - For providers that don't report a generation duration (OpenAI, Anthropic), time and t/s are wall-clock, marked `~`; local providers (Ollama, llama.cpp) report real generation time.
+- The chat totals (`🧮`, `💰Σ`) are summed from each past response's stored usage. Temporary chats (and API
+  requests without a chat id) don't pass that history usage to filters, so there both totals equal the
+  current message and are hidden.
 - In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn.
 - Estimated cost (`≈`) is a ballpark from published models.dev prices, not your invoice. Provider-reported cost (`auto` mode) is exact.
 

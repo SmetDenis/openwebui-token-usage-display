@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.6.0]
+
+- **Running chat token total (`🧮`).** A new metric shows how many tokens the chat has consumed so far: the sum of every response's `Σ` on the current branch - the token twin of the `💰Σ` cost total, and the only chat-wide number for models that report no cost (Ollama, llama.cpp, other local or free models). Because the model re-reads the whole history on every turn, it counts *processed* tokens and grows much faster than the context window - it is not the size of the chat (that is `📐`). Details:
+    - New admin valve `show_cumulative_tokens` (**on by default**) and metric key `tokens_total`, placed right after `total` in the default order. If you saved a custom `display_order`, the new key is appended at the end, as with any unlisted metric - add `tokens_total` where you want it. Icons: `🧮` (emoji) / `ΣΣ` (simple); `compact_numbers` applies to it.
+    - Hidden when it equals the message `Σ` (the first turn), like `💰Σ`. Marked `≈` when the current turn's `Σ` is a tiktoken estimate.
+    - Past responses are summed from their stored `usage` with the same cache-aware total as `Σ`; responses without usage are skipped, not re-estimated.
+    - **Temporary chats (and API requests without a chat id):** Open WebUI hands the filter their history without per-message usage, so both `🧮` and `💰Σ` collapse to the current message there (and are hidden). Verified against Open WebUI v0.11.0 and v0.11.3.
+    - `debug_mode`: new `cumulative_tokens_debug` block (`total`, `estimated`, `messages_counted`, `messages_skipped_no_usage`); the `tokens` block carries `cumulative` / `cumulative_est`.
+- **Fixed: a non-finite token count (`NaN` / `Infinity`) in `usage` no longer breaks the stats line.** Python's JSON parser accepts these values, and the plugin converted them with `int()` on a path that is not exception-guarded, so such a value in the current response aborted the line - and, with the new chat total walking the history, one bad stored response would have aborted it for every later response in the chat. Non-finite numbers are now treated as "not a number" at the single numeric intake (`_num`), so the affected field is simply omitted. The same class of value in the `context_size_map` valve (`Infinity`) is now skipped per entry instead of disabling the whole map.
+- Idea credit: the fork [ArtyCooL/openwebui-token-usage-display](https://github.com/ArtyCooL/openwebui-token-usage-display/commit/f73c618555ca36c15564a1a79fa0df5bd61e30d9).
+
 
 ## [2.5.2]
 
