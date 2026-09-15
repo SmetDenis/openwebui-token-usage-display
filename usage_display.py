@@ -3,7 +3,7 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.8.0
+version: 2.6.0
 license: MIT
 description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0

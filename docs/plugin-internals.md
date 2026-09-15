@@ -92,7 +92,7 @@ when non-obvious:
 `reasoning`, `cached`, `audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `model`, `source`)
 to `_render_*`
 functions with one signature `(s: _Stats) -> str | None`. `_Stats` is a frozen dataclass bundling
-`valves`, `tokens`, `timing`, `ctx`, `cost`, `model` (v2.6.1; it replaced a fixed 6-positional-arg
+`valves`, `tokens`, `timing`, `ctx`, `cost`, `model` (v2.6.0; it replaced a fixed 6-positional-arg
 signature that forced suppressing `PLR0913`/`PLR0917` and left every renderer with unused
 arguments). `_build_stats` walks the resolved order, drops `None` results, and suppresses a line
 consisting solely of `source` parts. `_emit_debug` takes the same `_Stats` plus a `_Turn` (task,
@@ -106,10 +106,10 @@ an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
 
 ## Resolution chains
 
-### Context size — `_context_size_for` (v2.8.0 order)
+### Context size — `_context_size_for` (v2.6.0 order)
 
 1. `context_size_override` valve → 2. `num_ctx` hint from inlet → 3. user `context_size_map` →
-4. **live window through the OWUI connection** (`_connection_context_size`, v2.8.0) →
+4. **live window through the OWUI connection** (`_connection_context_size`, v2.6.0) →
 5. **backend-advertised size** (`_backend_context_size`) → `_ctx_size_cache` hit →
 6. probe row **matched** to the called model → 7. live models.dev (opt-in) → 8. `_STATIC_CONTEXT_SIZES` →
 9. probe row **unmatched** (a backend's only running model under another id). Tiers 1–3 and 5 return
@@ -119,7 +119,7 @@ under its own key `connection:{urlIdx}:{listed id}`, and 6–9 results are cache
 must never lose to a live lookup. Tiers 1–3 live in `_explicit_context_size`, 6–9 in
 `_automatic_context_size`.
 
-**Tier 4 — the live window, asked through the model's OWUI connection (v2.8.0, issue #14).**
+**Tier 4 — the live window, asked through the model's OWUI connection (v2.6.0, issue #14).**
 `_live_backend` reads the raw listing row under `__model__["openai"]` (a workspace model's comes from its base
 entry in `app.state.MODELS`, `_base_model_entry`): `owned_by: llama-swap` (alias rows name their real model in
 `meta.llamaswap.modelID`; `peer`/selector rows are skipped) or `owned_by: llamacpp` **with** a `status` block (a
@@ -142,7 +142,7 @@ router mode lists `n_ctx: 0` for an unloaded model). A workspace/preset model ha
 with `.get`), guarded by `except Exception`. The value reflects OWUI's model list at the time it was fetched
 (base-model cache), not a live query.
 
-**The probe** (`_probe_context`) asks llama-swap `/running` first (and, since v2.8.0, `/props?model=` for the
+**The probe** (`_probe_context`) asks llama-swap `/running` first (and, since v2.6.0, `/props?model=` for the
 called model when its row is `ready`); unless that yields a matched row, it asks
 llama.cpp `/v1/models` (id or `aliases` → `meta.n_ctx`) and, unless *that* matches, `/props` (older builds;
 named by `model_alias`, `model_path` or the GGUF file name). Each returns `(size, matched_id | None)` via
@@ -150,7 +150,10 @@ named by `model_alias`, `model_path` or the GGUF file name). Each returns `(size
 `prefix_id`) or `/`; a single unmatched row is returned with `None`, several unmatched rows return nothing. A
 matched row ranks above models.dev/static (tier 6), an unmatched one below them (tier 9).
 
-### Design decisions (v2.7.0, issue #6)
+### Design decisions (v2.6.0, issue #6)
+
+Issues #6 and #14 were built as 2.7.0 and 2.8.0 but never released separately: both were folded into the
+re-cut v2.6.0 (see the release note in `CLAUDE.md`). The two sections below keep their order of design.
 
 - **Root cause, not symptom:** the probe was below the static table, so for every family the table knows it
   never ran; the fix reorders by *what the number means* — a running server's window beats a model's trained
@@ -163,19 +166,18 @@ matched row ranks above models.dev/static (tier 6), an unmatched one below them 
   attribute may move in a future OWUI; the failure mode is falling back to the tables, never an error.
 - **The probe is split by match, not moved wholesale:** `/props` and a single llama-swap row describe *a*
   loaded model, not necessarily the called one. Moving an unmatched result above the tables would stamp a
-  local window on cloud models (GPT-4o showing 16k). Unmatched rows keep their pre-2.7.0 rank (last), so an
+  local window on cloud models (GPT-4o showing 16k). Unmatched rows keep their pre-2.6.0 rank (last), so an
   alias setup that worked before still works.
 - **Probe id matching tightened** (exact / `prefix.id` / `org/id`, no substring): once a match outranks the
   tables, a substring match (`qwen` in `qwen3-max`) becomes a wrong-number bug instead of a harmless fallback.
-- **No auto-discovery of the backend URL from the OWUI connection** (`urlIdx`): it would silently add network
-  calls to every configured provider; the probe stays opt-in.
-- **Superseded in v2.8.0:** "No auto-discovery of the backend URL from the OWUI connection" — see below; the
-  reason (network calls to every provider) is removed by detecting the backend from the listing row.
+- **Superseded by issue #14 (same release):** "no auto-discovery of the backend URL from the OWUI connection"
+  (`urlIdx`) — it would have silently added network calls to every configured provider. That reason is removed
+  by detecting the backend from the listing row; see below.
 - **Not fixed here:** the screenshot's `211ms · 23.7 t/s` next to 645 output tokens (5 tokens / 0.211 s =
   23.7 t/s) suggests the llama.cpp timings cover only the last round or chunk — OWUI's `merge_usage` keeps
   the last `predicted_ms`/`predicted_per_second` while summing tokens. Needs a debug payload to confirm.
 
-### Design decisions (v2.8.0, issue #14)
+### Design decisions (v2.6.0, issue #14)
 
 - **Root cause:** llama.cpp's `--fit` (default on) picks the window at load time, so neither llama-swap's
   `/running` command (`--ctx-size` absent) nor its listing (`capabilities.context`, a config number) carries it;
@@ -186,7 +188,7 @@ matched row ranks above models.dev/static (tier 6), an unmatched one below them 
   as a manual fallback for backends not reached through a connection. Accepted risk: `get_openai_connection` /
   `app.state.config` are OWUI internals; failure only means falling back to the next tier.
 - **On by default, but only for detected llama-swap / llama.cpp-router rows** (owner's choice). Detection from
-  `owned_by` means cloud connections are never contacted — the privacy reason behind the v2.7.0 "no
+  `owned_by` means cloud connections are never contacted — the privacy reason behind the issue #6 "no
   auto-discovery" decision does not apply. Rejected: an opt-in toggle (the reporter would have had to find it).
   Known gap: a connection with hand-typed `model_ids` has no listing row (`openai: {id}` only) → not detected.
 - **Live beats listed** (owner's choice): tier 4 sits above tier 5, so a live `/props` answer wins over
@@ -366,13 +368,13 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | mixed native/estimated history | summed; `≈` if any estimated | `:1459-1479` | `test_resolve_cost_cumulative_mixes_native_and_estimated_messages` |
 | malformed models.dev `api.json` | tolerant per-entry parse | `:1673-1704` | `test_parse_prices_malformed_input_yields_empty_map` |
 | malformed llama-swap `/running` | regex miss → `None` | `:1376-1391` | `test_parse_llama_swap_malformed_input_returns_none` |
-| several llama-swap models running (v2.6.1) | row matched to the called model id; no match → `None` → llama.cpp | `_parse_llama_swap` | `test_parse_llama_swap_picks_the_called_model_among_several`, `test_probe_context_llama_swap_unmatched_model_falls_back_to_llamacpp` |
+| several llama-swap models running (v2.6.0) | row matched to the called model id; no match → `None` → llama.cpp | `_parse_llama_swap` | `test_parse_llama_swap_picks_the_called_model_among_several`, `test_probe_context_llama_swap_unmatched_model_falls_back_to_llamacpp` |
 | one llama-swap model, id differs (alias) | that row is used, flagged unmatched → ranked after the tables | `_parse_llama_swap` | `test_parse_llama_swap_single_row_is_used_despite_id_mismatch` |
-| backend lists `meta.n_ctx` / `max_model_len` (v2.7.0) | beats models.dev/static/probe; uncached | `_backend_context_size` | `test_context_backend_n_ctx_beats_static_table`, `test_context_backend_vllm_max_model_len` |
+| backend lists `meta.n_ctx` / `max_model_len` (v2.6.0) | beats models.dev/static/probe; uncached | `_backend_context_size` | `test_context_backend_n_ctx_beats_static_table`, `test_context_backend_vllm_max_model_len` |
 | backend lists `n_ctx: 0` (llama.cpp router, unloaded) or malformed fields | ignored → next tier | `_advertised_context` | `test_context_backend_ignores_non_positive_and_malformed` |
 | workspace model on a llama.cpp base | base row read from `__request__.app.state.MODELS` | `_backend_context_size` | `test_context_workspace_model_reads_backend_row_of_its_base_model`, `test_outlet_passes_request_for_workspace_backend_context` |
 | model registry missing/raising | guarded → tables | `_backend_context_size` | `test_context_workspace_model_registry_failure_falls_through` |
-| llama-swap model started with `--fit` (no `--ctx-size`) (v2.8.0) | `/props?model=` of the `ready` row | `_probe_llama_swap` | `test_probe_llama_swap_reads_fit_window_from_props_of_ready_model` |
+| llama-swap model started with `--fit` (no `--ctx-size`) (v2.6.0) | `/props?model=` of the `ready` row | `_probe_llama_swap` | `test_probe_llama_swap_reads_fit_window_from_props_of_ready_model` |
 | llama-swap row not `ready` | `/props` never asked (it would load the model); `--ctx-size` only | `_llama_swap_ready_id` | `test_probe_llama_swap_never_asks_props_for_a_model_that_is_not_ready`, `test_llama_swap_ready_id_needs_a_ready_matched_row` |
 | llama-swap upstream without `/props` (vLLM) / `/props` error | falls back to `--ctx-size` | `_probe_llama_swap` | `test_probe_llama_swap_props_failure_falls_back_to_ctx_size` |
 | model served by llama-swap via an OWUI connection (issue #14) | connection URL/key/prefix reused; live beats listed; hit cached, user map still wins | `_connection_context_size` | `test_connection_probe_llama_swap_uses_owui_url_key_and_prefix` |

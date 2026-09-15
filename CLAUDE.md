@@ -70,7 +70,11 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
   top entry in `CHANGELOG.md`. (`required_open_webui_version: 0.9.0` in the same docstring is the
   compat floor; native provider cost needs 0.10.0+.)
 - **Tag each release `vX.Y.Z`** matching the CHANGELOG entry (existing convention: `v2.0.0` …
-  `v2.5.1`); there is no automated release workflow — tagging is manual.
+  `v2.6.0`); there is no automated release workflow — tagging is manual.
+- **Do not reuse a published version number.** `v2.6.0` was re-cut on 2026-09-15 (owner's choice): the
+  original `v2.6.0` and `v2.6.1` releases of 2026-09-14 were deleted and the unreleased 2.7.0/2.8.0 work
+  folded into one `v2.6.0`. Accepted cost: two different builds carried `2.6.0`, so users who pasted the
+  first one see no version change. Going forward, cut a new version instead.
 - The community-store post text is maintained in `docs/community-post.md`; publishing to the store
   post (URL above) is a manual copy-paste done by the user.
 

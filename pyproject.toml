@@ -1,6 +1,6 @@
 [project]
 name = "openwebui-token-usage-display"
-version = "2.8.0"
+version = "2.6.0"
 description = "Open WebUI filter plugin: token usage & cost display below each response"
 requires-python = ">=3.11"
 

@@ -109,7 +109,7 @@ model dict (`utils/models.py`, custom model with `base_model_id`) carries none o
 model's entry in `request.app.state.MODELS` (a plain dict, or `socket/utils.py:RedisDict` with `.get`) does.
 `__request__` is passed to outlet (`middleware.py`, outlet `extra_params`). Checked in v0.11.3.
 
-**Connection settings are reachable from a filter** (used by the v2.8.0 connection probe). A connection model's
+**Connection settings are reachable from a filter** (used by the v2.6.0 connection probe). A connection model's
 `urlIdx` indexes OWUI's OpenAI connections; `routers/openai.py:get_openai_connection(idx)` (async, **0.10.0+**,
 reads `Config.get_many('openai.api_base_urls', 'openai.api_keys', 'openai.api_configs')`) returns
 `(url, key, api_config)`, where `api_config` is keyed `str(idx)` or, legacy, by URL and carries `prefix_id`,
