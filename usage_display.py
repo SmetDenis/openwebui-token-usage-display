@@ -3,9 +3,9 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.6.1
+version: 2.7.0
 license: MIT
-description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes from a built-in table (seeded from models.dev) with optional live models.dev fetch and llama.cpp/llama-swap probing. Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
+description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from what the serving backend reports for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """  # noqa: D205, D212, D415, E501 - OWUI frontmatter: first line must be bare quotes, one `key: value` per line
 
@@ -410,6 +410,49 @@ def _modelsdev_match(table: dict[str, Any], model_id: str) -> str | None:
     if bare in table:
         return bare
     return _longest_key_match(table, model_id)
+
+
+def _match_running(found: list[tuple[list[str], int]], model_id: str) -> tuple[int, str | None] | None:
+    """Pick the called model's context size from a local backend's list of (ids, size) rows.
+
+    Returns (size, matched id) when a row id equals `model_id` or is its suffix after an OWUI
+    connection prefix (`prefix.id`, routers/openai.py) or a path (`org/id`), (size, None) when there
+    is exactly one row that does not match (an OWUI alias may legitimately differ), and None
+    otherwise. No loose substring match: a matched row outranks the tables, so a local `qwen` must
+    not claim a cloud `qwen3-max`. The caller ranks an unmatched row below the tables.
+    """
+    mid = (model_id or "").lower()
+    by_id = {rid.lower(): size for ids, size in found for rid in ids if rid}
+    for key in sorted(by_id, key=len, reverse=True):
+        if mid == key or mid.endswith(("." + key, "/" + key)):
+            return by_id[key], key
+    if len(found) == 1:
+        return found[0][1], None
+    return None
+
+
+def _advertised_context(entry: object) -> tuple[int, str] | None:
+    """Context size a local backend reports for a model in its own /v1/models listing, else None.
+
+    OWUI keeps each OpenAI-connection model's raw listing row both under `openai` and spread at the
+    top level of the model dict (routers/openai.py). llama.cpp (since May 2026) and llama-swap (with
+    a capabilities context) put the running window in `meta.n_ctx`, vLLM in `max_model_len`. These
+    are the server's actual limits, unlike a model's trained maximum. Non-positive values (llama.cpp
+    router mode reports 0 for an unloaded model) are ignored.
+    """
+    if not isinstance(entry, dict):
+        return None
+    for src in (entry.get("openai"), entry):
+        if not isinstance(src, dict):
+            continue
+        meta = src.get("meta")
+        n_ctx = _num(meta.get("n_ctx")) if isinstance(meta, dict) else None
+        if n_ctx is not None and n_ctx > 0:
+            return int(n_ctx), "meta.n_ctx"
+        max_len = _num(src.get("max_model_len"))
+        if max_len is not None and max_len > 0:
+            return int(max_len), "max_model_len"
+    return None
 
 
 def _resolve_model_id(model: dict[str, Any] | None, body: dict[str, Any] | None = None) -> str:
@@ -827,7 +870,10 @@ class Filter:
         context_critical_percent: int = Field(default=70, description="Context %% at which the icon turns red.")
         llamacpp_url: str = Field(
             default="",
-            description="Optional llama.cpp base URL (e.g. http://127.0.0.1:8080) for /props n_ctx probe. Empty=off.",
+            description=(
+                "Optional llama.cpp base URL (e.g. http://127.0.0.1:8080) probed via /v1/models, then /props, "
+                "for the running n_ctx. Only needed when OWUI's model list lacks it (older llama.cpp). Empty=off."
+            ),
         )
         llama_swap_url: str = Field(
             default="",
@@ -923,13 +969,15 @@ class Filter:
 
     # --- outlet: build and emit the stats line ---------------------------------
 
-    async def outlet(
+    async def outlet(  # noqa: PLR0913 - OWUI injects each dunder kwarg the signature names; one per source
         self,
         body: dict[str, Any],
+        *,
         __user__: dict[str, Any] | None = None,
         __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         __metadata__: dict[str, Any] | None = None,
         __model__: dict[str, Any] | None = None,
+        __request__: Any = None,
     ) -> dict[str, Any]:
         """Resolve tokens, timing, context and cost for the last response and emit the stats line."""
         user_valves = __user__.get("valves") if __user__ else None
@@ -966,7 +1014,7 @@ class Filter:
         # The two resolvers touch valve-parsed maps and the network; a bug in either must degrade to a
         # sentinel, never break the response pipeline.
         try:
-            ctx = await self._resolve_context(body, __metadata__, __model__, tokens)
+            ctx = await self._resolve_context(body, __metadata__, __model__, tokens, __request__)
         except Exception:  # noqa: BLE001
             ctx = {"size": None, "used": None, "source": "error", "matched_key": None}
 
@@ -1266,6 +1314,7 @@ class Filter:
         metadata: dict[str, Any] | None,
         model: dict[str, Any] | None,
         tokens: dict[str, Any],
+        request: Any = None,
     ) -> dict[str, Any]:
         if not self.valves.show_context_window:
             return {"size": None, "used": None, "source": "disabled", "matched_key": None}
@@ -1276,21 +1325,31 @@ class Filter:
 
         model_id = _resolve_model_id(model, body)
 
-        size, prov = await self._context_size_for(model_id, metadata)
+        size, prov = await self._context_size_for(model_id, metadata, model, request)
         return {"size": size, "used": used, "source": prov["source"], "matched_key": prov["matched_key"]}
 
     async def _context_size_for(
-        self, model_id: str, metadata: dict[str, Any] | None
+        self,
+        model_id: str,
+        metadata: dict[str, Any] | None,
+        model: dict[str, Any] | None = None,
+        request: Any = None,
     ) -> tuple[int | None, dict[str, Any]]:
         """Resolve context size + provenance ({source, matched_key}). Provenance is debug-only.
 
-        Resolution order: override -> num_ctx hint -> user context_size_map -> live models.dev ->
-        static table -> local-backend probe. The user's context_size_map is an explicit override,
-        so it beats the automatic models.dev fetch (mirrors how price_map wins over models.dev).
+        Resolution order: override -> num_ctx hint -> user context_size_map -> size the backend
+        advertises in the model listing -> probe matched to the model -> live models.dev -> static
+        table -> unmatched single-model probe. What the running server reports beats the tables,
+        which only know a model's trained maximum (a llama.cpp `--ctx-size 16384` is not Qwen3's
+        131072). The user's context_size_map stays above everything automatic.
         """
         explicit = self._explicit_context_size(model_id, metadata)
         if explicit is not None:
             return explicit
+        # Read from the request's own model dict, so it is never cached: a relisted model applies at once.
+        advertised = self._backend_context_size(model, request)
+        if advertised is not None:
+            return advertised
 
         cache_key = model_id.lower()
         cached = _ctx_size_cache.get(cache_key)
@@ -1324,25 +1383,51 @@ class Filter:
             return int(user_map[umkey]), {"source": "user_map", "matched_key": umkey}
         return None
 
+    @staticmethod
+    def _backend_context_size(model: dict[str, Any] | None, request: Any) -> tuple[int, dict[str, Any]] | None:
+        """Tier 4: the context size the backend itself lists for the model (see _advertised_context).
+
+        A workspace/preset model carries no listing row of its own, so its base model's row is read
+        from OWUI's model registry (`request.app.state.MODELS`, a dict or a RedisDict). That is OWUI
+        internals, hence the guard: any failure just means "not advertised".
+        """
+        if not isinstance(model, dict):
+            return None
+        found = _advertised_context(model)
+        info = model.get("info")
+        base = info.get("base_model_id") if isinstance(info, dict) else None
+        if found is None and base and request is not None:
+            try:
+                found = _advertised_context(request.app.state.MODELS.get(base))
+            except Exception:  # noqa: BLE001 - OWUI internals may change shape between versions
+                found = None
+        if found is None:
+            return None
+        return found[0], {"source": "backend", "matched_key": found[1]}
+
     async def _automatic_context_size(self, model_id: str) -> tuple[int | None, dict[str, Any]]:
-        """Tiers 4-6, looked up automatically; the caller caches a hit."""
+        """Tiers 5-8, looked up automatically; the caller caches a hit."""
         v = self.valves
-        # 4) Live models.dev lookup (opt-in; cached ~24h).
+        # 5) Optional endpoint probe for local backends (opt-in via valve URL). A row matched to the
+        #    called model is the running window and wins; an unmatched single row waits for tier 8.
+        probe = await self._probe_context(model_id) if (v.llamacpp_url or v.llama_swap_url) else None
+        if probe is not None and probe[1] is not None:
+            return probe[0], {"source": "probe", "matched_key": probe[1]}
+        # 6) Live models.dev lookup (opt-in; cached ~24h).
         if v.fetch_context_from_modelsdev:
             table = await self._modelsdev_map()
             key = _modelsdev_match(table, model_id)
             if key is not None:
                 return table[key], {"source": "modelsdev", "matched_key": key}
-        # 5) Static table, matched by substring.
+        # 7) Static table, matched by substring.
         table = self._context_table()
         key = _longest_key_match(table, model_id)
         if key is not None:
             return table[key], {"source": "static_table", "matched_key": key}
-        # 6) Optional endpoint probe for local backends (opt-in via valve URL).
-        if v.llamacpp_url or v.llama_swap_url:
-            size = await self._probe_context(model_id)
-            if size is not None:
-                return size, {"source": "probe", "matched_key": None}
+        # 8) The only model a backend runs, under an id that differs from the called one. Ranked last:
+        #    with a cloud model called, this row is some other model's window.
+        if probe is not None:
+            return probe[0], {"source": "probe", "matched_key": None}
         return None, {"source": "none", "matched_key": None}
 
     async def _modelsdev_map(self) -> dict[str, Any]:
@@ -1378,10 +1463,12 @@ class Filter:
         _modelsdev_cache["expiry"] = now + max(60, ttl)
         return result
 
-    async def _probe_context(self, model_id: str) -> int | None:
+    async def _probe_context(self, model_id: str) -> tuple[int, str | None] | None:
         """Best-effort probe of a local backend for its running context size.
 
-        Fully isolated: any failure returns None and never affects the stats line.
+        Returns (size, matched row id), with None for the id when the backend runs a single model
+        whose id differs from `model_id` (see _match_running). Fully isolated: any failure returns
+        None and never affects the stats line.
         """
         if not _AIOHTTP_AVAILABLE:
             return None
@@ -1389,16 +1476,21 @@ class Filter:
         # Any failure (DNS, timeout, bad JSON, an aiohttp quirk) only means "no probe result".
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as session:
-                # llama-swap first; a failed or unmatched lookup falls through to llama.cpp.
-                size = await self._probe_llama_swap(session, v.llama_swap_url, model_id) if v.llama_swap_url else None
-                if not size and v.llamacpp_url:
-                    size = await self._probe_llamacpp(session, v.llamacpp_url)
-                return size or None
+                # llama-swap first; anything short of a matched row lets llama.cpp try for one.
+                swap = await self._probe_llama_swap(session, v.llama_swap_url, model_id) if v.llama_swap_url else None
+                if swap is not None and swap[1] is not None:
+                    return swap
+                cpp = await self._probe_llamacpp(session, v.llamacpp_url, model_id) if v.llamacpp_url else None
+                if cpp is not None and cpp[1] is not None:
+                    return cpp
+                return swap or cpp
         except Exception:  # noqa: BLE001
             return None
 
     @staticmethod
-    async def _probe_llama_swap(session: aiohttp.ClientSession, base_url: str, model_id: str) -> int | None:
+    async def _probe_llama_swap(
+        session: aiohttp.ClientSession, base_url: str, model_id: str
+    ) -> tuple[int, str | None] | None:
         """llama-swap: /running lists the running models with their launch command (--ctx-size)."""
         try:
             async with session.get(base_url.rstrip("/") + "/running") as resp:
@@ -1408,28 +1500,76 @@ class Filter:
         return Filter._parse_llama_swap(data, model_id)
 
     @staticmethod
-    async def _probe_llamacpp(session: aiohttp.ClientSession, base_url: str) -> int | None:
-        """llama.cpp: /props reports the loaded model's n_ctx (top-level or in generation settings)."""
-        async with session.get(base_url.rstrip("/") + "/props") as resp:
-            data = await resp.json(content_type=None)
-        gen = data.get("default_generation_settings") if isinstance(data, dict) else None
-        n_ctx = _first_num(data, "n_ctx") or _first_num(gen, "n_ctx")
-        return int(n_ctx) if n_ctx else None
+    async def _probe_llamacpp(
+        session: aiohttp.ClientSession, base_url: str, model_id: str
+    ) -> tuple[int, str | None] | None:
+        """llama.cpp: /v1/models names each model with its n_ctx; older builds only have /props.
+
+        /props describes the one loaded model, so it is asked only when /v1/models yields no row
+        matched to the called model.
+        """
+        base = base_url.rstrip("/")
+        try:
+            async with session.get(base + "/v1/models") as resp:
+                listed = Filter._parse_llamacpp_models(await resp.json(content_type=None), model_id)
+        except Exception:  # noqa: BLE001 - endpoint missing or not JSON: /props may still answer
+            listed = None
+        if listed is not None and listed[1] is not None:
+            return listed
+        try:
+            async with session.get(base + "/props") as resp:
+                props = Filter._parse_llamacpp_props(await resp.json(content_type=None), model_id)
+        except Exception:  # noqa: BLE001 - /props down or not JSON: keep what /v1/models gave
+            props = None
+        if props is not None and props[1] is not None:
+            return props
+        return listed or props
 
     @staticmethod
-    def _parse_llama_swap(data: object, model_id: str) -> int | None:
+    def _parse_llamacpp_models(data: object, model_id: str) -> tuple[int, str | None] | None:
+        """Match the called model in a llama.cpp /v1/models payload (id or alias -> meta.n_ctx)."""
+        rows = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        found: list[tuple[list[str], int]] = []
+        for row in rows:
+            advertised = _advertised_context(row)
+            if advertised is None:
+                continue
+            aliases = row.get("aliases")
+            ids = [str(row.get("id") or "")] + ([str(a) for a in aliases] if isinstance(aliases, list) else [])
+            found.append((ids, advertised[0]))
+        return _match_running(found, model_id)
+
+    @staticmethod
+    def _parse_llamacpp_props(data: object, model_id: str) -> tuple[int, str | None] | None:
+        """Read n_ctx (top-level or in generation settings) from /props, naming the model it belongs to.
+
+        The model is named by its alias or by its GGUF file name (what llama.cpp lists as the id when
+        no alias is set), so a match can outrank the tables like a /v1/models row.
+        """
+        if not isinstance(data, dict):
+            return None
+        n_ctx = _first_num(data, "n_ctx") or _first_num(data.get("default_generation_settings"), "n_ctx")
+        if not n_ctx or n_ctx <= 0:
+            return None
+        path = str(data.get("model_path") or "")
+        ids = [str(data.get("model_alias") or ""), path, re.split(r"[\\/]", path)[-1].removesuffix(".gguf")]
+        return _match_running([(ids, int(n_ctx))], model_id)
+
+    @staticmethod
+    def _parse_llama_swap(data: object, model_id: str) -> tuple[int, str | None] | None:
         """Extract --ctx-size of the model OWUI called from a llama-swap /running payload.
 
         llama-swap can run several models at once (groups), each row naming its `model` id, so the
-        row is matched to `model_id` like the models.dev table (exact -> bare -> longest substring).
-        A single running row is used as is, since the ids may legitimately differ (an OWUI
-        connection prefix, an alias); several rows with no match yield None rather than another
-        model's window.
+        row is matched to `model_id` (see _match_running). A single unmatched row is still returned,
+        flagged as unmatched, since the ids may legitimately differ (an alias); several rows with no
+        match yield None rather than another model's window.
         """
         rows = data.get("running", []) if isinstance(data, dict) else data
         if not isinstance(rows, list):
             return None
-        found: list[tuple[str, int]] = []
+        found: list[tuple[list[str], int]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -1438,12 +1578,8 @@ class Filter:
                 cmd = " ".join(str(c) for c in cmd)
             match = re.search(r"--ctx-size[= ]+(\d+)", str(cmd))
             if match:
-                found.append((str(row.get("model") or "").lower(), int(match.group(1))))
-        if len(found) == 1:
-            return found[0][1]
-        by_model = {model: size for model, size in found if model}
-        key = _modelsdev_match(by_model, model_id)
-        return by_model[key] if key is not None else None
+                found.append(([str(row.get("model") or "")], int(match.group(1))))
+        return _match_running(found, model_id)
 
     def _context_size_map_table(self) -> dict[str, int]:
         """Parse the user's context_size_map valve into {model-substring(lower) -> tokens}. Non-fatal.
@@ -1874,12 +2010,27 @@ class Filter:
             "preset": bool(m.get("preset")) if "preset" in m else None,
             "is_pipe": bool(m.get("pipe")),
             "has_url_idx": "urlIdx" in m,
+            "backend_context": self._backend_context_debug(m),
             "provider_guess": self._provider_guess(m, resolved_id),
             "function_calling": function_calling,
             "owui_params": params,
             "gen_params_available": False,
             "note": "generation params (temperature/top_p/max_tokens/system/reasoning) removed by OWUI before outlet",
         }
+
+    @staticmethod
+    def _backend_context_debug(model: dict[str, Any]) -> dict[str, Any] | None:
+        """Context numbers from the model's own /v1/models row: the running window vs the trained one."""
+        raw = model.get("openai")
+        row: dict[str, Any] = raw if isinstance(raw, dict) else model
+        raw_meta = row.get("meta")
+        meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+        found = {
+            "n_ctx": _num(meta.get("n_ctx")),
+            "n_ctx_train": _num(meta.get("n_ctx_train")),
+            "max_model_len": _num(row.get("max_model_len")),
+        }
+        return found if any(val is not None for val in found.values()) else None
 
     def _valves_snapshot(self) -> dict[str, Any]:
         """Full valve dump for reproducing issues; the two local-backend URLs are masked."""

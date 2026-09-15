@@ -1217,19 +1217,19 @@ def test_parse_prices_nested_shape_skips_non_dict_entry(usage_display_module: Mo
 def test_parse_llama_swap_extracts_ctx_size_from_running(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     data = {"running": [{"cmd": "llama-server --model foo.gguf --ctx-size 8192 --port 8080"}]}
-    assert f._parse_llama_swap(data, "some-model") == 8192
+    assert f._parse_llama_swap(data, "some-model") == (8192, None)
 
 
 def test_parse_llama_swap_skips_non_dict_rows(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     data = {"running": [123, {"cmd": "--ctx-size 999"}]}
-    assert f._parse_llama_swap(data, "some-model") == 999
+    assert f._parse_llama_swap(data, "some-model") == (999, None)
 
 
 def test_parse_llama_swap_cmd_as_list(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     data = {"running": [{"cmd": ["llama-server", "--ctx-size", "4096"]}]}
-    assert f._parse_llama_swap(data, "some-model") == 4096
+    assert f._parse_llama_swap(data, "some-model") == (4096, None)
 
 
 def test_parse_llama_swap_malformed_input_returns_none(usage_display_module: ModuleType) -> None:
@@ -1249,16 +1249,58 @@ def test_parse_llama_swap_picks_the_called_model_among_several(usage_display_mod
             {"model": "qwen3-30b", "cmd": "llama-server --ctx-size 32768"},
         ]
     }
-    assert f._parse_llama_swap(data, "qwen3-30b") == 32768  # exact id
-    assert f._parse_llama_swap(data, "llama-swap.qwen3-30b") == 32768  # OWUI connection prefix: substring match
+    assert f._parse_llama_swap(data, "qwen3-30b") == (32768, "qwen3-30b")  # exact id
+    assert f._parse_llama_swap(data, "llama-swap.qwen3-30b") == (32768, "qwen3-30b")  # OWUI connection prefix
     assert f._parse_llama_swap(data, "mistral-7b") is None  # several rows, none matches: no guessing
+
+
+def test_parse_llama_swap_no_loose_substring_match(usage_display_module: ModuleType) -> None:
+    """A matched row outranks the tables, so a short local id must not claim a longer cloud id."""
+    f = usage_display_module.Filter()
+    data = {
+        "running": [
+            {"model": "qwen", "cmd": "llama-server --ctx-size 8192"},
+            {"model": "gemma", "cmd": "llama-server --ctx-size 4096"},
+        ]
+    }
+    assert f._parse_llama_swap(data, "openrouter.qwen3-max") is None  # "qwen" is a substring, not the model
+    assert f._parse_llama_swap(data, "local/qwen") == (8192, "qwen")  # path suffix still matches
+
+
+def test_parse_llamacpp_models_matches_id_or_alias(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    data = {
+        "data": [
+            {"id": "gemma-3-4b", "aliases": [], "meta": {"n_ctx": 8192, "n_ctx_train": 131072}},
+            {"id": "Qwen3.6-27B-UD-Q5_K_XL", "aliases": ["qwen-fast"], "meta": {"n_ctx": 16384}},
+            {"id": "not-loaded", "meta": {"n_ctx": 0}},  # router mode: unloaded -> skipped
+            "junk",
+        ]
+    }
+    assert f._parse_llamacpp_models(data, "qwen3.6-27b-ud-q5_k_xl") == (16384, "qwen3.6-27b-ud-q5_k_xl")
+    assert f._parse_llamacpp_models(data, "llamacpp.qwen-fast") == (16384, "qwen-fast")
+    assert f._parse_llamacpp_models(data, "gpt-4o") is None  # two rows, no match: no guessing
+    single = {"data": [{"id": "whatever", "aliases": "not-a-list", "meta": {"n_ctx": 4096}}]}
+    assert f._parse_llamacpp_models(single, "my-alias") == (4096, None)
+    assert f._parse_llamacpp_models({"data": "nope"}, "x") is None
+    assert f._parse_llamacpp_models(None, "x") is None
+
+
+def test_parse_llamacpp_props_names_the_loaded_model(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    props = {"model_path": "/models/Qwen3.6-27B-UD-Q5_K_XL.gguf", "default_generation_settings": {"n_ctx": 16384}}
+    assert f._parse_llamacpp_props(props, "qwen3.6-27b-ud-q5_k_xl") == (16384, "qwen3.6-27b-ud-q5_k_xl")
+    assert f._parse_llamacpp_props({"model_alias": "qwen", "n_ctx": 8192}, "qwen") == (8192, "qwen")
+    assert f._parse_llamacpp_props({"model_alias": "qwen", "n_ctx": 8192}, "gpt-4o") == (8192, None)
+    assert f._parse_llamacpp_props({"n_ctx": 0}, "qwen") is None  # router mode placeholder
+    assert f._parse_llamacpp_props(["not", "a", "dict"], "qwen") is None
 
 
 def test_parse_llama_swap_single_row_is_used_despite_id_mismatch(usage_display_module: ModuleType) -> None:
     """One running model is unambiguous, so an alias or differently-spelled OWUI id still gets its window."""
     f = usage_display_module.Filter()
     data = {"running": [{"model": "qwen3-30b", "cmd": "llama-server --ctx-size 32768"}]}
-    assert f._parse_llama_swap(data, "my-alias") == 32768
+    assert f._parse_llama_swap(data, "my-alias") == (32768, None)  # flagged unmatched
 
 
 # --- stats assembly, provider guess, sanitize, valves snapshot ----------------- #
@@ -1292,6 +1334,17 @@ def test_provider_guess_family_from_model_id(usage_display_module: ModuleType) -
     assert f._provider_guess(None, "gpt-4o-mini") == "openai"
     assert f._provider_guess({}, "totally-unknown-model") == "unknown"
     assert f._provider_guess(None, "") == "unknown"
+
+
+def test_sanitize_model_backend_context_numbers_only(usage_display_module: ModuleType) -> None:
+    """The debug payload shows the running vs trained window from the listing row, and nothing else from it."""
+    f = usage_display_module.Filter()
+    row = {"id": "qwen", "meta": {"n_ctx": 16384, "n_ctx_train": 262144, "model_path": "/home/secret/q.gguf"}}
+    out = f._sanitize_model({"id": "qwen", "openai": row, **row}, None, "qwen")
+    assert out["backend_context"] == {"n_ctx": 16384, "n_ctx_train": 262144, "max_model_len": None}
+    assert "secret" not in str(out)
+    vllm = f._sanitize_model({"id": "m", "max_model_len": 32768}, None, "m")
+    assert vllm["backend_context"] == {"n_ctx": None, "n_ctx_train": None, "max_model_len": 32768}
 
 
 def test_sanitize_model_whitelist_only_no_secrets(usage_display_module: ModuleType) -> None:
@@ -1337,6 +1390,7 @@ def test_sanitize_model_whitelist_only_no_secrets(usage_display_module: ModuleTy
         "preset",
         "is_pipe",
         "has_url_idx",
+        "backend_context",
         "provider_guess",
         "function_calling",
         "owui_params",
@@ -1359,6 +1413,7 @@ def test_sanitize_model_whitelist_only_no_secrets(usage_display_module: ModuleTy
     assert out["preset"] is True
     assert out["is_pipe"] is False
     assert out["has_url_idx"] is True
+    assert out["backend_context"] is None  # no /v1/models row numbers on this model
     assert out["function_calling"] == "native"
     assert out["owui_params"] == {
         "reasoning_tags": True,
@@ -1936,8 +1991,8 @@ def test_context_size_for_probe_success(usage_display_module: ModuleType, monkey
     async def _empty_map() -> dict[str, Any]:
         return {}
 
-    async def _probe(_model_id: str) -> int:
-        return 65536
+    async def _probe(_model_id: str) -> tuple[int, None]:
+        return 65536, None  # the backend's only model, under a different id
 
     monkeypatch.setattr(f, "_modelsdev_map", _empty_map)
     monkeypatch.setattr(f, "_modelsdev_prices_map", _empty_map)
@@ -1946,6 +2001,145 @@ def test_context_size_for_probe_success(usage_display_module: ModuleType, monkey
     size, prov = run_async(f._context_size_for("totally-unmatched-model-probe-check", None))
     assert size == 65536
     assert prov == {"source": "probe", "matched_key": None}
+
+
+def _llamacpp_model(model_id: str, n_ctx: int) -> dict[str, Any]:
+    """An OWUI model dict for a llama.cpp connection: the raw /v1/models row under `openai` and spread."""
+    row = {"id": model_id, "owned_by": "llamacpp", "meta": {"n_ctx": n_ctx, "n_ctx_train": 262144}}
+    return {**row, "name": model_id, "owned_by": "openai", "openai": row, "urlIdx": 0}
+
+
+class _FakeRequest:
+    """Stand-in for OWUI's `__request__`: only `app.state.MODELS` is read."""
+
+    def __init__(self, models: Any) -> None:
+        state = type("State", (), {"MODELS": models})()
+        self.app = type("App", (), {"state": state})()
+
+
+def test_context_backend_n_ctx_beats_static_table(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #6: llama-server --ctx-size 16384 showed Qwen3's trained 131072 from the static table."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    model = _llamacpp_model("qwen3.6-27b-issue6", 16384)
+    ctx = run_async(f._resolve_context(make_body(model=model["id"]), {}, model, make_tokens(total=7200)))
+    assert ctx["size"] == 16384
+    assert ctx["source"] == "backend"
+    assert ctx["matched_key"] == "meta.n_ctx"
+    # Not cached: the same id without a listing row falls back to the table at once.
+    plain = run_async(
+        f._resolve_context(make_body(), {}, make_model_dict("qwen3.6-27b-issue6"), make_tokens(total=7200))
+    )
+    assert plain["size"] == 131072
+    assert plain["source"] == "static_table"
+
+
+def test_context_backend_vllm_max_model_len(usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    model = {"id": "llama-3.1-8b-vllm", "max_model_len": 32768}
+    size, prov = run_async(f._context_size_for(model["id"], None, model))
+    assert size == 32768
+    assert prov == {"source": "backend", "matched_key": "max_model_len"}
+
+
+def test_context_backend_ignores_non_positive_and_malformed(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    for model in (
+        {"id": "gpt-4o-backend-zero", "meta": {"n_ctx": 0}},  # llama.cpp router: model not loaded
+        {"id": "gpt-4o-backend-bad", "meta": "nope", "openai": "nope", "max_model_len": "big"},
+    ):
+        size, prov = run_async(f._context_size_for(model["id"], None, model))
+        assert size == 128000
+        assert prov["source"] == "static_table"
+
+
+def test_context_user_map_and_num_ctx_beat_backend(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    model = _llamacpp_model("qwen3-backend-vs-map", 16384)
+    size, prov = run_async(f._context_size_for(model["id"], {"_tud_num_ctx": 4096}, model))
+    assert (size, prov["source"]) == (4096, "num_ctx")
+    f.valves.context_size_map = '{"qwen3-backend": 8192}'
+    size, prov = run_async(f._context_size_for(model["id"], None, model))
+    assert (size, prov["source"]) == (8192, "user_map")
+
+
+def test_context_workspace_model_reads_backend_row_of_its_base_model(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preset carries no listing row; its base model's row comes from OWUI's model registry."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    preset = make_model_dict("qwen-no-think", base="qwen3.6-27b-preset")
+    request = _FakeRequest({"qwen3.6-27b-preset": _llamacpp_model("qwen3.6-27b-preset", 16384)})
+    size, prov = run_async(f._context_size_for("qwen3.6-27b-preset", None, preset, request))
+    assert size == 16384
+    assert prov == {"source": "backend", "matched_key": "meta.n_ctx"}
+
+
+def test_context_workspace_model_registry_failure_falls_through(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    preset = make_model_dict("qwen-agent", base="qwen3.6-27b-registry-broken")
+
+    class _BrokenModels:
+        def get(self, _key: str) -> None:
+            msg = "redis down"
+            raise ConnectionError(msg)
+
+    for request in (_FakeRequest(_BrokenModels()), object(), _FakeRequest({})):
+        size, prov = run_async(f._context_size_for("qwen3.6-27b-registry-broken", None, preset, request))
+        assert size == 131072
+        assert prov["source"] == "static_table"
+
+
+def test_context_matched_probe_beats_tables_unmatched_loses(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    f.valves.llamacpp_url = "http://localhost:8080"
+
+    async def _matched(model_id: str) -> tuple[int, str]:
+        return 16384, model_id
+
+    monkeypatch.setattr(f, "_probe_context", _matched)
+    size, prov = run_async(f._context_size_for("qwen3-probe-matched", None))
+    assert size == 16384
+    assert prov == {"source": "probe", "matched_key": "qwen3-probe-matched"}
+
+    async def _unmatched(_model_id: str) -> tuple[int, None]:
+        return 16384, None
+
+    monkeypatch.setattr(f, "_probe_context", _unmatched)
+    size, prov = run_async(f._context_size_for("gpt-4o-probe-unmatched", None))
+    assert size == 128000  # a cloud model is not given the local server's window
+    assert prov["source"] == "static_table"
+
+
+def test_outlet_passes_request_for_workspace_backend_context(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    usage = make_usage(input_tokens=6590, output_tokens=645, total_tokens=7235)
+    body = make_body([make_message("q", role="user"), make_message("a", usage=usage)], model="qwen-no-think-outlet")
+    preset = make_model_dict("qwen-no-think-outlet", base="qwen3.6-27b-outlet")
+    request = _FakeRequest({"qwen3.6-27b-outlet": _llamacpp_model("qwen3.6-27b-outlet", 16384)})
+    emitter = CapturingEmitter()
+    run_async(f.outlet(body, __event_emitter__=emitter, __model__=preset, __request__=request))
+    desc = emitter.statuses()[0]["data"]["description"]
+    assert "7.2k/16.4k (44%)" in desc
 
 
 # --- _resolve_cost: off / auto (native) / estimate branches -------------------- #
@@ -2380,7 +2574,7 @@ def test_probe_context_llama_swap_success(usage_display_module: ModuleType, monk
     mod = usage_display_module
     f.valves.llama_swap_url = "http://localhost:8090"
     install_fake_aiohttp(monkeypatch, mod, {"http://localhost:8090/running": {"running": [{"cmd": "--ctx-size 4096"}]}})
-    assert run_async(f._probe_context("some-model")) == 4096
+    assert run_async(f._probe_context("some-model")) == (4096, None)
 
 
 def test_probe_context_llama_swap_unmatched_model_falls_back_to_llamacpp(
@@ -2396,7 +2590,7 @@ def test_probe_context_llama_swap_unmatched_model_falls_back_to_llamacpp(
         mod,
         {"http://localhost:8090/running": running, "http://localhost:8080/props": {"n_ctx": 8192}},
     )
-    assert run_async(f._probe_context("some-model")) == 8192
+    assert run_async(f._probe_context("some-model")) == (8192, None)
 
 
 def test_probe_context_llama_swap_no_match_and_no_llamacpp_returns_none(
@@ -2436,7 +2630,7 @@ def test_probe_context_llama_swap_fails_falls_back_to_llamacpp(
             "http://localhost:8080/props": {"n_ctx": 8192},
         },
     )
-    assert run_async(f._probe_context("some-model")) == 8192
+    assert run_async(f._probe_context("some-model")) == (8192, None)
 
 
 def test_probe_context_llamacpp_nested_generation_settings(
@@ -2448,7 +2642,113 @@ def test_probe_context_llamacpp_nested_generation_settings(
     install_fake_aiohttp(
         monkeypatch, mod, {"http://localhost:8080/props": {"default_generation_settings": {"n_ctx": 16384}}}
     )
-    assert run_async(f._probe_context("some-model")) == 16384
+    assert run_async(f._probe_context("some-model")) == (16384, None)
+
+
+def test_probe_context_llamacpp_v1_models_match_skips_props(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    f.valves.llamacpp_url = "http://localhost:8080/"
+    models = {"data": [{"id": "a", "meta": {"n_ctx": 1024}}, {"id": "qwen3.6", "meta": {"n_ctx": 16384}}]}
+    install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {"http://localhost:8080/v1/models": models, "http://localhost:8080/props": RuntimeError("must not be asked")},
+    )
+    assert run_async(f._probe_context("qwen3.6")) == (16384, "qwen3.6")
+
+
+def test_probe_context_llamacpp_old_build_matches_via_props(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-May-2026 llama.cpp lists no meta.n_ctx; /props names the model by its GGUF file."""
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    f.valves.llamacpp_url = "http://localhost:8080"
+    install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {
+            "http://localhost:8080/v1/models": {"data": [{"id": "Qwen3.6.gguf", "meta": {"n_ctx_train": 262144}}]},
+            "http://localhost:8080/props": {"model_path": "/m/Qwen3.6.gguf", "n_ctx": 16384},
+        },
+    )
+    assert run_async(f._probe_context("qwen3.6")) == (16384, "qwen3.6")
+
+
+def test_probe_context_llamacpp_unmatched_props_kept_when_listing_fails(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    f.valves.llamacpp_url = "http://localhost:8080"
+    install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {
+            "http://localhost:8080/v1/models": RuntimeError("404"),
+            "http://localhost:8080/props": {"model_alias": "other", "n_ctx": 4096},
+        },
+    )
+    assert run_async(f._probe_context("qwen3.6")) == (4096, None)
+
+
+def test_probe_context_llamacpp_unmatched_listing_kept_when_props_fails(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    f.valves.llamacpp_url = "http://localhost:8080"
+    install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {
+            "http://localhost:8080/v1/models": {"data": [{"id": "other", "meta": {"n_ctx": 4096}}]},
+            "http://localhost:8080/props": RuntimeError("props down"),
+        },
+    )
+    assert run_async(f._probe_context("qwen3.6")) == (4096, None)
+
+
+def test_probe_context_llama_swap_unmatched_row_yields_to_matched_llamacpp(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    f.valves.llama_swap_url = "http://localhost:8090"
+    f.valves.llamacpp_url = "http://localhost:8080"
+    install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {
+            "http://localhost:8090/running": {"running": [{"model": "other", "cmd": "--ctx-size 1024"}]},
+            "http://localhost:8080/v1/models": {"data": [{"id": "qwen3.6", "meta": {"n_ctx": 16384}}]},
+        },
+    )
+    assert run_async(f._probe_context("qwen3.6")) == (16384, "qwen3.6")
+    # Neither matches: the swap row (asked first) is returned, flagged as unmatched.
+    assert run_async(f._probe_context("gpt-4o")) == (1024, None)
+
+
+def test_probe_context_llama_swap_matched_row_skips_llamacpp(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    f.valves.llama_swap_url = "http://localhost:8090"
+    f.valves.llamacpp_url = "http://localhost:8080"
+    install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {
+            "http://localhost:8090/running": {"running": [{"model": "qwen3.6", "cmd": "--ctx-size 16384"}]},
+            "http://localhost:8080/v1/models": RuntimeError("must not be asked"),
+            "http://localhost:8080/props": RuntimeError("must not be asked"),
+        },
+    )
+    assert run_async(f._probe_context("qwen3.6")) == (16384, "qwen3.6")
 
 
 def test_probe_context_llamacpp_fails_returns_none(

@@ -101,7 +101,7 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (185 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (203 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
 and `make_*` builders live at the top of the test file). `pydantic` is pinned (`==`) in the `dev`
 dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.11.3), so the plugin

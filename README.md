@@ -63,9 +63,11 @@ The context window size is resolved in this order:
 1. **Manual override** valve (if set)
 2. **`num_ctx`** captured from the request (Ollama / local models)
 3. **Your `context_size_map`** - an explicit user override, so it wins over the automatic sources below
-4. **Live models.dev lookup** - optional, opt-in; fetches current sizes and caches them (default off)
-5. **Built-in table** - seeded from [models.dev](https://models.dev), covering the popular OpenAI / Anthropic / Gemini / Llama / DeepSeek / Grok / Mistral / Qwen / Kimi / GLM / MiniMax / Cohere families
-6. **llama.cpp / llama-swap probe** - optional, opt-in; queries `/props` or `/running`
+4. **What the serving backend reports for the model** - automatic, no network: llama.cpp (builds since May 2026) and llama-swap (with `capabilities.context` set) list the running window as `meta.n_ctx` in `/v1/models`, vLLM as `max_model_len`, and Open WebUI hands that listing to the plugin. This is your server's real `--ctx-size`, not the model's trained maximum
+5. **llama.cpp / llama-swap probe** - optional, opt-in; asks llama.cpp `/v1/models` (then `/props` on older builds) or llama-swap `/running`, and wins over the tables only when the row matches the called model's id
+6. **Live models.dev lookup** - optional, opt-in; fetches current sizes and caches them (default off)
+7. **Built-in table** - seeded from [models.dev](https://models.dev), covering the popular OpenAI / Anthropic / Gemini / Llama / DeepSeek / Grok / Mistral / Qwen / Kimi / GLM / MiniMax / Cohere families
+8. **A probed backend's only running model, when its id differs from the called one** (an alias) - last, because with a cloud model called it would be another model's window
 
 **Workspace models resolve via their base model.** For a custom model / "agent" built on a base model, matching (context size **and** cost) uses the model's **`base_model_id`** - the real underlying LLM - not your custom model id. So a single `context_size_map` entry keyed on the base model covers every agent built on it.
 
@@ -99,7 +101,7 @@ In `estimate` mode the price is resolved as: your manual **`price_map`** valve â
 - **Metric order** is configurable via the admin `display_order` valve (comma-separated keys).
 - **Line appearance** is configurable: `separator`, `icon_style` (`emoji` / `simple` monochrome / `off`
   bare values), and `compact_numbers` (abbreviate token counters as `k`/`M`).
-- Context detection: manual size override, a custom `{"model-substring": tokens}` map, the live models.dev fetch toggle, and optional llama.cpp / llama-swap URLs.
+- Context detection: manual size override, a custom `{"model-substring": tokens}` map, the live models.dev fetch toggle, and optional llama.cpp / llama-swap URLs (the size a backend advertises is read automatically).
 - Cost: `cost_mode`, a running chat-total toggle, a `cost_min_display` threshold, a manual `price_map`, and the live models.dev price-fetch toggle.
 
 ## Troubleshooting
@@ -115,6 +117,7 @@ Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - 
   `general_settings: { always_include_stream_usage: true }`.
 - **Tokens show but cost is blank in `auto` mode.** In `auto`, cost appears only when the provider/proxy reports it **inside the response body** `usage`. A LiteLLM proxy returns cost in the
   `x-litellm-response-cost` HTTP header by default, which Open WebUI does not read - move it into the body with `litellm_settings: { include_cost_in_streaming_usage: true }`, or switch to `cost_mode: estimate`.
+- **Context shows the model's maximum (e.g. `131.1k` for Qwen3), not your llama.cpp `--ctx-size`.** `context_debug.source` is `static_table` or `modelsdev`: the backend did not advertise its window. Update llama.cpp (the `meta.n_ctx` field in `/v1/models` appeared in May 2026) and refresh Open WebUI's model list, set `capabilities.context` in llama-swap, set the `llamacpp_url` / `llama_swap_url` valve, or add a `context_size_map` entry. `model.backend_context` in the debug payload shows the running (`n_ctx`) and trained (`n_ctx_train`) windows the listing carries.
 - **`estimate` cost is blank / context % missing.** The model id matched no price/context entry (common when Open WebUI exposes a display name like `Anthropic - Opus`). Add a `price_map` / `context_size_map`
   keyed to a substring of the id, or use a canonical id. For a workspace model, key the map on the
   **base** model.
