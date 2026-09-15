@@ -109,6 +109,17 @@ model dict (`utils/models.py`, custom model with `base_model_id`) carries none o
 model's entry in `request.app.state.MODELS` (a plain dict, or `socket/utils.py:RedisDict` with `.get`) does.
 `__request__` is passed to outlet (`middleware.py`, outlet `extra_params`). Checked in v0.11.3.
 
+**Connection settings are reachable from a filter** (used by the v2.8.0 connection probe). A connection model's
+`urlIdx` indexes OWUI's OpenAI connections; `routers/openai.py:get_openai_connection(idx)` (async, **0.10.0+**,
+reads `Config.get_many('openai.api_base_urls', 'openai.api_keys', 'openai.api_configs')`) returns
+`(url, key, api_config)`, where `api_config` is keyed `str(idx)` or, legacy, by URL and carries `prefix_id`,
+`auth_type` (`bearer`/None → the key as bearer; `none`; `session`; `system_oauth`; `azure_ad`/`microsoft_entra_id`),
+`headers`, `model_ids`, `provider`. On 0.9.x the same data lives on `request.app.state.config.OPENAI_API_BASE_URLS`
+/ `OPENAI_API_KEYS` / `OPENAI_API_CONFIGS`. Prefixing mutates the raw row in place (`model['id'] = f'{prefix_id}.{id}'`),
+so `__model__["openai"]["id"]` carries the prefix too; `utils/model_ids.py:strip_provider_model_prefix` is how
+OWUI removes it. A connection with manual `model_ids` lists `{'id', 'name', 'owned_by': 'openai', 'openai': {'id'}}`
+only — no upstream row. Checked in v0.11.3 and v0.10.0/v0.9.6.
+
 **`__metadata__` is sensitive:** it carries `user_message` (the raw prompt), `user_id`,
 `user_agent`, `session_id`, `chat_id`, `variables`, `chat_variables`, `files`, and the full `model`
 dict (`main.py:1180-1209`). Never dump it raw into anything user-shareable — whitelist fields

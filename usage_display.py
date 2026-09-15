@@ -3,9 +3,9 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.7.0
+version: 2.8.0
 license: MIT
-description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from what the serving backend reports for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
+description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """  # noqa: D205, D212, D415, E501 - OWUI frontmatter: first line must be bare quotes, one `key: value` per line
 
@@ -72,6 +72,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 
@@ -453,6 +454,64 @@ def _advertised_context(entry: object) -> tuple[int, str] | None:
         if max_len is not None and max_len > 0:
             return int(max_len), "max_model_len"
     return None
+
+
+def _live_backend(entry: object) -> tuple[str, str] | None:
+    """(kind, listed model id) when the model is served by a backend that can be asked for its live window.
+
+    Detected from the raw /v1/models row OWUI keeps under `openai`, so a cloud connection is never
+    probed: llama-swap marks its rows `owned_by: llama-swap` (an alias row names its real model in
+    `meta.llamaswap.modelID`; peer and selector rows are skipped), a llama.cpp router marks them
+    `owned_by: llamacpp` plus a `status` block that a single llama-server row lacks. A plain
+    llama-server already lists its running `meta.n_ctx`, read by _advertised_context. The id may
+    still carry the OWUI connection prefix. A connection restricted to hand-typed model ids has no
+    row to read, so it is not detected.
+    """
+    row = entry.get("openai") if isinstance(entry, dict) else None
+    if not isinstance(row, dict):
+        return None
+    row_id = row.get("id")
+    if not isinstance(row_id, str) or not row_id:
+        return None
+    if row.get("owned_by") == "llama-swap":
+        meta = row.get("meta")
+        swap = meta.get("llamaswap") if isinstance(meta, dict) else None
+        kind = swap.get("type") if isinstance(swap, dict) else None
+        if kind == "alias" and isinstance(swap, dict) and isinstance(swap.get("modelID"), str) and swap["modelID"]:
+            return "llama-swap", swap["modelID"]
+        return ("llama-swap", row_id) if kind in (None, "model") else None
+    if row.get("owned_by") == "llamacpp" and isinstance(row.get("status"), dict):
+        return "llamacpp-router", row_id
+    return None
+
+
+def _props_n_ctx(data: object) -> int | None:
+    """Positive n_ctx from a llama.cpp /props payload (top level or its generation settings), else None."""
+    if not isinstance(data, dict):
+        return None
+    n_ctx = _first_num(data, "n_ctx") or _first_num(data.get("default_generation_settings"), "n_ctx")
+    return int(n_ctx) if n_ctx and n_ctx > 0 else None
+
+
+def _llama_swap_ready_id(data: object, model_id: str) -> str | None:
+    """Id of the llama-swap /running row that is the called model and fully loaded, else None.
+
+    Matching mirrors _match_running (exact, `prefix.id`, `org/id`), but only a `ready` row counts:
+    a model-dispatched request such as /props?model= makes llama-swap start a model that is not
+    running, evicting whatever is, and a stats probe must never do that. The row id keeps its case
+    because llama-swap resolves model ids case-sensitively.
+    """
+    rows = data.get("running") if isinstance(data, dict) else None
+    mid = (model_id or "").lower()
+    best: str | None = None
+    for row in rows if isinstance(rows, list) else []:
+        rid = row.get("model") if isinstance(row, dict) else None
+        if not isinstance(rid, str) or not rid or row.get("state") != "ready":
+            continue
+        key = rid.lower()
+        if (mid == key or mid.endswith(("." + key, "/" + key))) and (best is None or len(rid) > len(best)):
+            best = rid
+    return best
 
 
 def _resolve_model_id(model: dict[str, Any] | None, body: dict[str, Any] | None = None) -> str:
@@ -877,7 +936,10 @@ class Filter:
         )
         llama_swap_url: str = Field(
             default="",
-            description="Optional llama-swap base URL to probe /running for --ctx-size. Empty = off.",
+            description=(
+                "Optional llama-swap base URL probed via /running, then /props?model= for the running n_ctx. "
+                "Only needed when the model is not listed through an OWUI connection to that llama-swap. Empty=off."
+            ),
         )
         context_probe_ttl: int = Field(default=600, description="Seconds to cache a probed/resolved context size.")
         # --- Cost ---
@@ -1337,15 +1399,20 @@ class Filter:
     ) -> tuple[int | None, dict[str, Any]]:
         """Resolve context size + provenance ({source, matched_key}). Provenance is debug-only.
 
-        Resolution order: override -> num_ctx hint -> user context_size_map -> size the backend
+        Resolution order: override -> num_ctx hint -> user context_size_map -> live window asked
+        through the model's own OWUI connection (llama-swap / llama.cpp router) -> size the backend
         advertises in the model listing -> probe matched to the model -> live models.dev -> static
         table -> unmatched single-model probe. What the running server reports beats the tables,
         which only know a model's trained maximum (a llama.cpp `--ctx-size 16384` is not Qwen3's
-        131072). The user's context_size_map stays above everything automatic.
+        131072), and a live answer beats a listed one (llama-swap lists a number from its config,
+        which `--fit` may not honor). The user's context_size_map stays above everything automatic.
         """
         explicit = self._explicit_context_size(model_id, metadata)
         if explicit is not None:
             return explicit
+        live = await self._connection_context_size(model, request)
+        if live is not None:
+            return live
         # Read from the request's own model dict, so it is never cached: a relisted model applies at once.
         advertised = self._backend_context_size(model, request)
         if advertised is not None:
@@ -1385,7 +1452,7 @@ class Filter:
 
     @staticmethod
     def _backend_context_size(model: dict[str, Any] | None, request: Any) -> tuple[int, dict[str, Any]] | None:
-        """Tier 4: the context size the backend itself lists for the model (see _advertised_context).
+        """Tier 5: the context size the backend itself lists for the model (see _advertised_context).
 
         A workspace/preset model carries no listing row of its own, so its base model's row is read
         from OWUI's model registry (`request.app.state.MODELS`, a dict or a RedisDict). That is OWUI
@@ -1393,38 +1460,126 @@ class Filter:
         """
         if not isinstance(model, dict):
             return None
-        found = _advertised_context(model)
-        info = model.get("info")
-        base = info.get("base_model_id") if isinstance(info, dict) else None
-        if found is None and base and request is not None:
-            try:
-                found = _advertised_context(request.app.state.MODELS.get(base))
-            except Exception:  # noqa: BLE001 - OWUI internals may change shape between versions
-                found = None
+        found = _advertised_context(model) or _advertised_context(Filter._base_model_entry(model, request))
         if found is None:
             return None
         return found[0], {"source": "backend", "matched_key": found[1]}
 
+    @staticmethod
+    def _base_model_entry(model: dict[str, Any], request: Any) -> dict[str, Any] | None:
+        """A workspace/preset model's base model entry from OWUI's model registry, else None.
+
+        The registry (`request.app.state.MODELS`, a dict or a RedisDict) is OWUI internals, hence the
+        guard: any failure just means "no base entry".
+        """
+        info = model.get("info")
+        base = info.get("base_model_id") if isinstance(info, dict) else None
+        if not base or request is None:
+            return None
+        try:
+            entry = request.app.state.MODELS.get(base)
+        except Exception:  # noqa: BLE001 - OWUI internals may change shape between versions
+            return None
+        return entry if isinstance(entry, dict) else None
+
+    async def _connection_context_size(
+        self, model: dict[str, Any] | None, request: Any
+    ) -> tuple[int, dict[str, Any]] | None:
+        """Tier 4: ask the model's llama-swap / llama.cpp router for the running window (issue #14).
+
+        Uses the OWUI connection the model is served through (base URL, API key, `prefix_id`), so
+        nothing is configured twice, and asks only backends detected from the listing row
+        (_live_backend), never a cloud provider. llama-swap: /running must show the model `ready`,
+        then /props?model= (proxied to that llama-server, so a `--fit` window is seen), falling back
+        to the row's `--ctx-size`. llama.cpp router: /props?model=&autoload=false, which refuses
+        rather than loads. A hit is cached like the other probes; a miss is not, so the next response
+        asks again.
+        """
+        if not isinstance(model, dict) or not _AIOHTTP_AVAILABLE:
+            return None
+        entry = model if isinstance(model.get("openai"), dict) else self._base_model_entry(model, request)
+        backend = _live_backend(entry)
+        url_idx = entry.get("urlIdx") if entry is not None else None
+        if backend is None or not isinstance(url_idx, int) or isinstance(url_idx, bool):
+            return None
+        cache_key = f"connection:{url_idx}:{backend[1]}"
+        cached = _ctx_size_cache.get(cache_key)
+        if cached and cached[1] > time.time():
+            return cached[0], cached[2]
+
+        connection = await self._owui_connection(url_idx, request)
+        if connection is None:
+            return None
+        base_url, headers, prefix_id = connection
+        kind, listed_id = backend
+        upstream_id = listed_id.removeprefix(f"{prefix_id}.") if prefix_id else listed_id
+        size = await self._ask_live_backend(kind, base_url, headers, upstream_id)
+        if size is None:
+            return None
+        prov = {"source": "connection_probe", "matched_key": f"{kind}:{upstream_id}"}
+        _ctx_size_cache[cache_key] = (size, time.time() + max(60, self.valves.context_probe_ttl), prov)
+        return size, prov
+
+    @staticmethod
+    async def _ask_live_backend(kind: str, base_url: str, headers: dict[str, str], upstream_id: str) -> int | None:
+        """The running n_ctx of `upstream_id` on a llama-swap or a llama.cpp router, else None. Never loads it."""
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as session:
+                if kind == "llama-swap":
+                    found = await Filter._probe_llama_swap(session, base_url, upstream_id, headers)
+                    return found[0] if found is not None and found[1] is not None else None
+                query = f"/props?model={quote(upstream_id, safe='')}&autoload=false"
+                async with session.get(base_url + query, headers=headers) as resp:
+                    return _props_n_ctx(await resp.json(content_type=None))
+        except Exception:  # noqa: BLE001 - backend down, auth refused or not JSON: fall through to the next tier
+            return None
+
+    @staticmethod
+    async def _owui_connection(url_idx: int, request: Any) -> tuple[str, dict[str, str], str | None] | None:
+        """(base URL without /v1, auth headers, prefix_id) of OWUI's OpenAI connection `url_idx`, else None.
+
+        OWUI internals, guarded: 0.10+ reads it via `routers.openai.get_openai_connection`, 0.9.x from
+        `request.app.state.config`. The API key is sent only as a bearer token and only when the
+        connection itself uses bearer auth (session/OAuth/Entra tokens are per-user and not reused).
+        """
+        try:
+            try:
+                from open_webui.routers.openai import get_openai_connection  # noqa: PLC0415 - OWUI-only module
+            except ImportError:
+                cfg = request.app.state.config
+                url, key = cfg.OPENAI_API_BASE_URLS[url_idx], cfg.OPENAI_API_KEYS[url_idx]
+                api_config = cfg.OPENAI_API_CONFIGS.get(str(url_idx), cfg.OPENAI_API_CONFIGS.get(url, {}))
+            else:
+                url, key, api_config = await get_openai_connection(url_idx)
+        except Exception:  # noqa: BLE001 - OWUI internals may change shape between versions
+            return None
+        if not isinstance(url, str) or not url or not isinstance(api_config, dict):
+            return None
+        auth = api_config.get("auth_type")
+        headers = {"Authorization": f"Bearer {key}"} if key and auth in (None, "bearer") else {}
+        prefix_id = api_config.get("prefix_id")
+        return url.rstrip("/").removesuffix("/v1"), headers, prefix_id if isinstance(prefix_id, str) else None
+
     async def _automatic_context_size(self, model_id: str) -> tuple[int | None, dict[str, Any]]:
-        """Tiers 5-8, looked up automatically; the caller caches a hit."""
+        """Tiers 6-9, looked up automatically; the caller caches a hit."""
         v = self.valves
-        # 5) Optional endpoint probe for local backends (opt-in via valve URL). A row matched to the
-        #    called model is the running window and wins; an unmatched single row waits for tier 8.
+        # 6) Optional endpoint probe for local backends (opt-in via valve URL). A row matched to the
+        #    called model is the running window and wins; an unmatched single row waits for tier 9.
         probe = await self._probe_context(model_id) if (v.llamacpp_url or v.llama_swap_url) else None
         if probe is not None and probe[1] is not None:
             return probe[0], {"source": "probe", "matched_key": probe[1]}
-        # 6) Live models.dev lookup (opt-in; cached ~24h).
+        # 7) Live models.dev lookup (opt-in; cached ~24h).
         if v.fetch_context_from_modelsdev:
             table = await self._modelsdev_map()
             key = _modelsdev_match(table, model_id)
             if key is not None:
                 return table[key], {"source": "modelsdev", "matched_key": key}
-        # 7) Static table, matched by substring.
+        # 8) Static table, matched by substring.
         table = self._context_table()
         key = _longest_key_match(table, model_id)
         if key is not None:
             return table[key], {"source": "static_table", "matched_key": key}
-        # 8) The only model a backend runs, under an id that differs from the called one. Ranked last:
+        # 9) The only model a backend runs, under an id that differs from the called one. Ranked last:
         #    with a cloud model called, this row is some other model's window.
         if probe is not None:
             return probe[0], {"source": "probe", "matched_key": None}
@@ -1489,14 +1644,30 @@ class Filter:
 
     @staticmethod
     async def _probe_llama_swap(
-        session: aiohttp.ClientSession, base_url: str, model_id: str
+        session: aiohttp.ClientSession, base_url: str, model_id: str, headers: dict[str, str] | None = None
     ) -> tuple[int, str | None] | None:
-        """llama-swap: /running lists the running models with their launch command (--ctx-size)."""
+        """llama-swap: the called model's live window, else the --ctx-size of its launch command.
+
+        /running lists the running models. When the called one is `ready`, /props?model= is proxied
+        to its llama-server and reports the real n_ctx, including one picked by `--fit` (on by
+        default in llama.cpp) that no launch command shows. A plain /props is refused by llama-swap,
+        and a model that is not ready is never asked (the request would load it).
+        """
+        base = base_url.rstrip("/")
         try:
-            async with session.get(base_url.rstrip("/") + "/running") as resp:
+            async with session.get(base + "/running", headers=headers or {}) as resp:
                 data = await resp.json(content_type=None)
         except Exception:  # noqa: BLE001 - llama-swap down or not JSON: let the llama.cpp probe try
             return None
+        ready_id = _llama_swap_ready_id(data, model_id)
+        if ready_id is not None:
+            try:
+                async with session.get(f"{base}/props?model={quote(ready_id, safe='')}", headers=headers or {}) as resp:
+                    n_ctx = _props_n_ctx(await resp.json(content_type=None))
+            except Exception:  # noqa: BLE001 - upstream has no /props (e.g. vLLM): use the launch command
+                n_ctx = None
+            if n_ctx is not None:
+                return n_ctx, ready_id
         return Filter._parse_llama_swap(data, model_id)
 
     @staticmethod
@@ -1548,14 +1719,12 @@ class Filter:
         The model is named by its alias or by its GGUF file name (what llama.cpp lists as the id when
         no alias is set), so a match can outrank the tables like a /v1/models row.
         """
-        if not isinstance(data, dict):
-            return None
-        n_ctx = _first_num(data, "n_ctx") or _first_num(data.get("default_generation_settings"), "n_ctx")
-        if not n_ctx or n_ctx <= 0:
+        n_ctx = _props_n_ctx(data)
+        if n_ctx is None or not isinstance(data, dict):
             return None
         path = str(data.get("model_path") or "")
         ids = [str(data.get("model_alias") or ""), path, re.split(r"[\\/]", path)[-1].removesuffix(".gguf")]
-        return _match_running([(ids, int(n_ctx))], model_id)
+        return _match_running([(ids, n_ctx)], model_id)
 
     @staticmethod
     def _parse_llama_swap(data: object, model_id: str) -> tuple[int, str | None] | None:
@@ -2011,6 +2180,7 @@ class Filter:
             "is_pipe": bool(m.get("pipe")),
             "has_url_idx": "urlIdx" in m,
             "backend_context": self._backend_context_debug(m),
+            "live_backend": _live_backend(m),
             "provider_guess": self._provider_guess(m, resolved_id),
             "function_calling": function_calling,
             "owui_params": params,
