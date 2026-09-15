@@ -101,6 +101,14 @@ What *is* visible on a workspace/preset model is `info.meta`, including
 **`info.meta.capabilities`** — the frontend render gates (see below) can therefore be read from
 inside the plugin.
 
+**`__model__` carries the backend's raw model-listing row** for OpenAI-connection models: `routers/openai.py`
+`get_all_models` builds each entry as `{**model, 'name': …, 'owned_by': 'openai', 'openai': model, 'connection_type': …, 'urlIdx': idx}`,
+so every field of the upstream `/v1/models` row (llama.cpp `meta.n_ctx`/`n_ctx_train`, vLLM `max_model_len`,
+OpenRouter `context_length`) is readable both at the top level and under `openai`. A **workspace/preset**
+model dict (`utils/models.py`, custom model with `base_model_id`) carries none of it — only the base
+model's entry in `request.app.state.MODELS` (a plain dict, or `socket/utils.py:RedisDict` with `.get`) does.
+`__request__` is passed to outlet (`middleware.py`, outlet `extra_params`). Checked in v0.11.3.
+
 **`__metadata__` is sensitive:** it carries `user_message` (the raw prompt), `user_id`,
 `user_agent`, `session_id`, `chat_id`, `variables`, `chat_variables`, `files`, and the full `model`
 dict (`main.py:1180-1209`). Never dump it raw into anything user-shareable — whitelist fields

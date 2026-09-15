@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.7.0]
+
+- **Fixed: a local llama.cpp model showed its trained maximum instead of the server's `--ctx-size`** ([#6](https://github.com/SmetDenis/openwebui-token-usage-display/issues/6): Qwen3.6 on `llama-server --ctx-size 16384` showed `7.2k/131.1k (6%)` instead of `7.2k/16.4k (44%)`). The context size came from the built-in table (`qwen3` = 131072), and the opt-in llama.cpp / llama-swap probe was ranked *below* that table, so it never ran for any model family the table knows - setting `llamacpp_url` could not fix it either. Changes:
+    - **New automatic source, no configuration and no network:** the size the serving backend advertises for the model in its `/v1/models` listing, which Open WebUI already passes to the plugin. llama.cpp lists the running window as `meta.n_ctx` (builds since May 2026), llama-swap does the same when `capabilities.context` is set in its config, and vLLM lists `max_model_len`. It ranks right after your own `context_size_map` and above the probe, models.dev and the built-in table (debug `context_debug.source: backend`, `matched_key` names the field). Workspace/"agent" models read it from their base model's listing entry. It is not cached, so a relisted model applies at once.
+    - **The probe now outranks models.dev and the built-in table when its row matches the called model** (debug `matched_key` names the row). llama.cpp is asked `/v1/models` first (id or alias -> `meta.n_ctx`), then `/props` for older builds (matched by the model alias or GGUF file name). A backend's only running model under a different id (an alias) is still used, but only after the tables, so a cloud model is never given a local server's window.
+    - **Stricter probe id matching:** a row matches when its id equals the called id or ends it after a connection prefix (`prefix.id`) or a path (`org/id`). The loose substring match from 2.6.1 is gone, so a local `qwen` no longer claims a cloud `qwen3-max` now that a match outranks the tables.
+    - `debug_mode`: new `model.backend_context` block with the listing's `n_ctx` (running), `n_ctx_train` (trained) and `max_model_len`.
+    - `outlet` now also accepts `__request__` (needed for the workspace-model lookup); its dunder parameters became keyword-only, which is how Open WebUI passes them.
+- Verified against Open WebUI v0.11.3, llama.cpp `master` (2026-09-14), llama-swap `main` and vLLM `main`.
+
 ## [2.6.1]
 
 - **Fixed: the llama-swap probe could show another model's context window.** llama-swap can run several models at once (groups), and its `/running` endpoint lists each with its own `--ctx-size`; the probe took the first row regardless of which model Open WebUI called. It now picks the row whose `model` matches the called model id (exact, then last path segment, then longest substring - so an Open WebUI connection prefix still matches). A single running model is used as before, even when the ids differ (an alias). With several running models and no match, the probe reports nothing and falls through to the `llama.cpp` URL, if set, instead of guessing. Only affects the opt-in `llama_swap_url` valve.

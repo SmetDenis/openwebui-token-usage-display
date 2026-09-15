@@ -50,9 +50,11 @@ The context window size is resolved in this order:
 1. **Manual override** valve (if set)
 2. **`num_ctx`** captured from the request (Ollama / local models)
 3. **Your `context_size_map`** - an explicit user override, so it wins over the automatic sources below (mirrors how `price_map` beats models.dev for cost)
-4. **Live models.dev lookup** - optional, opt-in; fetches current sizes and caches them (default off, for privacy)
-5. **Built-in table** - seeded from [models.dev](https://models.dev), covers the popular OpenAI / Anthropic / Gemini / Llama / DeepSeek / Grok / Mistral / Qwen / Kimi / GLM / MiniMax / Cohere families
-6. **llama.cpp / llama-swap probe** - optional, opt-in; queries `/props` or `/running` for the running context size
+4. **What the serving backend reports for the model** - automatic, no network: llama.cpp (builds since May 2026) and llama-swap (with `capabilities.context` set) list the running window as `meta.n_ctx` in `/v1/models`, vLLM as `max_model_len`, and Open WebUI hands that listing to the plugin. This is your server's real `--ctx-size`, not the model's trained maximum
+5. **llama.cpp / llama-swap probe** - optional, opt-in; asks llama.cpp `/v1/models` (then `/props` on older builds) or llama-swap `/running`, and wins over the tables only when the row matches the called model's id
+6. **Live models.dev lookup** - optional, opt-in; fetches current sizes and caches them (default off, for privacy)
+7. **Built-in table** - seeded from [models.dev](https://models.dev), covers the popular OpenAI / Anthropic / Gemini / Llama / DeepSeek / Grok / Mistral / Qwen / Kimi / GLM / MiniMax / Cohere families
+8. **A probed backend's only running model, when its id differs from the called one** (an alias) - last, because with a cloud model called it would be another model's window
 
 **Workspace models resolve via their base model.** For a custom model / "agent" built on a base model, matching (context size **and** cost) uses the model's **`base_model_id`** - the real underlying LLM - not your custom model id, which is an arbitrary label (e.g. `research`) that carries no provider token. So a single `context_size_map` entry keyed on the base model (or a models.dev match on it) covers every agent built on it - you don't need to map each custom id separately. Direct base models are unaffected: they have no `base_model_id`, so their own id is used.
 
@@ -100,6 +102,9 @@ In `auto`, cost appears only when your provider/proxy reports it **inside the re
 
 **`cost_mode` is `estimate` but cost is still blank** (`cost_debug.price.matched_key: null`).
 The model id matched no price entry. This is common when Open WebUI exposes a **display name** (e.g. `Anthropic - Opus`) instead of a canonical id (`claude-opus-4-…`) — there is no recognizable token to substring-match. Add a `price_map` keyed to a substring of that id, e.g. `{"anthropic - opus": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25}}` — or rename the model / set the LiteLLM `model_name` to a canonical id, which makes prices, context sizes **and** models.dev all match automatically. For a **workspace/custom model** the id matched is its `base_model_id` (since v2.5.0), so key the `price_map` on the **base** model, not the agent id.
+
+**Context shows the model's maximum, not your local server's `--ctx-size`** (`context_debug.source: static_table`, e.g. `131.1k` for Qwen3 on a llama.cpp started with `--ctx-size 16384`).
+The backend did not advertise its running window. Update llama.cpp (its `/v1/models` lists `meta.n_ctx` since May 2026) and refresh Open WebUI's model list, set `capabilities.context` in llama-swap, set the `llamacpp_url` / `llama_swap_url` valve, or add a `context_size_map` entry. `model.backend_context` in the debug payload shows the running (`n_ctx`) and trained (`n_ctx_train`) windows the listing carries.
 
 **Context % is missing or wrong** (`context_debug.matched_key: null`, `size: null`).
 Same id-matching problem, for the context table. Add a `context_size_map` (e.g. `{"anthropic - opus": 1000000}`), enable the `fetch_context_from_modelsdev` valve, or use a canonical id. For a **workspace/custom model** matching uses its `base_model_id` (since v2.5.0), so key any map on the **base** model, not the agent id. Note: a connection `prefix_id` (which prepends `prefix.`) does **not** break matching — the original slug is still a substring; only a rename that alters the model-family token (e.g. `claude-opus-4.8` vs a `claude-opus-4-8` table key) does.
