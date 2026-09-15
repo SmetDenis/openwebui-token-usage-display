@@ -10,7 +10,9 @@ built by the factories below, shaped to OWUI 0.10.2.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
+import types
 from typing import TYPE_CHECKING, Any, Self
 
 import pytest
@@ -200,8 +202,9 @@ class _FakeAiohttpResponse:
 class _FakeAiohttpSession:
     """Stand-in for aiohttp.ClientSession: async context manager + `.get(url)`."""
 
-    def __init__(self, responses: dict[str, Any]) -> None:
+    def __init__(self, responses: dict[str, Any], requests: list[tuple[str, dict[str, str]]]) -> None:
         self._responses = responses
+        self._requests = requests
 
     async def __aenter__(self) -> Self:
         return self
@@ -209,7 +212,8 @@ class _FakeAiohttpSession:
     async def __aexit__(self, *exc: object) -> None:
         return None
 
-    def get(self, url: str, **_kw: Any) -> _FakeAiohttpResponse:
+    def get(self, url: str, headers: dict[str, str] | None = None, **_kw: Any) -> _FakeAiohttpResponse:
+        self._requests.append((url, headers or {}))
         return _FakeAiohttpResponse(self._responses.get(url, {}))
 
 
@@ -219,11 +223,13 @@ class _FakeAiohttpModule:
     `responses` maps request URL -> either a JSON-able payload (success) or an Exception
     instance (raised when that URL is fetched). `session_error`, if set, is raised by
     `ClientSession(...)` itself (simulating a connection-level failure before any request).
+    `requests` records every (url, headers) fetched, in order.
     """
 
     def __init__(self, responses: dict[str, Any] | None = None, *, session_error: Exception | None = None) -> None:
         self._responses = responses or {}
         self._session_error = session_error
+        self.requests: list[tuple[str, dict[str, str]]] = []
 
     def ClientTimeout(self, **_kw: Any) -> object:  # noqa: N802 - mirrors aiohttp's real API name
         return object()
@@ -231,7 +237,7 @@ class _FakeAiohttpModule:
     def ClientSession(self, **_kw: Any) -> _FakeAiohttpSession:  # noqa: N802 - mirrors aiohttp's real API name
         if self._session_error is not None:
             raise self._session_error
-        return _FakeAiohttpSession(self._responses)
+        return _FakeAiohttpSession(self._responses, self.requests)
 
 
 def install_fake_aiohttp(
@@ -240,10 +246,12 @@ def install_fake_aiohttp(
     responses: dict[str, Any] | None = None,
     *,
     session_error: Exception | None = None,
-) -> None:
+) -> _FakeAiohttpModule:
     """Make the plugin's aiohttp network probes live against canned responses (no real network)."""
-    monkeypatch.setattr(mod, "aiohttp", _FakeAiohttpModule(responses, session_error=session_error), raising=False)
+    fake = _FakeAiohttpModule(responses, session_error=session_error)
+    monkeypatch.setattr(mod, "aiohttp", fake, raising=False)
     monkeypatch.setattr(mod, "_AIOHTTP_AVAILABLE", True, raising=False)
+    return fake
 
 
 def test_make_output_shape_matches_extractor(usage_display_module: ModuleType) -> None:
@@ -1391,6 +1399,7 @@ def test_sanitize_model_whitelist_only_no_secrets(usage_display_module: ModuleTy
         "is_pipe",
         "has_url_idx",
         "backend_context",
+        "live_backend",
         "provider_guess",
         "function_calling",
         "owui_params",
@@ -2140,6 +2149,268 @@ def test_outlet_passes_request_for_workspace_backend_context(
     run_async(f.outlet(body, __event_emitter__=emitter, __model__=preset, __request__=request))
     desc = emitter.statuses()[0]["data"]["description"]
     assert "7.2k/16.4k (44%)" in desc
+
+
+# --- Issue #14: live window through the model's OWUI connection (llama-swap / llama.cpp router) --- #
+
+
+def _swap_model(listed_id: str, url_idx: int, **meta: Any) -> dict[str, Any]:
+    """An OWUI model dict for a llama-swap connection (listed id already carries any OWUI prefix)."""
+    row = {"id": listed_id, "owned_by": "llama-swap", "meta": {"llamaswap": {"type": "model"}, **meta}}
+    return {**row, "name": listed_id, "owned_by": "openai", "openai": row, "urlIdx": url_idx}
+
+
+def _router_model(listed_id: str, url_idx: int) -> dict[str, Any]:
+    """An OWUI model dict for a llama.cpp router connection (rows carry a `status` block)."""
+    row = {"id": listed_id, "owned_by": "llamacpp", "status": {"value": "loaded"}}
+    return {**row, "name": listed_id, "owned_by": "openai", "openai": row, "urlIdx": url_idx}
+
+
+def _install_owui_connection(
+    monkeypatch: pytest.MonkeyPatch, url: str, key: str, api_config: dict[str, Any] | Exception
+) -> None:
+    """Fake OWUI 0.10+ `open_webui.routers.openai.get_openai_connection` (one connection for any index)."""
+
+    async def get_openai_connection(_idx: int) -> tuple[str, str, dict[str, Any]]:
+        if isinstance(api_config, Exception):
+            raise api_config
+        return url, key, api_config
+
+    fake = types.ModuleType("open_webui.routers.openai")
+    fake.get_openai_connection = get_openai_connection  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "open_webui", types.ModuleType("open_webui"))
+    monkeypatch.setitem(sys.modules, "open_webui.routers", types.ModuleType("open_webui.routers"))
+    monkeypatch.setitem(sys.modules, "open_webui.routers.openai", fake)
+
+
+def test_live_backend_detects_only_llama_swap_and_llamacpp_router(usage_display_module: ModuleType) -> None:
+    live = usage_display_module._live_backend
+    assert live(_swap_model("ls.qwen3", 0)) == ("llama-swap", "ls.qwen3")
+    alias = {
+        "openai": {"id": "fast", "owned_by": "llama-swap", "meta": {"llamaswap": {"type": "alias", "modelID": "Q3"}}}
+    }
+    assert live(alias) == ("llama-swap", "Q3")
+    assert live({"openai": {"id": "old-swap", "owned_by": "llama-swap"}}) == ("llama-swap", "old-swap")
+    assert live(_router_model("gemma", 0)) == ("llamacpp-router", "gemma")
+    for entry in (
+        {"openai": {"id": "p:m", "owned_by": "llama-swap", "meta": {"llamaswap": {"type": "peer"}}}},
+        {"openai": {"id": "single", "owned_by": "llamacpp", "meta": {"n_ctx": 4096}}},  # plain llama-server
+        {"openai": {"id": "gpt-4o", "owned_by": "openai"}},
+        {"openai": {"id": "", "owned_by": "llama-swap"}},
+        {"id": "no-row", "owned_by": "llama-swap"},
+        None,
+    ):
+        assert live(entry) is None
+
+
+def test_llama_swap_ready_id_needs_a_ready_matched_row(usage_display_module: ModuleType) -> None:
+    ready_id = usage_display_module._llama_swap_ready_id
+    running = {
+        "running": [
+            {"model": "Qwen3", "state": "ready"},
+            {"model": "wen3", "state": "ready"},
+            {"model": "gemma", "state": "starting"},
+            "junk",
+            {"model": 5, "state": "ready"},
+        ]
+    }
+    assert ready_id(running, "ls.qwen3") == "Qwen3"  # prefix stripped by suffix match, original case kept
+    assert ready_id(running, "gemma") is None  # not ready: asking /props?model= would wait for or start a load
+    assert ready_id(running, "qwen3-max") is None
+    assert ready_id({"running": "nope"}, "Qwen3") is None
+    assert ready_id(None, "Qwen3") is None
+
+
+def test_props_n_ctx_reads_top_level_or_generation_settings(usage_display_module: ModuleType) -> None:
+    n_ctx = usage_display_module._props_n_ctx
+    assert n_ctx({"n_ctx": 8192}) == 8192
+    assert n_ctx({"default_generation_settings": {"n_ctx": 40960}}) == 40960
+    assert n_ctx({"default_generation_settings": {"n_ctx": 0}}) is None  # llama.cpp router's own dummy /props
+    assert n_ctx({"error": {"message": "model is not loaded"}}) is None
+    assert n_ctx("nope") is None
+
+
+def test_probe_llama_swap_reads_fit_window_from_props_of_ready_model(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #14: `--fit` leaves no --ctx-size in the command; /props?model= has the real window."""
+    f = usage_display_module.Filter()
+    f.valves.llama_swap_url = "http://swap:8080/"
+    running = {"running": [{"model": "qwen3/fit", "state": "ready", "cmd": "llama-server --fit on -m q.gguf"}]}
+    fake = install_fake_aiohttp(
+        monkeypatch,
+        usage_display_module,
+        {
+            "http://swap:8080/running": running,
+            "http://swap:8080/props?model=qwen3%2Ffit": {"default_generation_settings": {"n_ctx": 40960}},
+        },
+    )
+    assert run_async(f._probe_context("qwen3/fit")) == (40960, "qwen3/fit")
+    assert [url for url, _ in fake.requests] == ["http://swap:8080/running", "http://swap:8080/props?model=qwen3%2Ffit"]
+
+
+def test_probe_llama_swap_never_asks_props_for_a_model_that_is_not_ready(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    f.valves.llama_swap_url = "http://swap:8080"
+    running = {"running": [{"model": "qwen3-loading", "state": "starting", "cmd": "--ctx-size 16384"}]}
+    fake = install_fake_aiohttp(monkeypatch, usage_display_module, {"http://swap:8080/running": running})
+    assert run_async(f._probe_context("qwen3-loading")) == (16384, "qwen3-loading")
+    assert [url for url, _ in fake.requests] == ["http://swap:8080/running"]
+
+
+def test_probe_llama_swap_props_failure_falls_back_to_ctx_size(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A llama-swap upstream without /props (e.g. vLLM) or a /props error keeps the launch command's size."""
+    f = usage_display_module.Filter()
+    f.valves.llama_swap_url = "http://swap:8080"
+    running = {"running": [{"model": "vllm-model", "state": "ready", "cmd": "--ctx-size 32768"}]}
+    for props in (RuntimeError("404"), {"error": "not found"}):
+        install_fake_aiohttp(
+            monkeypatch,
+            usage_display_module,
+            {"http://swap:8080/running": running, "http://swap:8080/props?model=vllm-model": props},
+        )
+        assert run_async(f._probe_context("vllm-model")) == (32768, "vllm-model")
+
+
+def test_connection_probe_llama_swap_uses_owui_url_key_and_prefix(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #14 end to end: no plugin valves, the connection's URL/key/prefix are reused, live beats listed."""
+    mod = usage_display_module
+    f = mod.Filter()
+    _patch_no_network(monkeypatch, f)
+    _install_owui_connection(monkeypatch, "http://swap:8080/v1/", "sk-swap", {"prefix_id": "ls"})
+    running = {"running": [{"model": "qwen3-conn", "state": "ready", "cmd": "llama-server --fit on"}]}
+    fake = install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {
+            "http://swap:8080/running": running,
+            "http://swap:8080/props?model=qwen3-conn": {"default_generation_settings": {"n_ctx": 40960}},
+        },
+    )
+    model = _swap_model("ls.qwen3-conn", 101, n_ctx=131072)  # llama-swap capabilities.context from its config
+    size, prov = run_async(f._context_size_for("ls.qwen3-conn", None, model))
+    assert size == 40960
+    assert prov == {"source": "connection_probe", "matched_key": "llama-swap:qwen3-conn"}
+    assert fake.requests[0] == ("http://swap:8080/running", {"Authorization": "Bearer sk-swap"})
+    assert fake.requests[1][1] == {"Authorization": "Bearer sk-swap"}
+
+    # A hit is cached: the next response asks nothing.
+    fake.requests.clear()
+    assert run_async(f._context_size_for("ls.qwen3-conn", None, model)) == (size, prov)
+    assert fake.requests == []
+
+    # The user's map still wins, without touching the network.
+    f.valves.context_size_map = '{"qwen3-conn": 8192}'
+    assert run_async(f._context_size_for("ls.qwen3-conn", None, model))[0] == 8192
+
+
+def test_connection_probe_miss_falls_through_to_listing_and_is_not_cached(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = mod.Filter()
+    _patch_no_network(monkeypatch, f)
+    _install_owui_connection(monkeypatch, "http://swap:8080/v1", "", {"auth_type": "none"})
+    fake = install_fake_aiohttp(monkeypatch, mod, {"http://swap:8080/running": {"running": []}})  # swapped out
+    model = _swap_model("qwen3-swapped-out", 102, n_ctx=65536)
+    size, prov = run_async(f._context_size_for("qwen3-swapped-out", None, model))
+    assert (size, prov["source"]) == (65536, "backend")
+    assert fake.requests == [("http://swap:8080/running", {})]  # no key configured -> no auth header
+    run_async(f._context_size_for("qwen3-swapped-out", None, model))
+    assert len(fake.requests) == 2  # a miss is asked again next time
+
+
+def test_connection_probe_llamacpp_router_never_autoloads(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = mod.Filter()
+    _patch_no_network(monkeypatch, f)
+    _install_owui_connection(monkeypatch, "http://router:8080/v1", "sk-r", {"auth_type": "bearer"})
+    props_url = "http://router:8080/props?model=org%2Fgemma-3-router%3AQ4&autoload=false"
+    install_fake_aiohttp(monkeypatch, mod, {props_url: {"default_generation_settings": {"n_ctx": 12288}}})
+    model = _router_model("org/gemma-3-router:Q4", 103)
+    size, prov = run_async(f._context_size_for("org/gemma-3-router:Q4", None, model))
+    assert (size, prov["matched_key"]) == (12288, "llamacpp-router:org/gemma-3-router:Q4")
+
+    install_fake_aiohttp(
+        monkeypatch, mod, {props_url.replace("Q4", "Q8"): {"error": {"message": "model is not loaded"}}}
+    )
+    size, prov = run_async(
+        f._context_size_for("org/gemma-3-router:Q8", None, _router_model("org/gemma-3-router:Q8", 104))
+    )
+    assert (size, prov["source"]) == (None, "none")  # refused as not loaded: the next tiers answer (none here)
+
+
+def test_connection_probe_workspace_model_on_owui_09_config_without_bearer(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preset -> base entry from the registry; OWUI 0.9.x has no get_openai_connection, only app.state.config."""
+    mod = usage_display_module
+    f = mod.Filter()
+    _patch_no_network(monkeypatch, f)
+    monkeypatch.setitem(sys.modules, "open_webui.routers.openai", None)  # import fails like on 0.9.x
+    base = _swap_model("qwen3-preset09", 1)
+    request = _FakeRequest({"qwen3-preset09": base})
+    request.app.state.config = types.SimpleNamespace(
+        OPENAI_API_BASE_URLS=["http://cloud/v1", "http://swap09:8080"],
+        OPENAI_API_KEYS=["sk-cloud", "per-user"],
+        OPENAI_API_CONFIGS={"http://swap09:8080": {"auth_type": "session"}},  # legacy url-keyed config
+    )
+    running = {"running": [{"model": "qwen3-preset09", "state": "ready"}]}
+    fake = install_fake_aiohttp(
+        monkeypatch,
+        mod,
+        {"http://swap09:8080/running": running, "http://swap09:8080/props?model=qwen3-preset09": {"n_ctx": 20480}},
+    )
+    preset = make_model_dict("qwen-preset09-agent", base="qwen3-preset09")
+    size, prov = run_async(f._context_size_for("qwen3-preset09", None, preset, request))
+    assert (size, prov["source"]) == (20480, "connection_probe")
+    assert all(headers == {} for _, headers in fake.requests)  # a session connection's key is not reused
+
+
+def test_connection_probe_degrades_silently(usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = usage_display_module
+    f = mod.Filter()
+    _patch_no_network(monkeypatch, f)
+    fake = install_fake_aiohttp(monkeypatch, mod)
+    model = _swap_model("qwen3-degrade", 105)
+
+    def static(entry: Any, request: Any = None) -> Any:
+        return run_async(f._context_size_for("qwen3-degrade", None, entry, request))[1]["source"]
+
+    # Connection lookup raises / returns junk / request missing on 0.9.x.
+    _install_owui_connection(monkeypatch, "http://swap:8080", "k", RuntimeError("config db down"))
+    assert static(model) == "static_table"
+    _install_owui_connection(monkeypatch, "", "k", {})
+    assert static(model) == "static_table"
+    monkeypatch.setitem(sys.modules, "open_webui.routers.openai", None)
+    assert static(model) == "static_table"
+    # Not a detectable backend, or no usable urlIdx: nothing is looked up at all.
+    _install_owui_connection(monkeypatch, "http://swap:8080", "k", {})
+    assert static({**model, "urlIdx": True}) == "static_table"
+    assert static({**model, "openai": {"id": "qwen3-degrade", "owned_by": "openai"}}) == "static_table"
+    assert static(make_model_dict("qwen3-degrade")) == "static_table"
+    assert static(None) == "static_table"
+    assert fake.requests == []
+    # Session-level failure and aiohttp missing.
+    install_fake_aiohttp(monkeypatch, mod, session_error=RuntimeError("boom"))
+    assert static(model) == "static_table"
+    monkeypatch.setattr(mod, "_AIOHTTP_AVAILABLE", False)
+    assert static(model) == "static_table"
+
+
+def test_sanitize_model_reports_live_backend_without_secrets(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    out = f._sanitize_model(_swap_model("ls.qwen3-debug", 0), None, "ls.qwen3-debug")
+    assert out["live_backend"] == ("llama-swap", "ls.qwen3-debug")
+    assert f._sanitize_model(make_model_dict("gpt-4o"), None, "gpt-4o")["live_backend"] is None
 
 
 # --- _resolve_cost: off / auto (native) / estimate branches -------------------- #

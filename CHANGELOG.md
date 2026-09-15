@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.8.0]
+
+- **Context window behind llama-swap and a llama.cpp router, with no configuration** ([#14](https://github.com/SmetDenis/openwebui-token-usage-display/issues/14): a llama.cpp model started by llama-swap with `--fit` showed no real context size). Three things stood in the way: llama.cpp's `--fit` (on by default) picks the window at load time, so the `--ctx-size` the `llama_swap_url` probe looked for is not in the launch command; llama-swap refuses a plain `/props` without `?model=`; and the probe URL needed the API key typed into a valve. Changes:
+    - **New automatic source: the running window asked through the model's own Open WebUI connection.** For a model listed by llama-swap (`owned_by: llama-swap`) or a llama.cpp router (`owned_by: llamacpp` with a `status` block), the plugin reuses that connection's base URL, API key and `prefix_id` from Open WebUI - no valve, no key copied. Cloud connections are never contacted: they are not detected. It ranks right after your `context_size_map`, above the number the backend lists (debug `context_debug.source: connection_probe`, `matched_key` names the backend and model id). A hit is cached for `context_probe_ttl`; a miss is not.
+    - **A probe never loads a model.** A model-dispatched request makes llama-swap start the model if it is not running, evicting whatever is. llama-swap is therefore asked `/running` first and `/props?model=` only for a model in state `ready`; a llama.cpp router is asked with `autoload=false`, which refuses instead of loading.
+    - **A live answer now beats llama-swap's listed `capabilities.context`.** That number comes from the llama-swap config and may not be the window `--fit` picked.
+    - **The `llama_swap_url` valve probe also asks `/props?model=`** for the called model when it is `ready`, falling back to the `--ctx-size` of its command (e.g. a vLLM upstream without `/props`).
+    - The API key is sent only as a bearer token, and only when the connection itself uses bearer auth; session / OAuth / Entra ID connections are probed without it. Not detected: a connection restricted to hand-typed model ids (Open WebUI keeps no listing row for those) - use the valves or `context_size_map` there.
+    - `debug_mode`: new `model.live_backend` (`[kind, listed id]` or `null`) shows whether the model was recognized as a live-probe candidate.
+- Verified against Open WebUI v0.11.3 (connection lookup `routers/openai.py:get_openai_connection`, 0.10.0+; `app.state.config` on 0.9.x), llama-swap `main` (2026-09-13) and llama.cpp `master` (2026-09-15).
+
 ## [2.7.0]
 
 - **Fixed: a local llama.cpp model showed its trained maximum instead of the server's `--ctx-size`** ([#6](https://github.com/SmetDenis/openwebui-token-usage-display/issues/6): Qwen3.6 on `llama-server --ctx-size 16384` showed `7.2k/131.1k (6%)` instead of `7.2k/16.4k (44%)`). The context size came from the built-in table (`qwen3` = 131072), and the opt-in llama.cpp / llama-swap probe was ranked *below* that table, so it never ran for any model family the table knows - setting `llamacpp_url` could not fix it either. Changes:
