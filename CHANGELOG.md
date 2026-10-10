@@ -4,17 +4,14 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
-## [2.6.1]
+## [2.7.0]
 
-- **Fixed: context-window 📐 "used" read far too high on multi-round (tool/agent) turns.**
-  The window-occupancy numerator used the cross-round summed `total_tokens`, but OWUI's
-  `merge_usage` sums `input_tokens`/`total_tokens` over every LLM round-trip (while
-  `prompt_tokens`/`completion_tokens` stay at the last round), so an agent turn could show
-  well over 100% (e.g. ~301% on 4 rounds over an 8k window). The "used" side is now the
-  last round's `prompt_tokens + completion_tokens` — cache added back for Anthropic-native,
-  whose `input` excludes cache. The `⬆︎`/`Σ`/`🧮` cumulative counters are unchanged (they
-  intentionally sum the whole turn). Single-round turns and the tiktoken-estimate path are
-  unaffected.
+- **Version note.** `2.6.1` is skipped: it belonged to a build released on 2026-09-14 and withdrawn (see `2.6.0`), and reusing it would hide this update from anyone who installed that build. `2.7.0` was never released - it only appeared briefly in the repository on 2026-09-15, before the `2.6.0` re-cut.
+- **Fixed: the context window `📐` read far too high on tool / agent turns** ([#26](https://github.com/SmetDenis/openwebui-token-usage-display/issues/26), [#27](https://github.com/SmetDenis/openwebui-token-usage-display/pull/27) by [@jtoland11](https://github.com/jtoland11)). One response with tool calls is several requests to the model, and Open WebUI stores their usage summed. The `📐` "used" side took that sum, although only the last request (plus its answer) is in the window - so a 4-round agent on an 8k window could show ~300%. It now reads the last request's `prompt_tokens + completion_tokens` (with Anthropic-native cache added back, since that `input` excludes it) - the same numbers Open WebUI's own context indicator uses. Details:
+    - **Needs Open WebUI 0.11.0+.** Only since 0.11.0 does Open WebUI keep `prompt_tokens` / `completion_tokens` per last request; 0.10.x sums them like everything else, so there `📐` still shows the summed number (nothing changes, nothing breaks).
+    - `⬆︎`, `⬇︎`, `Σ`, `🧮` and cost still cover every request of the turn - that is what was processed and billed. On a tool turn `⬆︎` can therefore be far larger than `📐`.
+    - Single-request responses and the tiktoken estimate are unaffected.
+    - `debug_mode`: `context_debug.used_source` tells where "used" came from - `last_round`, `total` (no per-request numbers, e.g. the tiktoken estimate) or `input+output`; the `tokens` block carries `context_used`.
 
 ## [2.6.0]
 

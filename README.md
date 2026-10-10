@@ -40,7 +40,7 @@ tokens when a provider reports no usage; the plugin loads fine without it.
 - **Reasoning / thinking** tokens - OpenAI o3/o4-mini & GPT-5, Gemini thinking, DeepSeek R1, Claude thinking, etc. (read from both the Chat Completions and the newer Responses API shapes)
 - **Cached prompt** tokens - OpenAI prompt cache and Anthropic `cache_read` / `cache_creation`
   (Anthropic cache is correctly counted as *additional* to input)
-- **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable)
+- **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable). On a response with tool calls (several requests to the model) it shows the last request, while `⬆︎`/`Σ`/cost add up all of them - so `⬆︎` can be far larger than `📐` (Open WebUI 0.11+; on 0.10.x `📐` is the sum too)
 - **Generation time** and **tokens/second**
 - **Cost** - the provider's own reported cost when available (OpenRouter, LiteLLM, ...), or an optional estimate from [models.dev](https://models.dev) prices (always marked `≈`); shown per message (`💰`)
   and as a running chat total (`💰Σ`)
