@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.6.1]
+
+- **Fixed: context-window 📐 "used" read far too high on multi-round (tool/agent) turns.**
+  The window-occupancy numerator used the cross-round summed `total_tokens`, but OWUI's
+  `merge_usage` sums `input_tokens`/`total_tokens` over every LLM round-trip (while
+  `prompt_tokens`/`completion_tokens` stay at the last round), so an agent turn could show
+  well over 100% (e.g. ~301% on 4 rounds over an 8k window). The "used" side is now the
+  last round's `prompt_tokens + completion_tokens` — cache added back for Anthropic-native,
+  whose `input` excludes cache. The `⬆︎`/`Σ`/`🧮` cumulative counters are unchanged (they
+  intentionally sum the whole turn). Single-round turns and the tiktoken-estimate path are
+  unaffected.
+
 ## [2.6.0]
 
 - **Re-released on 2026-09-15.** The first `2.6.0` and `2.6.1` builds (published 2026-09-14) were replaced by this single release, which also contains the context-window work below. If you installed either of them, paste this file again - the version number did not change.
