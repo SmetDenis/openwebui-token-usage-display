@@ -125,7 +125,7 @@ def make_timing(**over: Any) -> dict[str, Any]:
 
 
 def make_ctx(**over: Any) -> dict[str, Any]:
-    base: dict[str, Any] = {"size": None, "used": None, "source": "none", "matched_key": None}
+    base: dict[str, Any] = {"size": None, "used": None, "used_source": None, "source": "none", "matched_key": None}
     base.update(over)
     return base
 
@@ -1821,13 +1821,7 @@ def test_context_static_table_match(usage_display_module: ModuleType, monkeypatc
 def test_context_used_is_last_round_not_cross_round_sum(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: context 'used' must be the LAST round's request, not the cross-round Σ.
-
-    On a multi-round (tool/agent) turn OWUI's merge_usage sums input_tokens/total_tokens over
-    every LLM round-trip while prompt_tokens/completion_tokens stay at the last round's values.
-    Feeding the summed total into the window-usage numerator read as 'sent tokens way too high'
-    (and >100%). The per-round prompt is available here, so _resolve_context must prefer it.
-    """
+    """Regression (#26): context 'used' is the LAST round's request, not the cross-round Σ."""
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)
     f.valves.context_size_override = 8192
@@ -1840,56 +1834,133 @@ def test_context_used_is_last_round_not_cross_round_sum(
     ctx = run_async(f._resolve_context(make_body(model="gpt-4o"), {}, make_model_dict("gpt-4o"), tokens))
     assert ctx["size"] == 8192
     assert ctx["used"] == 1700  # 21%, not the summed 2750 (34%)
+    assert ctx["used_source"] == "last_round"
 
 
 def test_context_used_falls_back_to_total_without_per_round_prompt(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When context_used is None (tiktoken-estimate path, or a hand-built bag) use the summed total."""
+    """When context_used is None (tiktoken-estimate path) the summed total is used, and debug says so."""
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)
     f.valves.context_size_override = 8192
     tokens = make_tokens(total=150, context_used=None)
     ctx = run_async(f._resolve_context(make_body(model="gpt-4o"), {}, make_model_dict("gpt-4o"), tokens))
-    assert ctx["used"] == 150
+    assert (ctx["used"], ctx["used_source"]) == (150, "total")
+    hand_built = make_tokens(total=None, input=100, output=50, context_used=None)
+    ctx = run_async(f._resolve_context(make_body(model="gpt-4o"), {}, make_model_dict("gpt-4o"), hand_built))
+    assert (ctx["used"], ctx["used_source"]) == (150, "input+output")
+    empty = make_tokens(total=None, input=None, output=None, context_used=None)
+    ctx = run_async(f._resolve_context(make_body(model="gpt-4o"), {}, make_model_dict("gpt-4o"), empty))
+    assert (ctx["used"], ctx["used_source"]) == (None, None)
 
 
-def test_last_round_context_helper(usage_display_module: ModuleType) -> None:
-    """Unit checks on _last_round_context across provider shapes."""
-    mod = usage_display_module
-    f = mod.Filter()
-    # OpenAI single round: last == whole
-    u = {
-        "input_tokens": 1000,
-        "output_tokens": 100,
-        "total_tokens": 1100,
-        "prompt_tokens": 1000,
-        "completion_tokens": 100,
-    }
-    bag = {"input_has_cache": True, "cached": None, "cache_write": None}
-    assert f._last_round_context(u, bag) == 1100
-    # multi-round: prompt/completion stay at last round
-    u2 = {
-        "input_tokens": 2400,
-        "output_tokens": 350,
-        "total_tokens": 2750,
-        "prompt_tokens": 1400,
-        "completion_tokens": 300,
-    }
-    bag2 = {"input_has_cache": True, "cached": None, "cache_write": None}
-    assert f._last_round_context(u2, bag2) == 1700
-    # Anthropic-native: input EXCLUDES cache -> add it back
-    u3 = {
-        "input_tokens": 900,
-        "output_tokens": 300,
-        "prompt_tokens": 900,
-        "completion_tokens": 300,
-        "cache_read_input_tokens": 2000,
-    }
-    bag3 = {"input_has_cache": False, "cached": 2000, "cache_write": None}
-    assert f._last_round_context(u3, bag3) == 3200
-    # no per-round prompt and no normalized input (estimate path) -> None
-    assert f._last_round_context(None, {"input_has_cache": False, "cached": None, "cache_write": None}) is None
+@pytest.mark.parametrize(
+    ("usage", "bag", "expected"),
+    [
+        pytest.param(
+            {"input_tokens": 1000, "output_tokens": 100, "prompt_tokens": 1000, "completion_tokens": 100},
+            {"input_has_cache": True, "cached": None, "cache_write": None},
+            1100,
+            id="single-round",
+        ),
+        pytest.param(
+            {"input_tokens": 2400, "output_tokens": 350, "prompt_tokens": 1400, "completion_tokens": 300},
+            {"input_has_cache": True, "cached": None, "cache_write": None},
+            1700,
+            id="multi-round-last-wins",
+        ),
+        pytest.param(
+            {"input_tokens": 900, "output_tokens": 300, "cache_read_input_tokens": 2000},
+            {"input_has_cache": False, "cached": 2000, "cache_write": None},
+            3200,
+            id="anthropic-native-cache-added-back",
+        ),
+        pytest.param(
+            None, {"input_has_cache": False, "cached": None, "cache_write": None}, None, id="no-usage-estimate-path"
+        ),
+        pytest.param({"total_tokens": 150}, {"input_has_cache": True}, None, id="no-prompt-or-completion"),
+    ],
+)
+def test_last_round_context_helper(
+    usage_display_module: ModuleType, usage: dict[str, Any] | None, bag: dict[str, Any], expected: int | None
+) -> None:
+    assert usage_display_module.Filter._last_round_context(usage, bag) == expected
+
+
+# `usage` exactly as Open WebUI 0.11.4's merge_usage leaves it after two rounds (generated by feeding
+# per-round provider payloads through the real utils/response.py): input/output/total and the
+# *_tokens_details are summed, prompt/completion_tokens and top-level Anthropic cache are the last round.
+_MERGED_TWO_ROUND_USAGE: dict[str, tuple[dict[str, Any], str]] = {
+    "chat-completions": (
+        {
+            "input_tokens": 2400,
+            "output_tokens": 350,
+            "total_tokens": 2750,
+            "prompt_tokens": 1400,
+            "completion_tokens": 300,
+            "prompt_tokens_details": {"cached_tokens": 1800},
+        },
+        "📐 1.7k/10.0k (17%)",  # the summed Σ would read 2.8k (28%)
+    ),
+    "responses-api": (
+        {
+            "input_tokens": 2500,
+            "output_tokens": 240,
+            "total_tokens": 2740,
+            "prompt_tokens": 1500,  # absent from the raw rounds; merge_usage derives it from input_tokens
+            "completion_tokens": 200,
+            "input_tokens_details": {"cached_tokens": 1000},
+        },
+        "📐 1.7k/10.0k (17%)",
+    ),
+    "anthropic-native": (
+        {
+            "input_tokens": 400,
+            "output_tokens": 250,
+            "total_tokens": 650,
+            "prompt_tokens": 300,
+            "completion_tokens": 200,
+            "cache_read_input_tokens": 2100,
+            "cache_creation_input_tokens": 0,
+        },
+        "📐 2.6k/10.0k (26%)",  # 300 + 2100 cache + 200; the summed Σ would be 2750
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", list(_MERGED_TWO_ROUND_USAGE))
+def test_outlet_context_reads_last_round_of_owui_merged_usage(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """End-to-end (#26): a merged multi-round usage renders the last request in 📐, and debug names it."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    f.valves.context_size_override = 10_000
+    f.valves.debug_mode = True
+    usage, expected = _MERGED_TWO_ROUND_USAGE[shape]
+    body = make_body([make_message("q", role="user"), make_message("a", usage=usage)], model="gpt-4o")
+    emitter = CapturingEmitter()
+    run_async(f.outlet(body, __event_emitter__=emitter, __model__=make_model_dict("gpt-4o")))
+    assert expected in emitter.statuses()[0]["data"]["description"]
+    doc = next(e for e in emitter.events if e.get("type") == "citation")["data"]["document"][0]
+    assert '"used_source": "last_round"' in doc
+
+
+def test_outlet_context_on_owui_010_merged_usage_stays_summed(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OWUI 0.10.x merge_usage summed prompt/completion_tokens too: no per-round numbers, so 📐 keeps the Σ."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    f.valves.context_size_override = 10_000
+    usage = make_usage(
+        input_tokens=2400, output_tokens=350, total_tokens=2750, prompt_tokens=2400, completion_tokens=350
+    )
+    body = make_body([make_message("q", role="user"), make_message("a", usage=usage)], model="gpt-4o")
+    emitter = CapturingEmitter()
+    run_async(f.outlet(body, __event_emitter__=emitter, __model__=make_model_dict("gpt-4o")))
+    assert "(28%)" in emitter.statuses()[0]["data"]["description"]  # 2750 / 10000, same as before the fix
 
 
 def test_context_workspace_model_matches_via_base_model_id(
@@ -2021,7 +2092,7 @@ def test_resolve_context_disabled_short_circuits(
     ctx = run_async(
         f._resolve_context(make_body(model="gpt-4o"), {}, make_model_dict("gpt-4o"), make_tokens(total=100))
     )
-    assert ctx == {"size": None, "used": None, "source": "disabled", "matched_key": None}
+    assert ctx == {"size": None, "used": None, "used_source": None, "source": "disabled", "matched_key": None}
 
 
 def test_context_size_for_modelsdev_populated_table_match(

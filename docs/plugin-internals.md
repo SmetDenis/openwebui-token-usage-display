@@ -206,6 +206,36 @@ re-cut v2.6.0 (see the release note in `CLAUDE.md`). The two sections below keep
 - **Out of scope:** Ollama connections (they send `num_ctx`, tier 2), LM Studio, and `/props?model=` for the
   `llamacpp_url` valve on a router (its `/v1/models` already lists a loaded model's `meta.n_ctx`).
 
+### Context "used" — `_last_round_context` → `_resolve_context` (v2.7.0, issue #26)
+
+The numerator of `📐` is `tokens["context_used"]` (filled by `_extract_tokens`), else `tokens["total"]`, else
+`input + output`; `ctx["used_source"]` (`last_round` / `total` / `input+output`, `None` when nothing is known)
+records which one, and `context_debug.used_source` shows it. `_last_round_context` returns
+`prompt_tokens + completion_tokens` (falling back to `input_tokens` / `output_tokens` for a single round),
+plus cache read/write when `input_has_cache` is false (Anthropic-native), or `None` when the provider reported
+no tokens (the tiktoken path → `total`).
+
+Design decisions:
+
+- **Root cause:** one response with tool calls is several LLM requests, and OWUI's `merge_usage` sums
+  `input/output/total_tokens` over them — the right number for `⬆︎`/`Σ`/cost (processed and billed), the
+  wrong one for window occupancy, which is only the last request plus its answer. The plugin used the sum
+  for both; reported as 4 rounds on an 8k window reading ~300%.
+- **Source: `prompt_tokens` / `completion_tokens`.** Since OWUI 0.11.0 `merge_usage` rewrites them from
+  the last round ("provider aliases keep the latest value"), and OWUI's own context indicator
+  (`utils/context_compaction.py`) reads the same pair. No other per-round usage exists: neither `usage`
+  nor the `output` array keeps one.
+- **OWUI 0.10.x is knowingly not fixed:** there `prompt_tokens`/`completion_tokens` are in the summed
+  `USAGE_TOKEN_KEYS`, so `context_used` equals the summed total — no regression, no improvement.
+  Rejected: re-estimating the last request with tiktoken on 0.10.x (approximate, wrong for non-OpenAI
+  tokenizers, for a version being phased out).
+- **Anthropic-native cache is added back** (its `input` excludes cache); the top-level cache fields are
+  in none of `merge_usage`'s summed sets, so they are last-round too and the sum stays consistent.
+- **The other counters are untouched** (`⬆︎`, `⬇︎`, `Σ`, `🧮`, cost keep summing every round), so on
+  a tool turn `⬆︎` can be far above `📐` — documented in the README rather than "aligned".
+- Contributed in PR #27, released as 2.7.0 (owner's choice): 2.6.1 is skipped because a withdrawn
+  release carried it; 2.7.0 had only sat in `main` for hours on 2026-09-15, never released.
+
 ### Cost — `_resolve_cost` (`:1429-1494`)
 
 - `off` — nothing computed, fetched or shown.
@@ -252,6 +282,8 @@ models.dev tables. Classic failure: `claude-opus-4.8` (dot) does not substring-m
   cache into details) cache is a *subset*: `fresh_input = max(input − cached − cache_write, 0)`.
   Getting this wrong double-counts behind LiteLLM (fixed in v2.2.0).
 - `_compute_total` (`:1144-1158`): `fresh_input + cached + cache_write + output`.
+- `context_used` (v2.7.0, `_last_round_context`): the last request's tokens for the `📐` numerator — see
+  "Context used" above. Unlike `total`, it does not sum the rounds of a tool turn.
 - **Running chat total — `_cumulative_tokens`** (v2.6.0, called at the end of `_extract_tokens`):
   fills `tokens["cumulative"]` / `tokens["cumulative_est"]`, rendered as `🧮` by
   `_render_tokens_total`. Past assistant turns: `_compute_total(_usage_token_bag(usage))`, i.e. the
@@ -362,6 +394,9 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | cache rates missing | default to `input` rate | `:1567-1572` | `test_cost_components_cache_defaults_to_input_rate` |
 | cost below `cost_min_display` | hidden | `:681, :698` | `test_render_cost_estimate_marker_and_threshold` |
 | chat token total == message `Σ` | `🧮` suppressed | `_render_tokens_total` | `test_render_tokens_total_dedupes_and_marks_estimate` |
+| tool/agent turn: `usage` merged over several requests (v2.7.0, #26) | `📐` uses the last request (`prompt_tokens + completion_tokens`, Anthropic-native cache added back) | `_last_round_context` | `test_outlet_context_reads_last_round_of_owui_merged_usage`, `test_last_round_context_helper`, `test_context_used_is_last_round_not_cross_round_sum` |
+| OWUI 0.10.x merged usage (prompt/completion summed too) | `📐` keeps the summed total, as before | `_last_round_context` | `test_outlet_context_on_owui_010_merged_usage_stays_summed` |
+| no per-request numbers (tiktoken estimate / hand-built bag) | `used` falls back to `total`, then `input+output`; `used_source` says which | `_resolve_context` | `test_context_used_falls_back_to_total_without_per_round_prompt` |
 | past turns without/with malformed usage (unsaved chats) | skipped + counted in debug | `_cumulative_tokens` | `test_cumulative_tokens_skips_history_without_usage` |
 | current turn tiktoken-estimated | included, `🧮 ≈` | `_cumulative_tokens` | `test_cumulative_tokens_estimated_current_turn_and_empty`, `test_outlet_chat_token_total_marks_estimated_current_turn` |
 | cumulative == message cost | `💰Σ` suppressed | `:695-699` | `test_render_cost_total_dedupes_when_equal_to_message` |

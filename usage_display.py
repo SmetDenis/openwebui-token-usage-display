@@ -3,7 +3,7 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.6.1
+version: 2.7.0
 license: MIT
 description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
@@ -41,6 +41,10 @@ from __future__ import annotations
 #     -> the displayed 💰 already covers Open-WebUI-orchestrated tool/MCP calls;
 #     what it can't see is a surcharge the provider never puts in usage.cost
 #     (e.g. an OpenRouter BYOK web-search engine billed outside the generation).
+#   * Since 0.11.0 merge_usage rewrites prompt_tokens/completion_tokens from the
+#     LAST round (0.10.x summed them like input/output) -> the 📐 "used" side
+#     reads them, so a tool turn shows the last request, not the sum of rounds;
+#     on 0.10.x it stays the summed total (_last_round_context).
 #   * 0.9.0+ compatible: the outlet body carries per-message `usage` since 0.9.0 and
 #     normalize_usage exists since 0.8.0, so tokens/context/timing/estimate all work on
 #     0.9.x. Only NATIVE provider cost (USAGE_COST_KEYS) needs 0.10.0+ -> on 0.9.x use
@@ -1078,7 +1082,7 @@ class Filter:
         try:
             ctx = await self._resolve_context(body, __metadata__, __model__, tokens, __request__)
         except Exception:  # noqa: BLE001
-            ctx = {"size": None, "used": None, "source": "error", "matched_key": None}
+            ctx = {"size": None, "used": None, "used_source": None, "source": "error", "matched_key": None}
 
         model_id = _resolve_model_id(__model__, body)
         try:
@@ -1170,8 +1174,7 @@ class Filter:
         # Derived total: fresh input + cache (read+write) + output — correct for every shape.
         result["total"] = self._compute_total(result)
 
-        # Context-window occupancy (the "used" side of the 📐 metric): the LAST
-        # round's request, not the cross-round sum — see _last_round_context.
+        # The "used" side of 📐: the last round's request, not the cross-round sum.
         result["context_used"] = self._last_round_context(usage, result)
 
         # Running chat total — derived after `total`, so the current turn counts exactly as displayed.
@@ -1252,19 +1255,16 @@ class Filter:
 
     @staticmethod
     def _last_round_context(usage: dict[str, Any] | None, result: dict[str, Any]) -> int | None:
-        """Tokens occupying the model's context window at the end of the turn.
+        """Tokens occupying the model's context window at the end of the turn (the last request + its output).
 
-        For a multi-round (tool/agent) turn OWUI's merge_usage SUMS input_tokens/
-        total_tokens across every LLM round-trip while keeping prompt_tokens/
-        completion_tokens at the LAST round's values. The window is filled by the
-        last request (+its output), not by the sum of every earlier round's prompt
-        — so using the summed total over-counts the "used" side (e.g. 301% on a
-        4-round agent over an 8k window). prompt_tokens is the last round for every
-        provider (merge_usage always rewrites it from the incoming round), and for a
-        single round it equals input_tokens. Anthropic-native reports input
-        EXCLUDING cache (input_has_cache False), so its cache tokens are added back
-        — they occupy the window. Falls back to None (caller uses the summed total)
-        when no per-round prompt is available, e.g. the tiktoken-estimate path.
+        On a multi-round (tool/agent) turn OWUI's merge_usage SUMS input/output/total_tokens over
+        every LLM round-trip, but since 0.11.0 rewrites prompt_tokens/completion_tokens from the
+        last round (`utils/response.py:merge_usage`) - so they are the only per-request numbers
+        left. On 0.10.x merge_usage summed them too, so there this equals the summed total (no
+        regression, no fix). A single round has prompt == input. Anthropic-native input EXCLUDES
+        cache (input_has_cache False), so its cache is added back: it occupies the window, and the
+        top-level cache fields are last-round as well (in none of merge_usage's summed sets).
+        None when the provider reported no tokens (the tiktoken path): the caller falls back.
         """
         if not isinstance(usage, dict):
             return None
@@ -1411,22 +1411,25 @@ class Filter:
         request: Any = None,
     ) -> dict[str, Any]:
         if not self.valves.show_context_window:
-            return {"size": None, "used": None, "source": "disabled", "matched_key": None}
+            return {"size": None, "used": None, "used_source": None, "source": "disabled", "matched_key": None}
 
-        # Window utilization is the LAST round's request, not the cross-round Σ:
-        # merge_usage sums input/total over every tool round, which would read as
-        # "sent tokens way too high" (and >100%) for multi-round turns. Fall back
-        # to the summed total only when the per-round prompt is unavailable.
-        used = tokens.get("context_used")
+        # Last request first (see _last_round_context); the summed total only when it is unknown.
+        used, used_source = tokens["context_used"], "last_round"
         if used is None:
-            used = tokens["total"]
+            used, used_source = tokens["total"], "total"
         if used is None:
-            used = (tokens["input"] or 0) + (tokens["output"] or 0) or None
+            used, used_source = (tokens["input"] or 0) + (tokens["output"] or 0) or None, "input+output"
 
         model_id = _resolve_model_id(model, body)
 
         size, prov = await self._context_size_for(model_id, metadata, model, request)
-        return {"size": size, "used": used, "source": prov["source"], "matched_key": prov["matched_key"]}
+        return {
+            "size": size,
+            "used": used,
+            "used_source": used_source if used is not None else None,
+            "source": prov["source"],
+            "matched_key": prov["matched_key"],
+        }
 
     async def _context_size_for(
         self,
@@ -2317,6 +2320,7 @@ class Filter:
             "matched_key": stats.ctx.get("matched_key"),
             "size": size,
             "used": used,
+            "used_source": stats.ctx.get("used_source"),
             "percent": percent,
         }
 

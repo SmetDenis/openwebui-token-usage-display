@@ -74,7 +74,10 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 - **Do not reuse a published version number.** `v2.6.0` was re-cut on 2026-09-15 (owner's choice): the
   original `v2.6.0` and `v2.6.1` releases of 2026-09-14 were deleted and the unreleased 2.7.0/2.8.0 work
   folded into one `v2.6.0`. Accepted cost: two different builds carried `2.6.0`, so users who pasted the
-  first one see no version change. Going forward, cut a new version instead.
+  first one see no version change. Going forward, cut a new version instead. A number that only sat in
+  `main` (never tagged or released) counts as unused: `2.7.0` was in `main` for ~7 hours on 2026-09-15
+  (and `2.8.0` for minutes) before that re-cut, and the owner still cut the issue #26 fix as `2.7.0`
+  (2026-10-10) — no release had carried it, so no installed build could hide the update.
 - The community-store post text is maintained in `docs/community-post.md`; publishing to the store
   post (URL above) is a manual copy-paste done by the user.
 
@@ -105,10 +108,10 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (215 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (226 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
 and `make_*` builders live at the top of the test file). `pydantic` is pinned (`==`) in the `dev`
-dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.11.3), so the plugin
+dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.11.4), so the plugin
 is tested against the same pydantic it runs on in production — keep that pin tracking OWUI's, and
 don't merge a Dependabot bump that drifts it (Dependabot runs weekly for the `uv` and
 `github-actions` ecosystems).

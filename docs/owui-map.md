@@ -187,7 +187,12 @@ instead.
   — how proxy-reported cost survives normalization) and deep-sums the four `USAGE_DETAIL_KEYS:72`
   `*_tokens_details` dicts. Top-level Anthropic cache fields and Ollama duration fields are in none
   of those sets → **last round wins** for cache/timing. This is the OWUI limitation the plugin
-  documents rather than fixes.
+  documents rather than fixes. Since **0.11.0** (`df94268e8`) the merge then rewrites
+  `prompt_tokens`/`completion_tokens` from the incoming round (`incoming.prompt_tokens or
+  incoming.input_tokens or current.prompt_tokens`, same for completion) — the only per-request numbers
+  left after a tool turn, read by the plugin's `📐` and by OWUI's own `context_compaction`. On **0.10.x**
+  both were in `USAGE_TOKEN_KEYS` and summed. `merge_usage` also runs per streaming chunk that carries
+  `usage` or llama.cpp `timings`, not only per round. Checked in v0.11.4 and v0.10.2.
 
 ## Events (`socket/main.py`)
 
