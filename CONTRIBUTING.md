@@ -79,11 +79,56 @@ tested against the same pydantic it runs on in production.
 
 ## Releasing a change
 
+Every merge to `main` that changes `usage_display.py` is a release; CI tags and publishes it.
+
 1. Make the change with a test.
-2. Bump the `version:` field in the `usage_display.py` docstring — it is the single source of truth
-   for the version (also mirrored in `pyproject.toml`).
-3. Add a matching entry at the top of `CHANGELOG.md`.
-4. `make pre-commit` must be green.
+2. If it touches `usage_display.py`, run `make bump PART=<part>`:
+   - `major` — breaks an install: raises `required_open_webui_version`, removes a metric or valve, or
+     changes a default incompatibly;
+   - `minor` — adds a metric, a valve or a capability;
+   - `patch` — a fix, or any other edit inside `usage_display.py` (comments included).
+
+   It counts the next number from the latest release tag and writes it into the docstring `version:`
+   (the single source of truth), `pyproject.toml`, the `uv.lock` project line and a new top
+   `## [X.Y.Z]` section of `CHANGELOG.md`. Rerunning it is safe.
+3. Describe the change for users under that `CHANGELOG.md` heading: it becomes the release text.
+4. `make pre-commit` must be green — it includes the release check (`make release-check`).
+5. Merge. The `release` job in `ci.yml` creates tag `vX.Y.Z` on the merge commit and a GitHub release
+   (the CHANGELOG section, then GitHub's list of merged PRs). Do not create tags or releases by hand.
+
+Changes that leave `usage_display.py` alone (docs, CI, tests, dependency bumps) keep the version and
+release nothing. If another branch released your number first, the check fails after you rebase:
+run `make bump` again — it renumbers your unreleased CHANGELOG section and keeps its text.
+
+### Release flow decisions
+
+Recorded 2026-10-11, after the version number had to be argued about on several releases in a row.
+
+- **Root cause:** choosing the number, committing it and publishing it were three separate manual
+  steps that drifted apart. Feature branches each "cut" a version, so numbers sat in `main` without a
+  release (`2.7.0`, `2.8.0` on 2026-09-15); `v2.6.0` was re-cut over deleted builds, so two different
+  files carried `2.6.0`; `2.7.0` was published from the GitHub UI with a bare tag, auto-generated notes
+  and a target of `main` that put the tag on a later commit.
+- **Merge = release** (owner's choice), because users install by pasting the file from `main`: any
+  unreleased code there under an old number recreates the "two builds, one version" problem.
+  Rejected: an `Unreleased` CHANGELOG section with a separate release command (main would carry new
+  code under the last number between releases, and the release step could be forgotten), and
+  release-please (it generates a commit-list changelog that clashes with the hand-written one, and the
+  version sits in Open WebUI's strict one-line frontmatter).
+- **The number is derived, not chosen:** semver part from the kind of change, counted from the latest
+  tag by `make bump`; a number exists only once tagged. Owner's choice over "always minor", which would
+  stop the number telling a fix from a feature.
+- **The check needs no base branch:** the plugin either equals the file under its version's tag, or
+  carries a version above every tag. That catches a forgotten bump and a number another branch released
+  first, and lets Dependabot and docs changes through untouched. It compares file contents, not commits,
+  so the `2.7.0` tag sitting on a later commit is harmless.
+- **Published from `ci.yml` after the whole gate** (`needs: gate`), tagged on `$GITHUB_SHA` rather than
+  `main`, idempotent (an existing tag means nothing to do), with notes = the CHANGELOG section plus
+  GitHub's merged-PR list (owner's choice; Dependabot PRs show up in that list).
+- **`scripts/release.py` is stdlib-only:** the release job runs it with the runner's Python, outside the
+  project venv.
+- **`uv.lock` gets only its version line edited:** `uv lock` from a newer uv (0.12.24) raised the lock's
+  `revision` from 3 to 5, which Dependabot's bundled uv (0.12.7) may not read.
 
 ## Verifying against Open WebUI
 

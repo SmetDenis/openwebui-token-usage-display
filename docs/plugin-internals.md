@@ -25,7 +25,7 @@ Orchestration order (each step degrades gracefully, never raises out):
 2. **Background-task guard** (`:945-955`) — skips the 7 `metadata["task"]` values
    (`title_generation`, `tags_generation`, `follow_up_generation`, `emoji_generation`,
    `query_generation`, `autocomplete_generation`, `moa_response_generation`). Defensive only: task
-   requests never run filter functions at all, through v0.11.1 (see `docs/owui-map.md`). The guard
+   requests never run filter functions at all, through v0.12.0 (see `docs/owui-map.md`). The guard
    list is a subset: OWUI's `TASKS` enum gained `image_prompt_generation` and `function_calling`,
    so it now has 9 members — harmless while the requests never reach filters.
 3. **Message gates** (`:957-962`) — empty `messages` or no assistant message → return.
@@ -34,13 +34,14 @@ Orchestration order (each step degrades gracefully, never raises out):
    `try/except Exception` with a sentinel fallback (`source="error"` / all-`None` cost), so a
    resolver bug can never kill the response pipeline.
 6. `_build_stats` (`:982`) joins the parts with `valves.separator`; `debug_mode` appends `(debug)`.
+   The `_Stats` it gets also carries the message's `finish_reason` (a string, else `None`; OWUI 0.12.0+).
 7. Emits `{"type": "status", "data": {"description": ..., "done": True}}` (`:986-992`), then in
    debug mode `_emit_debug` (`:994-1007`) emits a `citation` event (copyable modal, persisted) and
    mirrors the pretty JSON to server stdout as `[TUD debug]`.
 
 ## The OWUI contract (NOTE block) and its verification status
 
-The NOTE block at `usage_display.py:14-46` is the source-verified contract with OWUI. Re-verified
+The NOTE block at `usage_display.py:14-56` is the source-verified contract with OWUI. Re-verified
 against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
 
 - Normalized triple guaranteed on every save path — **confirmed** (`utils/response.py:14-51,105`).
@@ -56,6 +57,8 @@ against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
 - Only saved chats carry history `usage` into outlet; unsaved chats rebuild history as
   role+content — **confirmed** in v0.11.0 and v0.11.3 (`outlet_filter_handler`, added to the NOTE
   block in v2.6.0 for the chat totals).
+- Whole block re-checked against a `v0.11.4...v0.12.0` diff (2026-10): none of the above changed.
+  0.12.0 adds `finish_reason` to the current outlet message (added to the NOTE block in v2.8.0).
 
 Any change to token/cost/context reading must be reconciled against this block AND re-verified
 against real OWUI source of the version being targeted — never against memory or docs.
@@ -65,13 +68,14 @@ against real OWUI source of the version being targeted — never against memory 
 Grouped inventory (`Valves` at `:755-884`, `UserValves` at `:886-887`). Defaults in parentheses
 when non-obvious:
 
-- **Visibility** — `show_input_tokens`, `show_output_tokens`, `show_total_tokens`,
+- **Visibility** — `show_input_tokens`, `show_output_tokens`, `show_finish_reason` (True, v2.8.0),
+  `show_total_tokens`,
   `show_cumulative_tokens` (True, v2.6.0),
   `show_generation_time`, `show_tokens_per_second`, `show_reasoning_tokens`, `show_cached_tokens`,
   `show_audio_tokens` (False), `show_model_name`, `show_data_source` (False),
   `show_context_window`, `show_cumulative_cost`. Message cost has **no** `show_*` — its visibility
   is `cost_mode` itself.
-- **Presentation** — `display_order` (pre-filled full 14-key order), `separator` (`" · "`),
+- **Presentation** — `display_order` (pre-filled full 15-key order), `separator` (`" · "`),
   `icon_style` (`emoji`/`simple`/`off`), `compact_numbers` (False).
 - **Estimation** — `fallback_to_tiktoken` (True), `count_all_messages_for_input` (True).
 - **Context** — `context_size_override` (0 = auto), `context_size_map` (JSON string),
@@ -86,23 +90,60 @@ when non-obvious:
 - **UserValves** — `enabled` (True). Per-user display customization was deliberately rolled back:
   everything else is admin-only.
 
+**Compatibility rule (OWUI 0.12.0+).** Saving new function code validates the valves an admin already
+stored against the new `Valves`, and refuses the save on anything but a "missing" error (see
+`docs/owui-map.md`, "What changed in v0.12.0"). So a release must never narrow a `Literal`, change a
+field's type, tighten a constraint, or forbid extra keys: every install that stored the old value could
+not update. Adding a field or dropping one is safe. A rollback runs the same check the other way
+(history snapshots carry no valves, so restoring or pasting older code validates today's stored valves
+against it): once an admin picks a value a newer release added, going back is blocked. Nothing in 2.8.0
+does that. `tests/test_valves_compat.py` enforces the forward direction: it loads `usage_display.py` from
+every release tag and validates, against the current `Valves`, its defaults plus every sample value that
+release accepted — every `Literal` option, both booleans, a few ints, floats and strings (`Literal | None`
+unwrapped). CI checks out with `fetch-depth: 0` and fails when no tag is present; locally a clone without
+tags skips (`git fetch --tags`). Not covered: a tightened bound for a value outside those samples.
+
 ## Renderer dispatch
 
-`_STATS_RENDERERS` (`:737-751`) maps 14 keys (`input`, `output`, `total`, `tokens_total`,
+`_STATS_RENDERERS` (`:737-751`) maps 15 keys (`input`, `output`, `finish`, `total`, `tokens_total`,
 `reasoning`, `cached`, `audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `model`, `source`)
 to `_render_*`
 functions with one signature `(s: _Stats) -> str | None`. `_Stats` is a frozen dataclass bundling
-`valves`, `tokens`, `timing`, `ctx`, `cost`, `model` (v2.6.0; it replaced a fixed 6-positional-arg
+`valves`, `tokens`, `timing`, `ctx`, `cost`, `model`, plus `finish_reason` (default `None`, added in
+v2.8.0). It arrived in v2.6.0 and replaced a fixed 6-positional-arg
 signature that forced suppressing `PLR0913`/`PLR0917` and left every renderer with unused
-arguments). `_build_stats` walks the resolved order, drops `None` results, and suppresses a line
+arguments. `_build_stats` walks the resolved order, drops `None` results, and suppresses a line
 consisting solely of `source` parts. `_emit_debug` takes the same `_Stats` plus a `_Turn` (task,
 messages, assistant message, usage, metadata).
 
 Rules: **`show_*` valves gate visibility; `display_order` only sorts.** `_resolve_display_order`
-(`:451-458`) always returns a full 14-key permutation — removed keys move to the end, unknown keys
+(`:451-458`) always returns a full 15-key permutation — removed keys move to the end, unknown keys
 are ignored (surfaced only in the debug payload). To add a metric: add a `show_*` valve, write a
 `_render_*(s: _Stats)`, register it in `_STATS_RENDERERS`, append the key to `_DEFAULT_ORDER`, add
 an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
+
+### Truncation marker — `_render_finish` (v2.8.0) — design decisions
+
+- **Source:** the `finish_reason` OWUI 0.12.0 puts on the current outlet message (`docs/owui-map.md`, "What
+  changed in v0.12.0"). Taken only when it is a string, so junk reads as unknown.
+- **Only `length` is shown** (owner's choice). `stop` is the norm and would be noise on a one-line
+  status; `tool_calls` ends a turn paused for tool approval or stopped at the tool-call limit;
+  `content_filter` was offered and declined (rare, provider-specific). Absence means "unknown" —
+  Responses API streams and OWUI < 0.12 send none — so it is never read as "stopped normally". Plain
+  pipes and non-streaming Responses replies get a synthesized `stop`/`tool_calls`, never `length`, so
+  the marker cannot show there; a pipe passing an upstream response through keeps its real value. Rejected: also matching
+  `max_tokens` (Anthropic-native wording): OWUI passes the upstream's OpenAI-shaped
+  `choices[0].finish_reason` as sent and maps no native `stop_reason` into it (`utils/anthropic.py`
+  maps only the other way, for OWUI's own Anthropic-compatible API), so only a non-conforming proxy
+  could send `max_tokens` — not worth a guess.
+- **Own key `finish` + valve `show_finish_reason` (on by default), not a suffix on `⬇︎`:** keeps the
+  rule that every fact has its own `show_*` gate and `display_order` slot. Rejected: a `✂︎` suffix on
+  the output count (could not be hidden separately).
+- **Placed right after `output`:** the status line is `line-clamp-1`, so the right end is what gets cut
+  on a narrow screen; a warning must not sit there. Saved custom orders get it at the end, as usual.
+- **Last request of the turn:** on a tool turn it is the final model call's reason — the call whose
+  text the user reads.
+- **Debug:** top-level `finish_reason` (`null` when absent).
 
 ## Resolution chains
 
@@ -394,6 +435,10 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | cache rates missing | default to `input` rate | `:1567-1572` | `test_cost_components_cache_defaults_to_input_rate` |
 | cost below `cost_min_display` | hidden | `:681, :698` | `test_render_cost_estimate_marker_and_threshold` |
 | chat token total == message `Σ` | `🧮` suppressed | `_render_tokens_total` | `test_render_tokens_total_dedupes_and_marks_estimate` |
+| `finish_reason` `length` (v2.8.0, OWUI 0.12.0+) | `✂️ truncated` right after `⬇︎` | `_render_finish` | `test_render_finish_flags_only_length`, `test_outlet_flags_truncated_response_next_to_output` |
+| `finish_reason` `stop`/`tool_calls`/`content_filter`/absent/non-string | nothing shown; debug reports it (`null` when absent) | `_render_finish`, `outlet` | `test_render_finish_flags_only_length`, `test_outlet_flags_truncated_response_next_to_output`, `test_outlet_debug_payload_reports_finish_reason` |
+| a release narrows a valve type (OWUI 0.12+ would refuse the code save) | gate fails | `tests/test_valves_compat.py` | `test_stored_valves_of_every_release_validate_against_current`, `test_rejection_mirrors_owui_validate_valves` |
+| compat test finds no release tags (shallow clone, archive) | fails in CI, skips locally | `_release_tags` | `test_release_tags_fail_in_ci_and_skip_locally` |
 | tool/agent turn: `usage` merged over several requests (v2.7.0, #26) | `📐` uses the last request (`prompt_tokens + completion_tokens`, Anthropic-native cache added back) | `_last_round_context` | `test_outlet_context_reads_last_round_of_owui_merged_usage`, `test_last_round_context_helper`, `test_context_used_is_last_round_not_cross_round_sum` |
 | OWUI 0.10.x merged usage (prompt/completion summed too) | `📐` keeps the summed total, as before | `_last_round_context` | `test_outlet_context_on_owui_010_merged_usage_stays_summed` |
 | no per-request numbers (tiktoken estimate / hand-built bag) | `used` falls back to `total`, then `input+output`; `used_source` says which | `_resolve_context` | `test_context_used_falls_back_to_total_without_per_round_prompt` |

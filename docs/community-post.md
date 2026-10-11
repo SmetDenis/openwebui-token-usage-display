@@ -8,7 +8,7 @@ Community page, comments and feedback: https://openwebui.com/posts/token_usage_d
 
 ## Description
 
-Shows token counts, reasoning/cached breakdowns, context-window utilization, generation time, tokens/sec and message/chat cost below each AI response. Reads provider-reported usage across OpenAI (Chat & Responses API), Anthropic, Gemini, Ollama and llama.cpp, with an optional tiktoken fallback. Cost is shown when your provider/proxy reports it (OpenRouter, LiteLLM) and can optionally be estimated from models.dev prices.
+Shows token counts, reasoning/cached breakdowns, context-window utilization, generation time, tokens/sec, a truncation marker when a response hits its output-token limit, and message/chat cost below each AI response. Reads provider-reported usage across OpenAI (Chat & Responses API), Anthropic, Gemini, Ollama and llama.cpp, with an optional tiktoken fallback. Cost is shown when your provider/proxy reports it (OpenRouter, LiteLLM) and can optionally be estimated from models.dev prices.
 
 ---
 
@@ -26,6 +26,7 @@ Shows token counts, reasoning/cached breakdowns, context-window utilization, gen
 - **Cached prompt** tokens - OpenAI prompt cache and Anthropic `cache_read` / `cache_creation` (Anthropic cache is correctly counted as *additional* to input)
 - **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable via `context_warn_percent` / `context_critical_percent`). On a response with tool calls (several requests to the model) it shows the last request, while `⬆︎`/`Σ`/cost add up all of them (Open WebUI 0.11+)
 - **Generation time** and **tokens/second**
+- **Truncation marker** (`✂️ truncated`, next to `⬇︎`) - shown only when the model stopped because it hit its output-token limit, so a cut-off answer is not mistaken for a complete one (Open WebUI 0.12.0+; Chat Completions / OpenAI-compatible and Ollama models, not the Responses API)
 - **Cost** - the cost of the message and a running total for the chat: the provider's own reported cost when available (OpenRouter, LiteLLM, ...), or an optional estimate from models.dev prices (always marked `≈`)
 - **Audio** tokens (off by default) and the **base model name** for workspace models
 
@@ -85,7 +86,7 @@ What no client-side display can capture is a surcharge the provider charges *on 
 
 - Every metric can be toggled on/off via admin **Valves**.
 - Users can disable the display entirely through **UserValves**.
-- **Metric order is configurable** via the admin `display_order` valve (comma-separated keys: `input, output, total, tokens_total, reasoning, cached, audio, context, time, tps, cost, cost_total, model, source`). The field comes **pre-filled with the default order** — just reorder or trim it (empty also means default). It only *reorders*: visibility stays governed by the `show_*` toggles, so removing a key does **not** hide it — the metric just moves to the end, like any enabled-but-unlisted one.
+- **Metric order is configurable** via the admin `display_order` valve (comma-separated keys: `input, output, finish, total, tokens_total, reasoning, cached, audio, context, time, tps, cost, cost_total, model, source`). The field comes **pre-filled with the default order** — just reorder or trim it (empty also means default). It only *reorders*: visibility stays governed by the `show_*` toggles, so removing a key does **not** hide it — the metric just moves to the end, like any enabled-but-unlisted one.
 - **Line appearance is configurable** (admin): `separator` (string between items, default ` · `), `icon_style` (`emoji` default / `simple` monochrome unicode / `off` bare values), and `compact_numbers` (abbreviate the seven token counters as `k`/`M`, e.g. `12,345 → 12.3k`, matching the context style).
 - Context detection is configurable: manual size override, a custom `{"model-substring": tokens}` map, the live models.dev fetch toggle, and optional llama.cpp / llama-swap URLs.
 - Cost is configurable: `cost_mode` (`off` / `auto` / `estimate`), a running chat-total toggle, a `cost_min_display` threshold that hides negligible amounts (default `0.0` shows everything), a manual `price_map`, and the live models.dev price-fetch toggle.
@@ -96,7 +97,7 @@ What no client-side display can capture is a surcharge the provider charges *on 
 The fastest way to find out *why* a metric is missing is to turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - Debug info"** source under the message (it's also mirrored to the server log). The `cost_debug`, `context_debug`, `model` and `valves` blocks name the exact broken link — the cases below map those fields to a fix.
 
 **Nothing shows below the response at all (no tokens).**
-The provider returned no `usage`. In streaming — Open WebUI's default — most OpenAI-compatible endpoints only send a usage chunk when the request explicitly asks for one. Enable the model's **Usage** capability (Workspace → Models → *your model* → Capabilities → **Usage**); it is **off by default** and is what makes Open WebUI send `stream_options: {include_usage: true}`. Behind a LiteLLM proxy you can instead force it globally with `general_settings: { always_include_stream_usage: true }`. Non-streaming responses carry `usage` regardless. Also confirm the filter is active and attached to the model.
+The provider returned no `usage`. In streaming — Open WebUI's default — most OpenAI-compatible endpoints only send a usage chunk when the request explicitly asks for one. Enable the model's **Usage** capability (Workspace → Models → *your model* → Capabilities → **Usage**); it is **off by default** and is what makes Open WebUI send `stream_options: {include_usage: true}`. Behind a LiteLLM proxy you can instead force it globally with `general_settings: { always_include_stream_usage: true }`. Non-streaming responses carry `usage` regardless. Also confirm the filter is active and attached to the model, and that Functions are not switched off server-wide: `ENABLE_FUNCTIONS=false` (Open WebUI 0.12.0+) or the master switch `ENABLE_PLUGINS=false` disables every filter - then `debug_mode` prints nothing to the server log either.
 
 **Tokens show but cost is blank, and `cost_mode` is `auto`** (`cost_debug.native.found: false`).
 In `auto`, cost appears only when your provider/proxy reports it **inside the response body** `usage`. The important gotcha: **a LiteLLM proxy returns its cost in the `x-litellm-response-cost` HTTP header by default, and Open WebUI does not read that header** — so `auto` never sees it. Move the cost into the body with `litellm_settings: { include_cost_in_streaming_usage: true }`. That is the only flag of its kind and it applies to **streaming only** — a non-streaming `/chat/completions` body never carries cost. Once set, `auto` shows the exact billed number. Otherwise switch to `cost_mode: estimate` for an approximation (always marked `≈`).
@@ -118,7 +119,8 @@ Fixed in **v2.2.0** — upgrade. Some proxies (LiteLLM) fold Anthropic's cache t
 ### Notes & limitations
 
 - For providers that **don't** report a generation duration (OpenAI, Anthropic), time and t/s are measured as wall-clock and marked `~`; with web search / RAG / tool calls enabled, that figure includes the pre-model work. Local providers (Ollama, llama.cpp) report real generation time and are unaffected.
-- In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn.
+- In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn. The truncation marker likewise reflects the last request of the turn.
+- In a Realtime voice call (Open WebUI 0.12.0+), replies the voice model speaks on its own never pass through filters, so they get no stats line; questions it hands to the chat model are ordinary responses and do.
 - Estimated cost (`≈`) is a ballpark from published models.dev prices, not your invoice; long-context tier pricing isn't modelled and, when the model can't be mapped to a provider, no estimate is shown. Provider-reported cost (`auto` mode) is exact.
 
 ### Changelog

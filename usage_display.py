@@ -3,9 +3,9 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.7.0
+version: 2.8.0
 license: MIT
-description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
+description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """  # noqa: D205, D212, D415, E501 - OWUI frontmatter: first line must be bare quotes, one `key: value` per line
 
@@ -45,6 +45,12 @@ from __future__ import annotations
 #     LAST round (0.10.x summed them like input/output) -> the 📐 "used" side
 #     reads them, so a tool turn shows the last request, not the sum of rounds;
 #     on 0.10.x it stays the summed total (_last_round_context).
+#   * Since 0.12.0 the current outlet message carries `finish_reason` — the
+#     value from the LAST model call of the turn, never persisted. Provider-real
+#     for Chat Completions, Ollama and pipes passing an upstream response through;
+#     synthesized "stop"/"tool_calls" (never "length") for other pipes and
+#     non-streaming Responses API; absent for Responses API streams -> absence
+#     means "unknown", not "stop"; only "length" is shown (✂️, _render_finish).
 #   * 0.9.0+ compatible: the outlet body carries per-message `usage` since 0.9.0 and
 #     normalize_usage exists since 0.8.0, so tokens/context/timing/estimate all work on
 #     0.9.x. Only NATIVE provider cost (USAGE_COST_KEYS) needs 0.10.0+ -> on 0.9.x use
@@ -543,11 +549,14 @@ def _resolve_model_id(model: dict[str, Any] | None, body: dict[str, Any] | None 
 
 # --- stats-line order (see configurable-order design doc) ----------------------
 
-# The 14 metric keys in their default display order (identical to the historical
+# The 15 metric keys in their default display order (identical to the historical
 # hard-coded order of _build_stats). Registry populated in the renderers section.
+# `finish` sits right after `output`: the status line is clamped to one line, so a
+# warning at the end could be cut off on a narrow screen.
 _DEFAULT_ORDER: list[str] = [
     "input",
     "output",
+    "finish",
     "total",
     "tokens_total",
     "reasoning",
@@ -586,7 +595,7 @@ def _normalize_order(order_str: str) -> tuple[list[str], list[str]]:
 def _resolve_display_order(admin_order: str) -> list[str]:
     """Resolve the admin-configured metric order, else the default.
 
-    Returns a permutation of all 14 keys: the parsed (valid) keys first, then the
+    Returns a permutation of all 15 keys: the parsed (valid) keys first, then the
     remaining keys in default order. Empty input -> _DEFAULT_ORDER unchanged.
     """
     valid, _ = _normalize_order(admin_order)
@@ -614,6 +623,7 @@ def _display_order_debug(admin_order: str) -> dict[str, Any]:
 _ICON_EMOJI: dict[str, str] = {
     "input": "⬆︎",
     "output": "⬇︎",
+    "finish": "✂️",
     "total": "Σ",
     "tokens_total": "🧮",
     "reasoning": "🧠",
@@ -628,6 +638,7 @@ _ICON_EMOJI: dict[str, str] = {
 _ICON_SIMPLE: dict[str, str] = {
     "input": "↑",
     "output": "↓",
+    "finish": "✂︎",
     "total": "Σ",
     "tokens_total": "ΣΣ",
     "reasoning": "∴",
@@ -698,6 +709,7 @@ class _Stats:
     ctx: dict[str, Any]
     cost: dict[str, Any]
     model: dict[str, Any] | None
+    finish_reason: str | None = None
 
 
 def _render_input(s: _Stats) -> str | None:
@@ -709,6 +721,15 @@ def _render_input(s: _Stats) -> str | None:
 def _render_output(s: _Stats) -> str | None:
     if s.valves.show_output_tokens and s.tokens["output"] is not None:
         return _with_icon(_icon(s.valves, "output"), _fmt_count(s.valves, s.tokens["output"]))
+    return None
+
+
+def _render_finish(s: _Stats) -> str | None:
+    # Only a hit output-token limit is worth a slot: "stop" is the norm, "tool_calls" ends a turn paused
+    # for approval or stopped at the tool-call limit, and a missing value (Responses API stream,
+    # OWUI < 0.12) means unknown.
+    if s.valves.show_finish_reason and s.finish_reason == "length":
+        return _with_icon(_icon(s.valves, "finish"), "truncated")
     return None
 
 
@@ -812,6 +833,7 @@ def _render_source(s: _Stats) -> str | None:
 _STATS_RENDERERS: dict[str, Callable[[_Stats], str | None]] = {
     "input": _render_input,
     "output": _render_output,
+    "finish": _render_finish,
     "total": _render_total,
     "tokens_total": _render_tokens_total,
     "reasoning": _render_reasoning,
@@ -850,6 +872,13 @@ class Filter:
         )
         show_input_tokens: bool = Field(default=True, description="Display input (prompt) token count.")
         show_output_tokens: bool = Field(default=True, description="Display output (completion) token count.")
+        show_finish_reason: bool = Field(
+            default=True,
+            description=(
+                "Flag a response the model cut off at its output-token limit (✂️ truncated). Needs Open WebUI "
+                "0.12.0+ and a Chat Completions (OpenAI-compatible) or Ollama model; not shown for the Responses API."
+            ),
+        )
         show_total_tokens: bool = Field(default=True, description="Display total token count.")
         show_cumulative_tokens: bool = Field(
             default=True,
@@ -871,8 +900,8 @@ class Filter:
             default=", ".join(_DEFAULT_ORDER),
             description=(
                 "Comma-separated metric order, pre-filled with the default order — reorder or trim "
-                "to taste (empty also means default). Keys: input, output, total, tokens_total, reasoning, cached, "
-                "audio, context, time, tps, cost, cost_total, model, source. This only sorts: "
+                "to taste (empty also means default). Keys: input, output, finish, total, tokens_total, reasoning, "
+                "cached, audio, context, time, tps, cost, cost_total, model, source. This only sorts: "
                 "visibility is governed by the show_* toggles, and removing a key here does NOT hide "
                 "it (use show_* for that) — it just moves to the end, like any enabled-but-unlisted metric."
             ),
@@ -1011,7 +1040,7 @@ class Filter:
         start_time = time.time()
         _request_timings[key] = start_time
 
-        # num_ctx is only visible in the inbound body (OWUI strips model.info.params).
+        # num_ctx is only visible in the inbound body (OWUI strips generation params from model.info.params).
         num_ctx = (
             _first_num(body, "num_ctx")
             or _first_num(body.get("options", {}) if isinstance(body.get("options"), dict) else {}, "num_ctx")
@@ -1090,7 +1119,16 @@ class Filter:
         except Exception:  # noqa: BLE001
             cost = {"message": None, "message_est": False, "cumulative": None, "cumulative_est": False}
 
-        stats = _Stats(valves=v, tokens=tokens, timing=timing, ctx=ctx, cost=cost, model=__model__)
+        finish = assistant_msg.get("finish_reason")
+        stats = _Stats(
+            valves=v,
+            tokens=tokens,
+            timing=timing,
+            ctx=ctx,
+            cost=cost,
+            model=__model__,
+            finish_reason=finish if isinstance(finish, str) else None,
+        )
         stats_parts = self._build_stats(stats)
         if v.debug_mode:
             stats_parts.append("(debug)")
@@ -2193,7 +2231,8 @@ class Filter:
 
         Only known-safe keys are copied out; raw __model__/__metadata__ (which carry user_message,
         user_id, session_id, access_grants, the full ollama/openai model dict, ...) never leak here.
-        OWUI strips info.params before outlet, so generation params are unavailable — surfaced
+        OWUI strips generation params from info.params before outlet (0.12.0+ keeps only the
+        model_controls UI metadata there), so they are unavailable — surfaced
         explicitly via gen_params_available rather than silently omitted.
         """
         m = model if isinstance(model, dict) else {}
@@ -2335,6 +2374,7 @@ class Filter:
                 [item.get("type") for item in output if isinstance(item, dict)] if isinstance(output, list) else None
             ),
             "content_len": len(content) if isinstance(content, str) else -1,
+            "finish_reason": stats.finish_reason,
             "model": self._sanitize_model(stats.model, turn.metadata, resolved_id),
             "tokens": stats.tokens,
             "timing": stats.timing,
