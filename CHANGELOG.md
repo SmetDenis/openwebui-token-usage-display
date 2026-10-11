@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.8.0]
+
+- **Checked against Open WebUI 0.12.0: no change needed.** Usage merging, the outlet body (apart from the new `finish_reason` below), the model listing and connection settings the context probe reads, status/citation persistence and the frontend render gates are as in 0.11.x. The plugin loads and runs in 0.12.0's rewritten function loader.
+- **Truncation marker (`✂️ truncated`).** Open WebUI 0.12.0 tells filters why the model stopped. When it stopped because it hit its output-token limit, the line now says so next to the output count: `⬇︎ 4,096 · ✂️ truncated · Σ ...`, so a cut-off answer is not mistaken for a complete one. Details:
+    - New admin valve `show_finish_reason` (**on by default**) and metric key `finish`, placed right after `output` in the default order so it survives the one-line clamp of the status line. If you saved a custom `display_order`, the new key is appended at the end, as with any unlisted metric - add `finish` where you want it. Icons: `✂️` (emoji) / `✂︎` (simple); with `icon_style: off` it reads `truncated`.
+    - Shown only for the `length` stop reason. A normal stop, a turn that ended on a tool call (paused for approval, or stopped at the tool-call limit) and a provider content filter show nothing.
+    - **Needs Open WebUI 0.12.0+ and a Chat Completions (OpenAI-compatible) or Ollama model**, or a pipe function that passes such a response through. Not shown for the Responses API: Open WebUI passes no stop reason for its streams and a made-up `stop` for its non-streaming replies (as it does for pipes returning plain text). Older Open WebUI versions pass none at all. On a tool turn it is the stop reason of the last request.
+    - `debug_mode`: new top-level `finish_reason` field (`null` when Open WebUI sent none).
+
 ## [2.7.0]
 
 - **Version note.** `2.6.1` is skipped: it belonged to a build released on 2026-09-14 and withdrawn (see `2.6.0`), and reusing it would hide this update from anyone who installed that build. `2.7.0` was never released - it only appeared briefly in the repository on 2026-09-15, before the `2.6.0` re-cut.

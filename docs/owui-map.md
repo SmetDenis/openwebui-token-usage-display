@@ -6,9 +6,66 @@ that constrain the plugin's UX. Paths are relative to the Open WebUI repo root.
 
 **Verified against Open WebUI `v0.11.0`** (commit `01f4282f1`) plus a diff check of `v0.11.0...v0.11.1`
 (released 2026-08-25): none of the mechanisms below changed in `v0.11.1` — its backend diff touches
-Socket.IO Redis locks/heartbeats, model tag normalization and error constants only. OWUI internals
-shift between versions — before relying on any claim, re-check it against a current checkout (the
-local clone path and freshness-check commands live in `CLAUDE.local.md`).
+Socket.IO Redis locks/heartbeats, model tag normalization and error constants only. A diff check of
+`v0.11.4...v0.12.0` (released 2026-10-10) re-walked every mechanism below; what moved is listed
+under "What changed in v0.12.0", and the line numbers cited elsewhere are still those of v0.11.0.
+OWUI internals shift between versions — before relying on any claim, re-check it against a current
+checkout (the local clone path and freshness-check commands live in `CLAUDE.local.md`).
+
+## What changed in v0.12.0 (plugin-relevant)
+
+Checked file by file against `v0.11.4...v0.12.0` (2026-10). Nothing here breaks the plugin; items
+1–2 are new data or constraints, the rest is context.
+
+1. **The current outlet message carries `finish_reason`** (`#32079`). `outlet_filter_handler` adds
+   `ctx['assistant_message']['finish_reason']` to the message whose id is the current `message_id`.
+   It is the value from the **last** model call of the turn (`stream_body_handler` runs once per tool
+   round and each round's final chunk overwrites it), taken from the chunk's `choices` (`choices[0]` on
+   the main path; the raw-API stream path loops over all choices). Where it comes from:
+   - **provider-real** for Chat Completions streaming and non-streaming replies, for Ollama
+     (`done_reason` now maps to it, so a token-limit cut reports `length`), and for pipes that return a
+     `StreamingResponse` or a dict (passed through, `functions.py:293-298,332-333`);
+   - **synthesized, never `length`**: other pipes get a closing chunk with `stop`
+     (`functions.py:318-319`) or `tool_calls`/`stop` from `openai_chat_completion_message_template`;
+     non-streaming Responses API replies get `tool_calls`/`stop` (`routers/openai.py:1399`);
+   - **absent** for Responses API streams (`response.*` events `continue` before the `choices` loop).
+
+   It is **never persisted** — past messages never have it. A turn can end on `tool_calls` when it is
+   paused for approval or stopped at the tool-call iteration limit.
+2. **Saving function code validates the stored valves** (`utils/valves.py:validate_valves`, called from
+   `models/functions.py` on insert/update/version restore). The *function instance* (`Filter()`) is
+   passed, so the nested `Valves` is found; the stored values minus `None` are fed to `Valves(**…)`.
+   Any error but `missing` is an HTTP 400 "Current Valves are incompatible with this code" — the admin
+   cannot save the new version. Unknown (removed) keys pass (pydantic ignores extras by default). The
+   same check guards a rollback: history snapshots carry no valves (`models/function_history.py`), so
+   restoring an older version validates today's stored valves against the older code.
+3. **The loader was rewritten** (`utils/plugin.py`). Module names are `function_<id>_<uuid>`, the module
+   is popped from `sys.modules` in `finally` and re-registered (`set_function_module_in_cache`) only
+   after a successful load; `replace_imports` no longer writes the rewritten source back to the DB; the
+   force-deactivate on a load error moved from the loader to `get_function_module_from_cache`.
+4. **`ENABLE_FUNCTIONS` gates filters**, `ENABLE_PLUGINS` stays the master switch over it,
+   `ENABLE_TOOLS` and `ENABLE_TOOL_SERVERS` (`env.py`: `ENABLE_FUNCTIONS = ENABLE_PLUGINS and …`).
+5. **`__model__["info"]["params"]` is no longer deleted** but replaced by `public_model_params()`:
+   only `model_controls` survives (the new "Model controls" knobs: each control's `label`,
+   `description`, `default`, `display` and its options' labels), or `{}`. Generation
+   params (`num_ctx`, temperature, system prompt) stay hidden from filters.
+6. **orjson is the default JSON codec** (`ENABLE_ORJSON=True`, `utils/json_codec.py`). Anything orjson
+   refuses (non-str keys, oversized ints) falls back to the stdlib codec, so event payloads are safe.
+7. **Shared chats can take replies.** `status`, `source`/`citation`, `files` and a filtered
+   `chat:completion` (incl. `usage`, `finish_reason`) are re-broadcast live to the `chat:{chat_id}` room,
+   so every participant sees the stats line and the debug citation as it is emitted.
+8. **Context compaction now also runs between tool rounds** (`middleware.py` tool loop →
+   `compact_messages_for_request`). The summary is a separate task call (no filters, not merged into the
+   reply's `usage`); later rounds send a shorter prompt, so the last-round `prompt_tokens` read by `📐`
+   reflects the compacted window. The server persists a checkpoint only at a user-message boundary
+   (`recent_messages[0].get('role') == 'user'`), so a mid-turn compaction leaves none in the DB.
+9. **Realtime voice calls** hand real questions to the chat model through the normal `submitHandler`
+   (filters run); the voice model's own small-talk replies never reach the pipeline.
+10. Unchanged and re-checked: `merge_usage`/`normalize_usage`, `get_message_list`, the `info` mirror,
+    `Chats.add_message_status_to_chat_by_id_and_message_id` (append-only `statusHistory`), the `TASKS`
+    enum (9), `apply_params_to_form_data` before inlet, `get_openai_connection(idx)` and the listing row
+    (`{**model, 'openai': model, 'urlIdx': idx}`), the `status_updates`/`citations` render gates and
+    `line-clamp-1`. Pins: pydantic `2.13.4` (unchanged), aiohttp `3.13.5 → 3.14.3`.
 
 ## What changed since v0.10.2 (plugin-relevant)
 
@@ -57,8 +114,10 @@ The five things a maintainer must know before touching token/context/UX code:
   `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` or `OFFLINE_MODE` is set, and it only runs on
   the code path where `content` is passed in explicitly (save/preview), not on a DB reload.
   `get_function_module_from_cache:375` caches modules per app state; the `stream` hook uses
-  cache-only loads for performance. **The whole module is inert when `ENABLE_PLUGINS=false`** —
-  `load_function_module_by_id` raises and `process_filter_functions` returns the body untouched.
+  cache-only loads for performance. **The whole module is inert when `ENABLE_PLUGINS=false`**, and
+  since 0.12.0 also when `ENABLE_FUNCTIONS=false` — `load_function_module_by_id` raises and
+  `process_filter_functions` returns the body untouched. 0.12.0 rewrote the loader and added valve
+  validation on save — see "What changed in v0.12.0".
 - `utils/filter.py` — restructured in 0.11 around `resolve_filter_pipeline:56`, which merges global
   filters + the model's `info.meta.filterIds` (`get_model_filter_ids:47`), keeps only filters that
   are active (a `toggle` filter must additionally be enabled for the request), reads
@@ -83,7 +142,7 @@ The five things a maintainer must know before touching token/context/UX code:
 ## Dunder kwargs available to filter hooks
 
 A handler receives only the subset its signature names. Built at `middleware.py:2401-2411` (inlet),
-`:3505-3512` (outlet), `:3766-3774` (stream).
+`:3505-3512` (outlet), `:3766-3774` (stream). Same set in 0.12.0.
 
 | kwarg | inlet | outlet | stream | notes |
 |---|---|---|---|---|
@@ -96,7 +155,9 @@ A handler receives only the subset its signature names. Built at `middleware.py:
 **`__model__` caveats:** raw (non-customized) models have **no `info` key** at all
 (`utils/models.py:34-75`) — always `.get("info") or {}`. `info.params` (temperature, num_ctx, ...)
 is **stripped before filters see the model** (`utils/models.py:180-181, 221-223`, "Remove params to
-avoid exposing sensitive info") — generation params and base URLs are unavailable in outlet.
+avoid exposing sensitive info") — generation params and base URLs are unavailable in outlet. Since
+0.12.0 the key is kept but replaced by `public_model_params()` (only the `model_controls` UI metadata, or `{}`),
+so the generation params are still hidden.
 What *is* visible on a workspace/preset model is `info.meta`, including
 **`info.meta.capabilities`** — the frontend render gates (see below) can therefore be read from
 inside the plugin.
@@ -136,7 +197,7 @@ instead.
 3. `middleware.py:process_chat_payload:2248` — `apply_params_to_form_data:1947` runs **before**
    inlet filters and, for Ollama-owned models, moves the whole params dict into
    `form_data["options"]` (`:1980-1982`), `num_ctx` included. Inlet filters run at `:2513-2525`
-   (guarded by `ENABLE_PLUGINS`). `features` is popped into `extra_params["__features__"]` only
+   (guarded by `ENABLE_PLUGINS`; `ENABLE_FUNCTIONS` since 0.12.0). `features` is popped into `extra_params["__features__"]` only
    *after* inlet (`:2528-2529`).
 4. Provider routers substitute `base_model_id` right before the upstream call
    (`routers/openai.py`, `routers/ollama.py` and siblings) and apply model params. Ollama usage is
@@ -145,7 +206,8 @@ instead.
 5. **Outlet filters run inline** in `middleware.py:outlet_filter_handler:3412`: for a saved chat it
    reloads the message map from the DB, builds the outlet body
    (`{model, messages, chat_id, session_id, id}`, messages carrying `content` — real **or
-   synthesized from `output`** — plus `info`, `output`, `usage`, `sources`, `:3473-3489`), runs
+   synthesized from `output`** — plus `info`, `output`, `usage`, `sources`, `:3473-3489`, and since
+   0.12.0 `finish_reason` on the current message only), runs
    `process_filter_functions(filter_type="outlet")`, persists any message whose content/output the
    filter actually changed (`:3534-3559`, also writing `originalContent`) and emits `chat:outlet`.
    **Unsaved chats (`temporary:`/`local:`/`channel:`, and an empty `chat_id` — raw API requests,

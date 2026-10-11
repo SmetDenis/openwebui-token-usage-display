@@ -5,6 +5,5 @@
 ## Checklist
 
 - [ ] `make pre-commit` passes (ruff + mypy strict + tests, coverage ≥ 95%)
-- [ ] Bumped the `version:` field in the `usage_display.py` docstring (if user-facing)
-- [ ] Added a `CHANGELOG.md` entry (if user-facing)
+- [ ] If `usage_display.py` changed: ran `make bump PART=major|minor|patch` and described the change under the new `CHANGELOG.md` heading (CI fails otherwise; merging publishes the release)
 - [ ] Verified behavior against Open WebUI (note the version tested)

@@ -6,11 +6,11 @@ RUFF := $(RUN) ruff
 MYPY := $(RUN) mypy
 
 HASH := \#
-PY_LINT_TARGETS := usage_display.py tests
+PY_LINT_TARGETS := usage_display.py tests scripts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install-dev lock upgrade test test-cov lint format typecheck pre-commit clean
+.PHONY: help install-dev lock bump release-check upgrade test test-cov lint format typecheck pre-commit clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?$(HASH)$(HASH) .*$$' $(MAKEFILE_LIST) \
@@ -19,8 +19,14 @@ help:  ## Show this help
 install-dev:  ## Create/sync .venv with the exact dev tools from uv.lock
 	uv sync --locked
 
-lock:  ## Re-lock after editing [dependency-groups] in pyproject.toml
+lock:  ## Re-lock after editing [dependency-groups] in pyproject.toml (never for a version bump: use `make bump`)
 	uv lock
+
+bump:  ## Set the next version from the latest release tag in every file: make bump PART=major|minor|patch
+	python3 scripts/release.py bump $(PART)
+
+release-check:  ## Check the version is written the same everywhere and is above every release
+	python3 scripts/release.py check
 
 upgrade:  ## Upgrade every locked dev tool to its latest allowed version
 	uv lock --upgrade

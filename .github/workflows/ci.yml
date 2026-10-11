@@ -17,6 +17,9 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history with tags: the valves-compat and release tests read every release tag.
+          fetch-depth: 0
       # setup-uv publishes no floating major tag, so it is pinned to a release commit.
       # uv's own version comes from `required-version` in pyproject.toml.
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -26,9 +29,37 @@ jobs:
       - run: uv sync --locked
       - name: Lint (ruff)
         run: |
-          uv run --locked ruff check --output-format github usage_display.py tests
-          uv run --locked ruff format --check --output-format github usage_display.py tests
+          uv run --locked ruff check --output-format github usage_display.py tests scripts
+          uv run --locked ruff format --check --output-format github usage_display.py tests scripts
       - name: Type-check (mypy)
         run: uv run --locked mypy
       - name: Tests + coverage
         run: uv run --locked pytest tests --cov --cov-report=term-missing
+
+  # Users paste usage_display.py from main, so every version that reaches main is published at once:
+  # after the whole gate passed, a version without a release tag gets `v<version>` on this exact commit
+  # and a GitHub release (its CHANGELOG section, then GitHub's list of merged PRs). A push that leaves the
+  # version alone (docs, CI, Dependabot) finds the tag and does nothing; a failed run retries on the next.
+  release:
+    needs: gate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Publish a new version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(python3 scripts/release.py pending)"
+          if [ -z "$version" ]; then
+            echo "Version $(python3 scripts/release.py version) is already released."
+            exit 0
+          fi
+          python3 scripts/release.py check
+          gh release create "v$version" --target "$GITHUB_SHA" --title "v$version" \
+            --notes "$(python3 scripts/release.py notes)" --generate-notes

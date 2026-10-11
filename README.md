@@ -42,6 +42,10 @@ tokens when a provider reports no usage; the plugin loads fine without it.
   (Anthropic cache is correctly counted as *additional* to input)
 - **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable). On a response with tool calls (several requests to the model) it shows the last request, while `⬆︎`/`Σ`/cost add up all of them - so `⬆︎` can be far larger than `📐` (Open WebUI 0.11+; on 0.10.x `📐` is the sum too)
 - **Generation time** and **tokens/second**
+- **Truncation marker** (`✂️ truncated`, next to `⬇︎`) - shown only when the model stopped because it hit its
+  output-token limit, so a cut-off answer is not mistaken for a complete one. Needs Open WebUI 0.12.0+ and a
+  Chat Completions (OpenAI-compatible) or Ollama model, or a pipe that passes such a response through. Not
+  shown for the Responses API: Open WebUI passes no stop reason for its streams and a made-up `stop` otherwise
 - **Cost** - the provider's own reported cost when available (OpenRouter, LiteLLM, ...), or an optional estimate from [models.dev](https://models.dev) prices (always marked `≈`); shown per message (`💰`)
   and as a running chat total (`💰Σ`)
 - **Audio** tokens (off by default) and the **base model name** for workspace models
@@ -110,6 +114,10 @@ In `estimate` mode the price is resolved as: your manual **`price_map`** valve �
 Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - Debug info"** source under the message (also mirrored to the server log). Its `cost_debug`, `context_debug`, `model` and
 `valves` blocks name the exact broken link.
 
+- **Nothing shows at all, and `debug_mode` prints nothing to the server log either.** The filter never ran. Check
+  that the function is enabled and either global or attached to the model, and that Functions are not switched
+  off for the whole server: `ENABLE_FUNCTIONS=false` (Open WebUI 0.12.0+) or the master switch
+  `ENABLE_PLUGINS=false` turns every filter off.
 - **Nothing shows below the response, but `debug_mode` prints a full payload with correct tokens to the server log.** The plugin ran fine - Open WebUI is hiding the line. Its frontend renders the status line only when the model's **Status Updates** capability is on, and the debug panel only when
   **Citations** is on (Workspace → Models → *your model* → Capabilities). This hits workspace/"agent"
   models, which store an explicit capability set; plain connection models default to on.
@@ -129,7 +137,10 @@ Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - 
 - The chat totals (`🧮`, `💰Σ`) are summed from each past response's stored usage. Temporary chats (and API
   requests without a chat id) don't pass that history usage to filters, so there both totals equal the
   current message and are hidden.
-- In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn.
+- In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn. The same holds for the truncation marker: it reflects the last request of the turn.
+- In a Realtime voice call (Open WebUI 0.12.0+), the replies the voice model speaks on its own never pass
+  through filters, so they get no stats line; the questions it hands to the chat model are ordinary responses
+  and do.
 - Estimated cost (`≈`) is a ballpark from published models.dev prices, not your invoice. Provider-reported cost (`auto` mode) is exact.
 
 ## Links

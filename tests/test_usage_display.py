@@ -29,9 +29,12 @@ def test_module_loads_and_exposes_filter(usage_display_module: ModuleType) -> No
     assert f.valves.icon_style == "emoji"
     assert f.valves.cost_mode == "auto"
     assert mod._DEFAULT_ORDER[0] == "input"
-    assert len(mod._DEFAULT_ORDER) == 14
+    assert len(mod._DEFAULT_ORDER) == 15
     assert mod._DEFAULT_ORDER.index("tokens_total") == mod._DEFAULT_ORDER.index("total") + 1  # tokens grouped
     assert f.valves.show_cumulative_tokens is True  # on by default, like show_cumulative_cost
+    # the truncation flag sits next to the output count, early enough to survive the one-line clamp
+    assert mod._DEFAULT_ORDER.index("finish") == mod._DEFAULT_ORDER.index("output") + 1
+    assert f.valves.show_finish_reason is True
 
 
 def run_async(coro: Any) -> Any:
@@ -468,8 +471,8 @@ def test_resolve_display_order_is_full_permutation(usage_display_module: ModuleT
     assert mod._resolve_display_order("") == mod._DEFAULT_ORDER  # empty -> default
     resolved = mod._resolve_display_order("cost, model")
     assert resolved[:2] == ["cost", "model"]
-    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all 14, no dupes
-    assert len(resolved) == len(set(resolved)) == 14
+    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all 15, no dupes
+    assert len(resolved) == len(set(resolved)) == 15
 
 
 def test_display_order_debug_provenance(usage_display_module: ModuleType) -> None:
@@ -487,7 +490,7 @@ def valves(usage_display_module: ModuleType) -> Any:
 
 
 def renderer(mod: ModuleType, name: str) -> Callable[..., str | None]:
-    """A `_render_*(stats)` renderer, called here as `r(valves, tokens, timing, ctx, cost, model)`."""
+    """A `_render_*(stats)` renderer, called here as `r(valves, tokens, timing, ctx, cost, model[, finish_reason])`."""
     render = getattr(mod, name)
     return lambda *fields: render(mod._Stats(*fields))
 
@@ -530,7 +533,7 @@ def test_fmt_count_compact_toggle(usage_display_module: ModuleType, valves: Any)
 
 
 # --------------------------------------------------------------------------- #
-# Group A cont. — all 14 stats-line renderers, each individually
+# Group A cont. — all 15 stats-line renderers, each individually
 # --------------------------------------------------------------------------- #
 
 
@@ -550,6 +553,60 @@ def test_render_output(usage_display_module: ModuleType, valves: Any) -> None:
     assert r(valves, make_tokens(output=None), make_timing(), make_ctx(), make_cost(), None) is None
     valves.show_output_tokens = False
     assert r(valves, make_tokens(output=50), make_timing(), make_ctx(), make_cost(), None) is None
+
+
+@pytest.mark.parametrize(
+    ("style", "expected"), [("emoji", "✂️ truncated"), ("simple", "✂︎ truncated"), ("off", "truncated")]
+)
+def test_render_finish_flags_only_length(
+    usage_display_module: ModuleType, valves: Any, style: str, expected: str
+) -> None:
+    r = renderer(usage_display_module, "_render_finish")
+    valves.icon_style = style
+    bags = (make_tokens(), make_timing(), make_ctx(), make_cost(), None)
+    assert r(valves, *bags, "length") == expected
+    # the normal stop, a turn paused on a tool call, a filter stop and "unknown" (no value) all stay silent
+    for reason in ("stop", "tool_calls", "content_filter", None):
+        assert r(valves, *bags, reason) is None
+    assert r(valves, *bags) is None  # _Stats default: OWUI < 0.12 sends no finish_reason
+    valves.show_finish_reason = False
+    assert r(valves, *bags, "length") is None
+
+
+def test_outlet_flags_truncated_response_next_to_output(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OWUI 0.12.0+ puts `finish_reason` on the current outlet message (last model call of the turn)."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    cut = make_message("partial answer", usage=make_usage(output_tokens=4096))
+    cut["finish_reason"] = "length"
+    emitter = CapturingEmitter()
+    run_async(f.outlet(make_body([cut], model="gpt-4o"), __event_emitter__=emitter, __model__=make_model_dict()))
+    assert "⬇︎ 4,096 · ✂️ truncated · Σ" in emitter.statuses()[0]["data"]["description"]
+
+    for finish in ("stop", 4096):  # a normal end, and a malformed non-string value
+        msg = make_message("answer", usage=make_usage())
+        msg["finish_reason"] = finish
+        emitter = CapturingEmitter()
+        run_async(f.outlet(make_body([msg], model="gpt-4o"), __event_emitter__=emitter, __model__=make_model_dict()))
+        assert "truncated" not in emitter.statuses()[0]["data"]["description"]
+
+
+def test_outlet_debug_payload_reports_finish_reason(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    f.valves.debug_mode = True
+    for finish, expected in (("tool_calls", '"finish_reason": "tool_calls"'), (None, '"finish_reason": null')):
+        msg = make_message("answer", usage=make_usage())
+        if finish is not None:
+            msg["finish_reason"] = finish
+        emitter = CapturingEmitter()
+        run_async(f.outlet(make_body([msg], model="gpt-4o"), __event_emitter__=emitter, __model__=make_model_dict()))
+        citation = next(e for e in emitter.events if e.get("type") == "citation")
+        assert expected in citation["data"]["document"][0]
 
 
 def test_render_total(usage_display_module: ModuleType, valves: Any) -> None:

@@ -33,7 +33,8 @@ and listed in the official Open WebUI docs Community Plugins catalog
 - Plugin internals — pipeline, valves, resolution chains, token/cache semantics, debug payload,
   edge-case catalog with covering tests: @docs/plugin-internals.md
 - Open WebUI source map — filter machinery, request lifecycle, usage normalization, persistence,
-  events, frontend constraints (verified against v0.11.1): @docs/owui-map.md
+  events, frontend constraints (verified against v0.11.1, diff-checked through v0.12.0):
+  @docs/owui-map.md
 
 ## Commands
 
@@ -45,7 +46,9 @@ lock is stale, so local runs and CI use identical ruff/mypy/pytest versions. The
 ```bash
 make install-dev                           # one-time setup: uv sync --locked (creates .venv)
 make pre-commit                            # the full gate: lint + typecheck + test-cov
-make lock        # re-lock after editing [dependency-groups]
+make bump PART=minor  # next version from the latest release tag, written everywhere (major|minor|patch)
+make release-check    # the version rules CI enforces (also part of the test suite)
+make lock        # re-lock after editing [dependency-groups] (never for a version bump)
 make upgrade     # bump every locked tool to its latest allowed version (then run the gate)
 make lint        # ruff check + ruff format --check
 make format      # ruff format + ruff check --fix (auto-fix)
@@ -55,29 +58,48 @@ make test-cov    # pytest with coverage (term-missing + HTML in htmlcov/)
 ```
 
 `make pre-commit` must be green before any change is done. It enforces **mypy strict** and a
-**coverage floor of 95%** (`pyproject.toml` `fail_under = 95`). CI (`.github/workflows/ci.yml`,
-single `gate` job) runs the same gate across Python 3.11–3.14 on pushes to `main` and all PRs,
-installing tools with `astral-sh/setup-uv` (pinned by commit SHA — it publishes no floating major
-tag) and `uv sync --locked`.
+**coverage floor of 95%** (`pyproject.toml` `fail_under = 95`). CI (`.github/workflows/ci.yml`:
+a `gate` job, then a `release` job on `main` — see "Releasing a change") runs the same gate across
+Python 3.11–3.14 on pushes to `main` and all PRs, installing tools with `astral-sh/setup-uv` (pinned
+by commit SHA — it publishes no floating major tag) and `uv sync --locked`.
 
 Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_render_input`
 (or `-k <substring>`). The suite has no network and no Open WebUI runtime — it is fast.
 
 ## Releasing a change
 
-- The version has a **single source of truth**: the `version:` field in the `usage_display.py`
-  module docstring. When bumping it, mirror it in `pyproject.toml` `version` and add a matching
-  top entry in `CHANGELOG.md`. (`required_open_webui_version: 0.9.0` in the same docstring is the
-  compat floor; native provider cost needs 0.10.0+.)
-- **Tag each release `vX.Y.Z`** matching the CHANGELOG entry (existing convention: `v2.0.0` …
-  `v2.6.0`); there is no automated release workflow — tagging is manual.
-- **Do not reuse a published version number.** `v2.6.0` was re-cut on 2026-09-15 (owner's choice): the
-  original `v2.6.0` and `v2.6.1` releases of 2026-09-14 were deleted and the unreleased 2.7.0/2.8.0 work
-  folded into one `v2.6.0`. Accepted cost: two different builds carried `2.6.0`, so users who pasted the
-  first one see no version change. Going forward, cut a new version instead. A number that only sat in
-  `main` (never tagged or released) counts as unused: `2.7.0` was in `main` for ~7 hours on 2026-09-15
-  (and `2.8.0` for minutes) before that re-cut, and the owner still cut the issue #26 fix as `2.7.0`
-  (2026-10-10) — no release had carried it, so no installed build could hide the update.
+**Every merge to `main` that changes `usage_display.py` is a release** (users paste the file from
+`main`, so `main` must always equal a published version). The number is never a judgment call:
+
+- **Pick the part, not the number:** `make bump PART=major|minor|patch` counts from the latest release
+  tag and writes the version into all four places — the docstring `version:` (the single source of
+  truth), `pyproject.toml`, the `uv.lock` project line, and a new top `## [X.Y.Z]` in `CHANGELOG.md`
+  (an unreleased top section is renumbered instead). Rerunning it is safe. Never bump with `make lock`:
+  a newer uv also rewrites the lock's `revision`, which Dependabot's older uv may not read.
+- **Semver part:** `major` breaks an install (raises `required_open_webui_version`, removes a metric or
+  valve, changes a default incompatibly); `minor` adds a metric, valve or capability; `patch` is a fix or
+  any other edit inside `usage_display.py`, comments included. A change that leaves the file untouched
+  (docs, CI, tests, Dependabot) is not a release and keeps the version.
+- **CI enforces it** (`scripts/release.py check`, run by `tests/test_release.py` in the gate): the four
+  places agree, the CHANGELOG section is not empty, and a plugin that differs from its tagged release
+  carries a version above every release tag. A forgotten bump, or a number another branch released
+  first, fails before merge — fix it with `make bump`.
+- **CI publishes it:** the `release` job in `ci.yml` (after the whole gate, on pushes to `main`) creates
+  tag `vX.Y.Z` on that exact commit and a GitHub release whose text is the CHANGELOG section followed by
+  GitHub's list of merged PRs. Never create tags or releases by hand. The bare `2.7.0` tag (made by hand
+  in the GitHub UI) is tolerated; every later one is `vX.Y.Z`.
+- **A number exists only once it is tagged**, and a tagged number is never reused. (History: `v2.6.0`
+  was re-cut on 2026-09-15 over deleted `v2.6.0`/`v2.6.1` builds — the confusion this flow exists to
+  prevent.) Rationale and rejected alternatives: `CONTRIBUTING.md` → "Release flow decisions".
+- `required_open_webui_version: 0.9.0` in the docstring is the compat floor; native provider cost needs
+  0.10.0+.
+- **Never narrow a valve.** Since OWUI 0.12.0, saving new function code validates the admin's stored
+  valves against the new `Valves` and refuses the save (HTTP 400) on any error but "missing" — so a
+  narrowed `Literal`, a changed field type, a tighter constraint or `extra="forbid"` would stop every
+  existing install from updating. Adding or removing a valve is safe. The same check guards a rollback
+  (restoring or pasting older code), so a value a newer release newly allows blocks going back once an admin
+  picks it. `tests/test_valves_compat.py` checks every release tag against the current `Valves`; rationale in
+  `docs/plugin-internals.md` → Valves.
 - The community-store post text is maintained in `docs/community-post.md`; publishing to the store
   post (URL above) is a manual copy-paste done by the user.
 
@@ -90,12 +112,12 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 - Config is two Pydantic models: `Valves` (admin — all toggles, ordering, cost/context maps and
   URLs) and `UserValves` (per-user `enabled` kill-switch only; per-user customization was
   deliberately rolled back).
-- The stats line is a dispatch table (`_STATS_RENDERERS`, 14 metric keys, every renderer takes one
+- The stats line is a dispatch table (`_STATS_RENDERERS`, 15 metric keys, every renderer takes one
   frozen `_Stats` object). Key rule: **`show_*` valves gate visibility; `display_order` only sorts.**
 - Context, price and model identity resolve through priority-ordered fallback chains
   (short-circuit on first hit); table lookups use longest-key case-insensitive substring match.
   Workspace/"agent" models resolve via **`base_model_id`**.
-- The **NOTE block** at `usage_display.py:14-46` is the source-verified contract with OWUI's data
+- The **NOTE block** at `usage_display.py:14-56` is the source-verified contract with OWUI's data
   model. Reconcile any token/cost/context change against it — and re-verify it against real OWUI
   source for the targeted version.
 - Live network access (models.dev context/prices, llama.cpp probe) is opt-in via valves and
@@ -108,10 +130,15 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (226 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (231 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
-and `make_*` builders live at the top of the test file). `pydantic` is pinned (`==`) in the `dev`
-dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.11.4), so the plugin
+and `make_*` builders live at the top of the test file). The only outside state any test reads is git:
+`tests/test_valves_compat.py` (4 tests) loads every release tag's `usage_display.py`, and
+`tests/test_release.py` (8 tests) checks the release rules of `scripts/release.py` against the tags and
+on a throwaway repository — which is why CI checks out with `fetch-depth: 0`. Both get the tags from the
+`release_tags` fixture in `tests/conftest.py`: without tags it fails in CI and skips locally — run
+`git fetch --tags` in a clone that lacks the newest release tag. `pydantic` is pinned (`==`) in the `dev`
+dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.12.0), so the plugin
 is tested against the same pydantic it runs on in production — keep that pin tracking OWUI's, and
 don't merge a Dependabot bump that drifts it (Dependabot runs weekly for the `uv` and
 `github-actions` ecosystems).
