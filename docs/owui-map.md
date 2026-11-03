@@ -8,9 +8,58 @@ that constrain the plugin's UX. Paths are relative to the Open WebUI repo root.
 (released 2026-08-25): none of the mechanisms below changed in `v0.11.1` — its backend diff touches
 Socket.IO Redis locks/heartbeats, model tag normalization and error constants only. A diff check of
 `v0.11.4...v0.12.0` (released 2026-10-10) re-walked every mechanism below; what moved is listed
-under "What changed in v0.12.0", and the line numbers cited elsewhere are still those of v0.11.0.
+under "What changed in v0.12.0", and the line numbers cited elsewhere are still those of v0.11.0. A
+`v0.12.0...v0.12.5` diff (released 2026-10-29, so it covers 0.12.1-0.12.4 too) re-checked the files the
+plugin reads; what moved is under "What changed in v0.12.1-v0.12.5".
 OWUI internals shift between versions — before relying on any claim, re-check it against a current
 checkout (the local clone path and freshness-check commands live in `CLAUDE.local.md`).
+
+## What changed in v0.12.1-v0.12.5 (plugin-relevant)
+
+Checked against `v0.12.0...v0.12.5` (2026-11-03) in `utils/response.py`, `utils/middleware.py`,
+`routers/openai.py`, `socket/main.py`, `utils/misc.py`, `models/chat_messages.py` and the status/response
+components; the release each item first appears in is given. `utils/filter.py`, `utils/plugin.py` and
+`utils/valves.py` did not change.
+
+1. **Anthropic cache is summed across model calls (0.12.5).** `USAGE_TOKEN_KEYS` now holds
+   `cache_read_input_tokens` and `cache_creation_input_tokens` (`utils/response.py:48-54`), so on a tool
+   turn they cover every round, like `input_tokens`. **This breaks an assumption of the plugin's `📐`**:
+   `_last_round_context` adds Anthropic-native cache back to the last round's `prompt + completion`,
+   expecting last-round cache — on 0.12.5 it adds the whole turn's cache and over-counts. Known gap, not
+   fixed yet. `Σ`, `🧮` and the cost estimate become consistent (summed input with summed cache).
+2. **Usage within one model call is a snapshot (0.12.5).** New `update_usage_snapshot`
+   (`utils/response.py:149-157`) overlays repeated usage chunks of one provider call and recomputes
+   `total_tokens = input + output`; `merge_usage` now runs only across calls (`middleware.py:4914-4917,
+   4959-4960`; `update_assistant_message_from_stream:3476,3482`). In 0.12.0 every usage/timings chunk went
+   through `merge_usage`, so a stream that repeated usage was over-counted; numbers can be lower now.
+3. **The normalized triple is no longer guaranteed (0.12.5).** `normalize_usage` (`:21-47`) keeps measured
+   zero apart from missing: an input/output/total counter with no valid source is left out instead of
+   becoming 0, and `usage_counter` (`:11-18`) drops bool, negative and non-integer values (also from
+   `prompt_tokens`/`completion_tokens`). `merge_usage` sets `incomplete: True` when a call lacked input or
+   output (`:117-123`), and a streamed call that reported no usage leaves `usage = {'incomplete': True}`
+   (`middleware.py:5603`) — a truthy dict without counters, on the current message and persisted on past
+   ones. The plugin reads it as "no usage" (tiktoken estimate, skipped by the chat totals). OWUI's own usage
+   tooltip hides such a usage too (`ResponseMessage.svelte:1208`).
+4. **`prompt_tokens`/`completion_tokens` come from the incoming call's `input_tokens`/`output_tokens`**
+   (`:141-144`), and only when that key is present — still the latest call's size.
+5. **Persisted usage is the caller's snapshot (0.12.5).** `models/chat_messages.py:_apply` stores the
+   incoming usage as given (`:279-281`) instead of merging it with the stored one; it is normalized on save.
+6. **A context-compaction marker in `output` (0.12.1).** When compaction runs between tool rounds,
+   `{'type': 'open_webui:context_compaction', 'id', 'call_id', 'summary'}` is appended to the message's
+   `output` (`middleware.py:6046`), so the turn's persisted `output` records it. `get_output_text` reads only
+   `type == "message"` items, and so does the plugin's text walk.
+7. **The status line wraps when expanded (0.12.4).** `StatusItem.svelte` takes a `clamp` prop (default
+   true): `StatusHistory.svelte` passes `clamp={!showHistory || history.length > 1}` to the top item and
+   `clamp={false}` to the expanded list, so collapsed it is still one line, expanded it shows in full. Still
+   plain text.
+8. Unchanged and re-checked: `outlet_filter_handler` (byte-identical; body shape, `finish_reason` on the
+   current message, saved vs unsaved history, dunder kwargs), end-of-stream order (`chat:completion` done →
+   outlet → `background_tasks_handler`, `:6371-6387`), `USAGE_COST_KEYS` and the deep-summed
+   `*_tokens_details`, last-wins durations/timings and `cost_details`, `get_openai_connection(idx)` and the
+   listing row (`routers/openai.py:255-260, 750-761`), the `info` mirror (`chat_messages.py:440-441`),
+   append-only `statusHistory` and the `citation` persistence rule (`socket/main.py:1680-1684, 1749-1764`),
+   `get_output_text`, the `status_updates`/`citations` render gates (`ResponseMessage.svelte:727, 944`).
+   Pins: pydantic `2.13.4` (unchanged), aiohttp `3.14.3 → 3.14.5`.
 
 ## What changed in v0.12.0 (plugin-relevant)
 
@@ -58,7 +107,8 @@ Checked file by file against `v0.11.4...v0.12.0` (2026-10). Nothing here breaks 
    `compact_messages_for_request`). The summary is a separate task call (no filters, not merged into the
    reply's `usage`); later rounds send a shorter prompt, so the last-round `prompt_tokens` read by `📐`
    reflects the compacted window. The server persists a checkpoint only at a user-message boundary
-   (`recent_messages[0].get('role') == 'user'`), so a mid-turn compaction leaves none in the DB.
+   (`recent_messages[0].get('role') == 'user'`), so a mid-turn compaction leaves none in the DB. Since
+   0.12.1 the turn's `output` carries an `open_webui:context_compaction` marker instead (see above).
 9. **Realtime voice calls** hand real questions to the chat model through the normal `submitHandler`
    (filters run); the voice model's own small-talk replies never reach the pipeline.
 10. Unchanged and re-checked: `merge_usage`/`normalize_usage`, `get_message_list`, the `info` mirror,
@@ -181,6 +231,18 @@ so `__model__["openai"]["id"]` carries the prefix too; `utils/model_ids.py:strip
 OWUI removes it. A connection with manual `model_ids` lists `{'id', 'name', 'owned_by': 'openai', 'openai': {'id'}}`
 only — no upstream row. Checked in v0.11.3 and v0.10.0/v0.9.6.
 
+**`__user__` is `user.model_dump()`** (`middleware.py`, every filter call site), or `{}` when the request
+has no `UserModel`. Its `role` is a plain string — `admin`, `user` or `pending` (`models/users.py`) — so a
+filter can tell admins apart (the v2.9.0 balance is admin-only by default). `__user__["valves"]` holds the
+`UserValves` instance. Checked in v0.12.5.
+
+**Valve form inputs.** A valve declared with `json_schema_extra={"input": {"type": "password"}}` renders as a
+masked `SensitiveInput` (`src/lib/components/common/Valves.svelte`, since v0.8.0); `select`, `multiselect`,
+`range`, `color` and `map` exist too. `resolve_valves_schema_options` (`utils/plugin.py`) rewrites only
+`input.options`. Masking is UI-only: `GET /functions/id/{id}/valves` (admin) returns the decrypted values,
+and valves are encrypted at rest with a Fernet key derived from `WEBUI_SECRET_KEY` (`utils/valves.py`).
+Checked in v0.12.5.
+
 **`__metadata__` is sensitive:** it carries `user_message` (the raw prompt), `user_id`,
 `user_agent`, `session_id`, `chat_id`, `variables`, `chat_variables`, `files`, and the full `model`
 dict (`main.py:1180-1209`). Never dump it raw into anything user-shareable — whitelist fields
@@ -217,6 +279,10 @@ instead.
    current message. Saved chats walk the active branch via `utils/misc.py:get_message_list`
    (parentId chain up to `message_id`). Verified in v0.11.0 and v0.11.3
    (`outlet_filter_handler`, `is_unsaved_chat`).
+   At end of stream the `chat:completion` done event (reply, usage) is emitted **before**
+   `outlet_filter_handler`, and `background_tasks_handler` (title, tags, follow-ups) runs **after** it — so
+   a network call in an outlet filter delays only the status line and those background tasks, not the reply
+   (checked in v0.12.5, `middleware.py:6371-6387`).
    Called from both the non-streaming handler (`:3703`) and end-of-stream (`:5551`); the raw-API
    path is gated by `ENABLE_API_OUTLET_FILTERS` (`:3735`, default on).
    `POST /api/chat/completed` still exists (`main.py:1976` → `utils/chat.py:chat_completed:313`,
@@ -241,20 +307,25 @@ instead.
 
 ## Usage normalization (`utils/response.py`)
 
-- `normalize_usage:14` — always derives `input_tokens`/`output_tokens`/`total_tokens` (from
+- `normalize_usage:14` — derives `input_tokens`/`output_tokens`/`total_tokens` (from
   `prompt_tokens`/`completion_tokens`, Ollama `prompt_eval_count`/`eval_count`, llama.cpp
-  `prompt_n`/`predicted_n`), **preserving** all original provider keys alongside.
+  `prompt_n`/`predicted_n`), **preserving** all original provider keys alongside. Through 0.12.4 always
+  (a missing counter became 0); since 0.12.5 only from a valid counter, else the key is left out (see
+  "What changed in v0.12.1-v0.12.5").
 - `merge_usage:105` — multi-round tool turns: sums `USAGE_SUMMABLE_KEYS` = `USAGE_TOKEN_KEYS:55`
   ∪ `USAGE_COST_KEYS:61` (`cost, total_cost, input_cost, output_cost, prompt_cost, completion_cost`
   — how proxy-reported cost survives normalization) and deep-sums the four `USAGE_DETAIL_KEYS:72`
-  `*_tokens_details` dicts. Top-level Anthropic cache fields and Ollama duration fields are in none
-  of those sets → **last round wins** for cache/timing. This is the OWUI limitation the plugin
-  documents rather than fixes. Since **0.11.0** (`df94268e8`) the merge then rewrites
+  `*_tokens_details` dicts. Ollama duration fields (and, through 0.12.4, the top-level Anthropic cache
+  fields) are in none of those sets → **last round wins** for timing (and, before 0.12.5, cache). This is
+  the OWUI limitation the plugin documents rather than fixes. Since 0.12.5 the two Anthropic cache fields
+  are in `USAGE_TOKEN_KEYS` and summed. Since **0.11.0** (`df94268e8`) the merge then rewrites
   `prompt_tokens`/`completion_tokens` from the incoming round (`incoming.prompt_tokens or
   incoming.input_tokens or current.prompt_tokens`, same for completion) — the only per-request numbers
   left after a tool turn, read by the plugin's `📐` and by OWUI's own `context_compaction`. On **0.10.x**
-  both were in `USAGE_TOKEN_KEYS` and summed. `merge_usage` also runs per streaming chunk that carries
-  `usage` or llama.cpp `timings`, not only per round. Checked in v0.11.4 and v0.10.2.
+  both were in `USAGE_TOKEN_KEYS` and summed. Through 0.12.4 `merge_usage` also ran per streaming chunk
+  that carries `usage` or llama.cpp `timings`, not only per round; since 0.12.5 chunks of one call are
+  overlaid by `update_usage_snapshot` and `merge_usage` runs only across calls. Checked in v0.11.4 and
+  v0.10.2; the 0.12.5 changes against v0.12.5.
 
 ## Events (`socket/main.py`)
 
@@ -326,9 +397,11 @@ now verifies the target session belongs to the requesting user.
   `workspace/Models/Capabilities.svelte:50`. The gates date back to v0.6.27, not to 0.11.
 - `Chat.svelte:chatEventHandler:949` — `status` pushes onto `message.statusHistory` (`:967-972`);
   `chat:completion` sets `message.usage` (`chatCompletionEventHandler:2377`, `:2431-2432`).
-- `Messages/ResponseMessage/StatusHistory/StatusItem.svelte` — status text renders plain-text with
-  a hardcoded `line-clamp-1` in every branch, inside a `<button>` that toggles the history →
-  **multi-line / markdown / conveniently-copyable debug output in the status line is impossible**.
+- `Messages/ResponseMessage/StatusHistory/StatusItem.svelte` — status text renders plain-text,
+  `line-clamp-1` when collapsed, inside a `<button>` that toggles the history → **multi-line / markdown /
+  conveniently-copyable debug output in the status line is impossible**. Through 0.12.3 the clamp was
+  hardcoded in every branch; since 0.12.4 a plain description is clamped only collapsed (the `clamp` prop)
+  and wraps in the expanded history — still plain text, and the collapsed line still cuts the right end.
 - `ContentRenderer.svelte:282-302` — `output` wins; `content` renders **only when `output` is
   empty**. On 0.10.x/0.11.x responses `output` is non-empty → appending debug text to `content` is
   invisible.

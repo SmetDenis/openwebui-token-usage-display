@@ -8,7 +8,7 @@ Community page, comments and feedback: https://openwebui.com/posts/token_usage_d
 
 ## Description
 
-Shows token counts, reasoning/cached breakdowns, context-window utilization, generation time, tokens/sec, a truncation marker when a response hits its output-token limit, and message/chat cost below each AI response. Reads provider-reported usage across OpenAI (Chat & Responses API), Anthropic, Gemini, Ollama and llama.cpp, with an optional tiktoken fallback. Cost is shown when your provider/proxy reports it (OpenRouter, LiteLLM) and can optionally be estimated from models.dev prices.
+Shows token counts, reasoning/cached breakdowns, context-window utilization, generation time, tokens/sec, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter balance below each AI response. Reads provider-reported usage across OpenAI (Chat & Responses API), Anthropic, Gemini, Ollama and llama.cpp, with an optional tiktoken fallback. Cost is shown when your provider/proxy reports it (OpenRouter, LiteLLM) and can optionally be estimated from models.dev prices.
 
 ---
 
@@ -28,6 +28,7 @@ Shows token counts, reasoning/cached breakdowns, context-window utilization, gen
 - **Generation time** and **tokens/second**
 - **Truncation marker** (`✂️ truncated`, next to `⬇︎`) - shown only when the model stopped because it hit its output-token limit, so a cut-off answer is not mistaken for a complete one (Open WebUI 0.12.0+; Chat Completions / OpenAI-compatible and Ollama models, not the Responses API)
 - **Cost** - the cost of the message and a running total for the chat: the provider's own reported cost when available (OpenRouter, LiteLLM, ...), or an optional estimate from models.dev prices (always marked `≈`)
+- **OpenRouter balance** (`💳`, off by default) - what is left on your OpenRouter account, asked from OpenRouter after each response (see below)
 - **Audio** tokens (off by default) and the **base model name** for workspace models
 
 **Example output:**
@@ -82,14 +83,25 @@ Both the **message** cost (`💰`) and a running **chat total** (`💰Σ`) are s
 
 What no client-side display can capture is a surcharge the provider charges *on top of* tokens and does **not** put into `usage.cost`. The main example is a gateway's **own server-side** web search / tools - OpenRouter's `web` plugin / `openrouter:web_search`, the `:online` suffix - which add a per-request fee; a BYOK search engine (e.g. Firecrawl) is billed entirely outside the generation. When such a surcharge is folded into the response's `usage.cost`, it's shown; when the provider bills it separately (BYOK, or only on your Activity page), it isn't. Turn on `debug_mode` to see a `web_search` hint (did the response carry web citations?) and the provider's `cost_details` split under `cost_debug`.
 
+### OpenRouter balance
+
+Turn on **`show_balance`** to see the remaining OpenRouter account balance (`💳 $17.05`, or `-$3.10` below zero) right after the chat cost - the account's `total_credits - total_usage` from OpenRouter's `GET /api/v1/credits`.
+
+- **No key to configure** for a model served through an Open WebUI connection to `openrouter.ai`: the plugin reuses that connection's key and sends it to `https://openrouter.ai/api/v1/credits` and nowhere else. Models on other connections are never asked about. Only a bearer-auth connection has a key to reuse; for a session/OAuth one, set `openrouter_api_key`.
+- **`openrouter_api_key`** - an optional key that replaces the connection's. An ordinary API key is enough: OpenRouter's docs say a management key is required, but any key of the account gets the same numbers (checked 2026-11-03). Don't use a management key - it can create and delete every key on the account. **Valves are not a safe place for a key**: the field is masked on screen, but every Open WebUI admin can read it back and any other function or tool on the server can read it. Use it at your own risk.
+- **Admins only by default** - it is the account owner's money, and the stats line stays in the chat history and in shared chats. `balance_for_all_users` shows it to everyone.
+- **OpenRouter behind a proxy** (e.g. LiteLLM): set `openrouter_api_key` and `balance_on_every_model`; the balance then appears under every model's responses.
+- **Asked on every response, not cached**, so consecutive messages never show a frozen number; the stats line waits for it (up to 2 s). OpenRouter settles a charge shortly after a response ends, so the balance may not include the message it is shown under yet.
+
 ### Configuration
 
 - Every metric can be toggled on/off via admin **Valves**.
 - Users can disable the display entirely through **UserValves**.
-- **Metric order is configurable** via the admin `display_order` valve (comma-separated keys: `input, output, finish, total, tokens_total, reasoning, cached, audio, context, time, tps, cost, cost_total, model, source`). The field comes **pre-filled with the default order** — just reorder or trim it (empty also means default). It only *reorders*: visibility stays governed by the `show_*` toggles, so removing a key does **not** hide it — the metric just moves to the end, like any enabled-but-unlisted one.
+- **Metric order is configurable** via the admin `display_order` valve (comma-separated keys: `input, output, finish, total, tokens_total, reasoning, cached, audio, context, time, tps, cost, cost_total, balance, model, source`). The field comes **pre-filled with the default order** — just reorder or trim it (empty also means default). It only *reorders*: visibility stays governed by the `show_*` toggles, so removing a key does **not** hide it — the metric just moves to the end, like any enabled-but-unlisted one.
 - **Line appearance is configurable** (admin): `separator` (string between items, default ` · `), `icon_style` (`emoji` default / `simple` monochrome unicode / `off` bare values), and `compact_numbers` (abbreviate the seven token counters as `k`/`M`, e.g. `12,345 → 12.3k`, matching the context style).
 - Context detection is configurable: manual size override, a custom `{"model-substring": tokens}` map, the live models.dev fetch toggle, and optional llama.cpp / llama-swap URLs.
 - Cost is configurable: `cost_mode` (`off` / `auto` / `estimate`), a running chat-total toggle, a `cost_min_display` threshold that hides negligible amounts (default `0.0` shows everything), a manual `price_map`, and the live models.dev price-fetch toggle.
+- OpenRouter balance: `show_balance`, `openrouter_api_key`, `balance_for_all_users`, `balance_on_every_model` (see above).
 - Audio tokens are off by default since few models use them.
 
 ### Troubleshooting
@@ -111,6 +123,9 @@ The backend did not advertise its running window. Behind llama-swap or a llama.c
 **Context % is missing or wrong** (`context_debug.matched_key: null`, `size: null`).
 Same id-matching problem, for the context table. Add a `context_size_map` (e.g. `{"anthropic - opus": 1000000}`), enable the `fetch_context_from_modelsdev` valve, or use a canonical id. For a **workspace/custom model** matching uses its `base_model_id` (since v2.5.0), so key any map on the **base** model, not the agent id. Note: a connection `prefix_id` (which prepends `prefix.`) does **not** break matching — the original slug is still a substring; only a rename that alters the model-family token (e.g. `claude-opus-4.8` vs a `claude-opus-4-8` table key) does.
 
+**`show_balance` is on but no `💳`** (`balance.status` in the debug payload).
+`admins_only` - you are not an admin (see `balance_for_all_users`); `not_openrouter` - the model's connection is not `openrouter.ai` (behind a proxy, set `openrouter_api_key` and `balance_on_every_model`); `no_key` - the connection has no bearer key and `openrouter_api_key` is empty; `error <code>: <message>` - OpenRouter's own refusal. `balance.key_source` shows which key was used; the key itself is never in the payload.
+
 **Anthropic cost or token totals look roughly doubled behind a proxy.**
 Fixed in **v2.2.0** — upgrade. Some proxies (LiteLLM) fold Anthropic's cache tokens into `prompt_tokens` while still reporting the top-level cache fields, and older versions counted them twice.
 
@@ -119,6 +134,7 @@ Fixed in **v2.2.0** — upgrade. Some proxies (LiteLLM) fold Anthropic's cache t
 ### Notes & limitations
 
 - For providers that **don't** report a generation duration (OpenAI, Anthropic), time and t/s are measured as wall-clock and marked `~`; with web search / RAG / tool calls enabled, that figure includes the pre-model work. Local providers (Ollama, llama.cpp) report real generation time and are unaffected.
+- On Open WebUI 0.12.5, a response with tool calls from an Anthropic model reached natively (not through a proxy like LiteLLM) shows too high a context window `📐`: Open WebUI now adds up Anthropic's cache over all requests of the turn, and `📐` counts the earlier requests' cache too. A fix will follow.
 - In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn. The truncation marker likewise reflects the last request of the turn.
 - In a Realtime voice call (Open WebUI 0.12.0+), replies the voice model speaks on its own never pass through filters, so they get no stats line; questions it hands to the chat model are ordinary responses and do.
 - Estimated cost (`≈`) is a ballpark from published models.dev prices, not your invoice; long-context tier pricing isn't modelled and, when the model can't be mapped to a provider, no estimate is shown. Provider-reported cost (`auto` mode) is exact.
