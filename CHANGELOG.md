@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.9.1]
+
+Fixes from an independent re-check against Open WebUI 0.12.5 ([#38](https://github.com/SmetDenis/openwebui-token-usage-display/issues/38)). No valve was added or removed and none changed its type or default (two descriptions were corrected), so the update saves over any 2.x install, and rolling back stays possible.
+
+- **Fixed: doubled token counts and cost on a cache-write-only response behind a proxy.** When a proxy such as LiteLLM reported `cached_tokens: 0` together with Anthropic's `cache_creation_input_tokens`, the plugin took the response for a native Anthropic one and added the cache write on top of an input that already contained it: `Σ`, `📐` and the estimated cost (`≈`) came out about twice too high. A reported zero now counts as reported.
+- **No more wasted requests where the line cannot be shown.** For an API call without a chat (no `chat_id`) Open WebUI gives the plugin no way to show anything, and in a channel it drops the plugin's status line and debug source. The plugin used to work out context, cost and balance there anyway - up to 2 s per network lookup, which on a non-streaming API call delayed the response itself. It now stops right away; in a channel, `debug_mode` still writes the payload to the server log.
+- **Arena models are left as they are, on purpose.** Under an arena response the line keeps the arena's name and shows no context window or price: the model Open WebUI picked is known to the plugin, but showing it (or its window and price, which give it away) would break the blind comparison.
+- `debug_mode`: a model on a connection marked "local" that is not Ollama (llama.cpp, LM Studio) is no longer reported as `ollama/local` in `provider_guess`; it shows its listed provider, else the family its id names, else `local`.
+- Valve descriptions: `debug_mode` now says what it does (a "Debug info" source plus the server log, not an extra status line); `context_warn_percent` / `context_critical_percent` no longer show `%%`.
+
 ## [2.9.0]
 
 - **Checked against Open WebUI 0.12.5.** The plugin runs unchanged, with one known gap: **on a response with tool calls from an Anthropic model reached natively (not through a proxy like LiteLLM), the context window `📐` reads too high.** Open WebUI 0.12.5 started adding up Anthropic's cache tokens over all requests of the turn, while `📐` expects the last request's cache only, so it counts the earlier requests' cache as well. Responses without tool calls are unaffected. A fix will follow. Other 0.12.5 changes the plugin already handles: a streamed reply whose provider sent no token counts is now stored as `{"incomplete": true}` - the line then shows the tiktoken estimate (`[est.]`), and the chat totals skip such past replies.

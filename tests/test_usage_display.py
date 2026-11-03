@@ -805,6 +805,44 @@ def test_cache_and_fresh_anthropic_native_on_top(usage_display_module: ModuleTyp
     assert out["fresh_input"] == 100  # native: input excludes cache, not subtracted
 
 
+def test_cache_and_fresh_zero_cache_read_keeps_proxy_subset_semantics(usage_display_module: ModuleType) -> None:
+    """A measured `cached_tokens: 0` is a detail key, not an absent one (issue #38).
+
+    Cache-write-only turn behind a proxy that folds Anthropic cache into prompt_tokens (LiteLLM): the detail
+    dict says 0 cache reads, the top-level cache_creation carries the write. Read as Anthropic-native, the
+    write was added on top of an input that already contains it, doubling Σ, 📐 and the cost estimate.
+    """
+    f = usage_display_module.Filter()
+    usage = make_usage(
+        input_tokens=5100,
+        output_tokens=50,
+        prompt_tokens=5100,
+        completion_tokens=50,
+        prompt_tokens_details={"cached_tokens": 0},
+        cache_creation_input_tokens=5000,
+    )
+    out = f._cache_and_fresh(usage, reported_input=5100)
+    assert out["cached"] is None  # top-level fields win the value; no top-level read was reported
+    assert out["cache_write"] == 5000
+    assert out["input_has_cache"] is True
+    assert out["fresh_input"] == 100
+
+    tokens = f._extract_tokens(usage, make_message("a", usage=usage), [], {}, None)
+    assert tokens["total"] == 5150
+    assert tokens["context_used"] == 5150
+
+    # Same when the zero arrives under the Responses API detail group.
+    responses = {"cache_creation_input_tokens": 5000, "input_tokens_details": {"cached_tokens": 0}}
+    assert f._cache_and_fresh(responses, reported_input=5100)["input_has_cache"] is True
+
+    # A zero detail beside a positive top-level read is an OpenAI-shaped skeleton, not a fold (a fold copies
+    # the read into the detail): it stays Anthropic-native, cache on top, as before 2.9.1.
+    skeleton = {"prompt_tokens_details": {"cached_tokens": 0}, "cache_read_input_tokens": 4000}
+    out = f._cache_and_fresh(skeleton, reported_input=100)
+    assert out["input_has_cache"] is False
+    assert out["fresh_input"] == 100
+
+
 def test_extract_tokens_openai_chat(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     usage = make_usage(
@@ -1408,7 +1446,11 @@ def test_build_stats_respects_display_order_and_gating(usage_display_module: Mod
 def test_provider_guess_local_and_arena_authoritative(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     assert f._provider_guess({"owned_by": "ollama"}, "llama3") == "ollama/local"
-    assert f._provider_guess({"connection_type": "local"}, "gpt-4o") == "ollama/local"  # local wins over model-id
+    # A local connection is not necessarily Ollama (issue #38): its listed provider, else the id's family,
+    # else plain "local" (connection_type is reported next to it in the debug payload anyway).
+    assert f._provider_guess({"connection_type": "local", "provider": "llama.cpp"}, "qwen3") == "llama.cpp"
+    assert f._provider_guess({"connection_type": "local"}, "qwen3-coder") == "qwen"
+    assert f._provider_guess({"connection_type": "local"}, "my-finetune") == "local"
     assert f._provider_guess({"owned_by": "arena"}, "gpt-4o") == "arena"
     assert f._provider_guess({"provider": "custom-corp"}, "whatever") == "custom-corp"  # admin override wins
 
@@ -1780,6 +1822,70 @@ def test_outlet_skips_when_user_disabled(usage_display_module: ModuleType, monke
     result = run_async(f.outlet(body, __user__={"valves": _UV()}, __event_emitter__=emitter))
     assert result is body
     assert emitter.events == []
+
+
+def test_outlet_does_no_work_where_nothing_can_be_shown(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No emitter (raw API call without chat_id) or a channel: chat -> no resolver runs (issue #38).
+
+    The resolvers reach the network (connection probe, OpenRouter balance, models.dev); OWUI still runs the
+    outlet there, and on the non-streaming API path the HTTP response waits for it.
+    """
+    f = usage_display_module.Filter()
+    calls: list[str] = []
+
+    async def _tracked(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        calls.append("resolver")
+        return {"usd": None, "status": "off", "key_source": None, "on_openrouter": None}
+
+    monkeypatch.setattr(f, "_resolve_balance", _tracked)
+    _patch_no_network(monkeypatch, f)
+    body = make_body([make_message("a", usage=make_usage())], model="gpt-4o")
+
+    assert run_async(f.outlet(body, __metadata__={"chat_id": "", "message_id": "m1"})) is body
+    channel = {"chat_id": "channel:c1", "message_id": "m1"}
+    emitter = CapturingEmitter()
+    assert run_async(f.outlet(body, __event_emitter__=emitter, __metadata__=channel)) is body
+    body_only = make_body([make_message("a", usage=make_usage())], model="gpt-4o")
+    body_only["chat_id"] = "channel:c1"  # the outlet body carries chat_id too
+    run_async(f.outlet(body_only, __event_emitter__=emitter))
+    assert calls == []
+    assert emitter.events == []
+
+    # debug mode still runs in a channel chat: its stdout copy is the only output that survives there.
+    f.valves.debug_mode = True
+    run_async(f.outlet(body, __event_emitter__=emitter, __metadata__=channel))
+    assert calls == ["resolver"]
+    assert "[TUD debug]" in capsys.readouterr().out
+
+    # An ordinary saved chat is unaffected.
+    f.valves.debug_mode = False
+    saved = CapturingEmitter()
+    run_async(f.outlet(body, __event_emitter__=saved, __metadata__={"chat_id": "c1", "message_id": "m1"}))
+    assert len(saved.statuses()) == 1
+
+
+def test_outlet_releases_the_inlet_timing_entry_on_every_early_return(usage_display_module: ModuleType) -> None:
+    """An outlet that returns early must still pop the inlet's `_request_timings` entry, or it leaks.
+
+    Raw API traffic (no chat_id -> no emitter) returns early on every request since 2.9.1, so an entry left
+    behind there would make the module dict grow with every call.
+    """
+    timings = usage_display_module._request_timings
+    f = usage_display_module.Filter()
+
+    class _Off:
+        enabled = False
+
+    for meta, kwargs in (
+        ({"chat_id": "", "message_id": "m1"}, {}),  # raw API: no emitter
+        ({"chat_id": "c1", "message_id": "m2"}, {"__user__": {"valves": _Off()}}),  # stats switched off
+    ):
+        run_async(f.inlet(make_body([make_message("hi", role="user")]), __metadata__=meta))
+        assert meta["_tud_timing_key"] in timings
+        run_async(f.outlet(make_body([make_message("a", usage=make_usage())]), __metadata__=meta, **kwargs))
+        assert meta["_tud_timing_key"] not in timings
 
 
 def test_outlet_skips_background_tasks(usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:

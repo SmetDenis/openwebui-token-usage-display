@@ -220,6 +220,14 @@ model dict (`utils/models.py`, custom model with `base_model_id`) carries none o
 model's entry in `request.app.state.MODELS` (a plain dict, or `socket/utils.py:RedisDict` with `.get`) does.
 `__request__` is passed to outlet (`middleware.py`, outlet `extra_params`). Checked in v0.11.3.
 
+**Arena models: inlet and outlet see different models.** `process_chat_payload` swaps an arena wrapper
+(`owned_by: 'arena'`) for a randomly chosen sub-model before inlet and records it as
+`metadata['selected_model_id']` (`middleware.py:2064-2088`, present since 0.9.0), but `main.py` builds the
+response context from the wrapper (`build_chat_response_context(..., model, ...)`), so outlet's `__model__` is
+the wrapper and `body["model"]` the arena id. `selected_model_id` survives in the per-model metadata the outlet
+gets (`generate_chat_completion` pops it from a merged copy and from `request.state.metadata`, a different dict
+since the per-model split). The frontend never displays the chosen model (blind comparison). Checked in v0.12.5.
+
 **Connection settings are reachable from a filter** (used by the v2.6.0 connection probe). A connection model's
 `urlIdx` indexes OWUI's OpenAI connections; `routers/openai.py:get_openai_connection(idx)` (async, **0.10.0+**,
 reads `Config.get_many('openai.api_base_urls', 'openai.api_keys', 'openai.api_configs')`) returns
@@ -269,7 +277,8 @@ instead.
    reloads the message map from the DB, builds the outlet body
    (`{model, messages, chat_id, session_id, id}`, messages carrying `content` — real **or
    synthesized from `output`** — plus `info`, `output`, `usage`, `sources`, `:3473-3489`, and since
-   0.12.0 `finish_reason` on the current message only), runs
+   0.12.0 `finish_reason` on the current message only; v0.12.5 also adds `filter_ids` and has **no
+   `metadata` key**, so data an inlet wrote to `body["metadata"]` reaches outlet only via `__metadata__`), runs
    `process_filter_functions(filter_type="outlet")`, persists any message whose content/output the
    filter actually changed (`:3534-3559`, also writing `originalContent`) and emits `chat:outlet`.
    **Unsaved chats (`temporary:`/`local:`/`channel:`, and an empty `chat_id` — raw API requests,
@@ -339,7 +348,12 @@ instead.
 - `message` / `replace` → append to / overwrite `message.content`.
 - Non-persistent chats — `temporary:` (current), `local:` (legacy) and `channel:` — skip all
   persistence (`utils/chat_id.py:is_saved_chat_id`). A `channel:` chat routes the emitter to
-  channel-message updates entirely (`_make_channel_emitter`).
+  channel-message updates entirely (`_make_channel_emitter`), which handles only `chat:completion`,
+  `response:completion`, `files` and `chat:message:error` — **`status` and `citation` are dropped**
+  (`socket/main.py:1532-1599`, v0.12.5).
+- **No emitter at all without a chat id:** `get_event_emitter_and_caller` builds one only when
+  `chat_id` and `message_id` are both set (`middleware.py:3054-3056`, v0.12.5), so a raw API request
+  passes `__event_emitter__=None` to the outlet — which still runs (`ENABLE_API_OUTLET_FILTERS`).
 
 `get_event_call:1100` — request/response calls into a live WS session (dialogs, client-side JS); it
 now verifies the target session belongs to the requesting user.

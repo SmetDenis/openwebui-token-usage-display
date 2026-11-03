@@ -131,7 +131,7 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (244 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (247 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
 and `make_*` builders live at the top of the test file). The only outside state any test reads is git:
 `tests/test_valves_compat.py` (4 tests) loads every release tag's `usage_display.py`, and
