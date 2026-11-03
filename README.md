@@ -173,9 +173,12 @@ Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - 
 ## Notes & limitations
 
 - For providers that don't report a generation duration (OpenAI, Anthropic), time and t/s are wall-clock, marked `~`; local providers (Ollama, llama.cpp) report real generation time.
-- The chat totals (`🧮`, `💰Σ`) are summed from each past response's stored usage. Temporary chats (and API
-  requests without a chat id) don't pass that history usage to filters, so there both totals equal the
-  current message and are hidden.
+- The chat totals (`🧮`, `💰Σ`) are summed from each past response's stored usage. Temporary chats, side
+  chats (`/side`, `/btw`, Open WebUI 0.13.0+) and API requests without a chat id don't pass that history
+  usage to filters, so there both totals equal the current message and are hidden.
+- Open WebUI 0.13.0 can compact a long chat more cheaply by replaying it to the provider's prompt cache, but
+  only for models with no filter function attached. On a model with this plugin (or any other filter)
+  compaction works as in 0.12.x. Open WebUI decides this, the plugin cannot change it.
 - When Open WebUI (0.12.5+) reports that a request of the turn sent no token count (`incomplete` in the
   usage), every token number of that response is marked `≈` (`⬆︎`, `⬇︎`, `Σ`, `📐`, and `🧮` for the
   rest of the chat): the real counts are higher.

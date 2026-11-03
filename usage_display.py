@@ -3,7 +3,7 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.10.0
+version: 2.10.1
 license: MIT
 description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
@@ -18,7 +18,8 @@ from __future__ import annotations
 #     triple was guaranteed (a missing counter became 0); since 0.12.5 a missing
 #     or invalid counter (negative, bool) is left out, and a streamed model call
 #     that reported no usage leaves `{"incomplete": True}` (merge_usage also sets
-#     `incomplete` on a turn where a call lacked input or output).
+#     `incomplete` on a turn where a call lacked input or output). A Responses API
+#     stream cut by the token limit did that until 0.13.0, which reads its usage.
 #     -> primary token read is the normalized triple; provider keys are backup;
 #     every read tolerates absence, and a usage with no counter is "no usage".
 #     `incomplete: true` beside counters (some call reported none) -> the token
@@ -33,8 +34,9 @@ from __future__ import annotations
 #     0.11.x outlet), then walks `output` (the only source on 0.10.x).
 #   * Only SAVED chats reload the active branch from the DB for outlet, so past
 #     messages carry their persisted `usage`. Unsaved chats (temporary:/local:/
-#     channel:, and API requests with no chat_id) rebuild the history from the
-#     request as role+content only (0.11.x outlet_filter_handler) -> no per-message
+#     channel:, the 0.13.0 side chats, which are temporary:, and API requests with
+#     no chat_id) rebuild the history from the request as role+content only
+#     (0.11.x outlet_filter_handler) -> no per-message
 #     usage on past turns, so both chat totals (💰Σ cost, 🧮 tokens) collapse to
 #     the current message there. Nothing is shown at all for API requests with no
 #     chat_id (no event emitter) or in channel: chats (their emitter drops status
@@ -45,7 +47,10 @@ from __future__ import annotations
 #     completion_tokens_details; Responses API -> input_tokens_details /
 #     output_tokens_details; Anthropic -> top-level cache_read/creation (only
 #     from a pipe or a pass-through proxy: OWUI's own chat path calls an
-#     OpenAI-compatible /chat/completions even for api.anthropic.com).
+#     OpenAI-compatible /chat/completions even for api.anthropic.com). Since
+#     0.13.0 a non-streaming Responses reply carries both families (the input_*/
+#     output_* keys copied to prompt_*/completion_*) -> every reader takes the
+#     first family that has a value, never both, so nothing is counted twice.
 #   * merge_usage sums input/output/total + top-level cost (USAGE_COST_KEYS) +
 #     *_tokens_details, but NOT Ollama/llama.cpp durations, nor (through 0.12.4)
 #     the top-level Anthropic cache fields -> in multi-round tool turns the token
@@ -72,10 +77,11 @@ from __future__ import annotations
 #     calls it: the inlet stamp and no count remain.
 #   * Since 0.12.0 the current outlet message carries `finish_reason` — the
 #     value from the LAST model call of the turn, never persisted. Provider-real
-#     for Chat Completions, Ollama and pipes passing an upstream response through;
-#     synthesized "stop"/"tool_calls" (never "length") for other pipes and
-#     non-streaming Responses API; absent for Responses API streams -> absence
-#     means "unknown", not "stop"; only "length" is shown (✂️, _render_finish).
+#     for Chat Completions, Ollama, pipes passing an upstream response through and
+#     (since 0.13.0, from the response status) non-streaming Responses API;
+#     synthesized "stop"/"tool_calls" (never "length") for other pipes and, before
+#     0.13.0, non-streaming Responses API; absent for Responses API streams ->
+#     absence means "unknown", not "stop"; only "length" is shown (✂️, _render_finish).
 #   * 0.9.0+ compatible: the outlet body carries per-message `usage` since 0.9.0 and
 #     normalize_usage exists since 0.8.0, so tokens/context/timing/estimate all work on
 #     0.9.x. Only NATIVE provider cost (USAGE_COST_KEYS) needs 0.10.0+ -> on 0.9.x use

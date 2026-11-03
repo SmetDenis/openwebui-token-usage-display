@@ -10,9 +10,78 @@ Socket.IO Redis locks/heartbeats, model tag normalization and error constants on
 `v0.11.4...v0.12.0` (released 2026-10-10) re-walked every mechanism below; what moved is listed
 under "What changed in v0.12.0", and the line numbers cited elsewhere are still those of v0.11.0. A
 `v0.12.0...v0.12.5` diff (released 2026-10-29, so it covers 0.12.1-0.12.4 too) re-checked the files the
-plugin reads; what moved is under "What changed in v0.12.1-v0.12.5".
+plugin reads; what moved is under "What changed in v0.12.1-v0.12.5". A `v0.12.5...v0.13.0` diff
+(released 2026-11-03) re-walked every mechanism below; what moved is under "What changed in v0.13.0".
 OWUI internals shift between versions — before relying on any claim, re-check it against a current
 checkout (the local clone path and freshness-check commands live in `CLAUDE.local.md`).
+
+## What changed in v0.13.0 (plugin-relevant)
+
+Checked against `v0.12.5...v0.13.0` (2026-11-03, issue #42). Nothing here breaks the plugin. The usage core
+in `utils/response.py` (`usage_counter`, `normalize_usage`, `merge_usage`, `update_usage_snapshot`, the
+`USAGE_*` key sets, how `incomplete` is written) did not change; what moved is on the Responses API path,
+around temporary chats and in context compaction. `utils/filter.py` and `utils/plugin.py` changed only in
+comments (plus `Tools.get_tools(active_only=True)` when installing tool requirements); `utils/valves.py` did
+not change.
+
+1. **Non-streaming Responses API replies carry a real `finish_reason`.** `routers/openai.py:1398` sets
+   `get_responses_finish_reason(response, bool(tool_calls))` (`utils/response.py:244-248`): `length` for
+   `status: incomplete` (`content_filter` when `incomplete_details.reason` says so), else `tool_calls`/`stop`.
+   In 0.12.5 it was always `'tool_calls' if tool_calls else 'stop'`. The plugin's `✂️` now shows on this path.
+   Responses **streams** on the chat path still set none (`middleware.py:4905-4917`, usage only).
+2. **Non-streaming Responses usage carries both key families.** `routers/openai.py:1401` passes it through
+   `convert_responses_usage_to_chat_completions` (`utils/response.py:235-241`): `normalize_usage`, then
+   `input_tokens`/`input_tokens_details`/`output_tokens`/`output_tokens_details` are copied to
+   `prompt_tokens`/`prompt_tokens_details`/`completion_tokens`/`completion_tokens_details`. `merge_usage` sums
+   each detail dict on its own, so after a tool turn both copies hold the same sums. In 0.12.5 the raw
+   Responses shape went to the middleware as is. Every plugin reader takes the first family that has a value,
+   so nothing is counted twice (`test_outlet_reads_owui_0130_responses_usage_with_both_detail_families_once`).
+3. **A truncated Responses stream keeps its usage.** `handle_responses_streaming_event` handles
+   `response.incomplete` like `response.completed` (`utils/response.py:838`, PR #33619). Before, a stream cut
+   by the token limit or a content filter reported no usage and left `{'incomplete': True}` (tiktoken `≈` in
+   the plugin); now its counters are provider-real.
+4. **Temporary-chat events go to the owner session only.** `socket/main.py:1635-1640` sends the events of a
+   `temporary:` chat to the socket session that owns it and drops them silently when that session is gone;
+   0.12.5 sent them to the room `user:{user_id}` (every tab). A request without a live owner session is
+   refused with 404 before any filter runs (`main.py:1303-1313`). Temporary ids may now be
+   `temporary:<sid>[:<uuid>]`; `is_saved_chat_id` and the prefixes are unchanged.
+5. **Side chats** (`/side`, `/btw`; `src/lib/components/chat/ChatTabs/SideChat.svelte`, behind the
+   `chat.side_chat` permission) are temporary chats with a normal streaming completion, so filters run. The
+   side chat handles `status` and `citation` itself and renders through the same `ResponseMessage` gates, so
+   the stats line and the debug citation show there. As in every unsaved chat, past messages carry no
+   `usage` (`🧮`/`💰Σ` count only the current turn).
+6. **Cache-replay compaction runs only without Function filters.** New: the summary call can replay the chat
+   request so the provider reads the history from its prompt cache (`utils/context_compaction.py:471-506`,
+   needs a non-empty `form_data`, `:473`). At turn start, with any Function filter (or pipe, pipeline,
+   resumed tool call) OWUI compacts before inlet with `form_data=None` (`middleware.py:2191-2213`), as in
+   0.12.5; only without filters is compaction deferred until after the `request` hook (`:3001-3044`). In the
+   tool loop `summary_form_data` stays `None` when filters exist (`:6033-6037`). So with this plugin attached
+   OWUI compacts the 0.12.5 way, the replayed summary never happens, and the plugin's timing and call count
+   are unaffected (the summary is still a separate task call with no filters and no `request` hook).
+7. **The status line sits under an overlay button**, no longer inside one: `StatusHistory.svelte:33-45` puts
+   a full-size `absolute inset-0` `<button>` over a `pointer-events-none` wrapper holding `StatusItem`.
+   `StatusItem.svelte` did not change: still plain text, `line-clamp-1` collapsed.
+8. **Renames** the docs used to cite: `convert_ollama_usage_to_openai` → `convert_ollama_usage_to_chat_completions`
+   (`utils/response.py:178`), `openai_chat_*_template` → `chat_completion_*_template` (`utils/misc.py:778-818`),
+   and the other Ollama converters (`*_ollama_*_to_chat_completions`). The plugin imports none of them.
+9. The default `CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS` went from 256 to 1024 (`env.py:1085-1091`), so a tool
+   turn can merge usage over more calls.
+10. Unchanged and re-checked: the inlet/`request`/outlet call sites and their kwargs (`request` at
+    `middleware.py:2988, 3216, 6089, 6305`), the same `__metadata__` dict from `request` to outlet,
+    `outlet_filter_handler` (`:3769`, no diff hunk: body shape, `finish_reason` on the current message, saved
+    vs unsaved history), end-of-stream order (`:6377-6393`), no emitter without `chat_id` + `message_id`
+    (`:3049-3064`) — the new raw-API stream wrapper `convert_responses_stream_to_chat_completions` sits on
+    that no-emitter branch (`if event_emitter:` `:4192`, else `:6444`); `channel:` emitter dropping
+    `status`/`citation` (`socket/main.py:1490`), the `TASKS` enum, the listing row and `urlIdx`
+    (`routers/openai.py:748-756`), `get_openai_connection(idx)` (`:249-254`), `auth_type` values,
+    `app.state.MODELS` `.get`, `public_model_params()`, `num_ctx` → `options` for Ollama
+    (`utils/payload.py:136-137`), the render gates (`ResponseMessage.svelte:728, 950`), the `citation`
+    persistence rule (`socket/main.py:1774-1776`), `validate_valves`, the frontmatter regex
+    (`utils/plugin.py:160`), the password valve input, the client-side version check. Automations run the
+    plugin in a saved chat; sub-agents run in their own chat on their own model and do not merge into the
+    parent's usage; inbox, comments, MCP apps and terminals never call the chat pipeline. OWUI's own context
+    indicator (`src/lib/utils/contextUsage.ts`, a refactor) still exposes no real context window. Pins:
+    pydantic `2.13.4`, aiohttp `3.14.5` (both unchanged).
 
 ## What changed in v0.12.1-v0.12.5 (plugin-relevant)
 
@@ -75,8 +144,10 @@ Checked file by file against `v0.11.4...v0.12.0` (2026-10). Nothing here breaks 
      (`done_reason` now maps to it, so a token-limit cut reports `length`), and for pipes that return a
      `StreamingResponse` or a dict (passed through, `functions.py:293-298,332-333`);
    - **synthesized, never `length`**: other pipes get a closing chunk with `stop`
-     (`functions.py:318-319`) or `tool_calls`/`stop` from `openai_chat_completion_message_template`;
-     non-streaming Responses API replies get `tool_calls`/`stop` (`routers/openai.py:1399`);
+     (`functions.py:318-319`) or `tool_calls`/`stop` from `openai_chat_completion_message_template`
+     (`chat_completion_message_template` since 0.13.0); non-streaming Responses API replies get
+     `tool_calls`/`stop` (`routers/openai.py:1399`) — **until 0.13.0**, which reads the response status
+     and can report `length` (see "What changed in v0.13.0");
    - **absent** for Responses API streams (`response.*` events `continue` before the `choices` loop).
 
    It is **never persisted** — past messages never have it. A turn can end on `tool_calls` when it is
@@ -199,7 +270,9 @@ gets (`:2238`, `:4169`, `:3869`), so a value written there reaches the outlet. T
 `getattr(function_module, 'request')` (`utils/filter.py`) and gets `body` (the form data) plus the dunder kwargs
 it names; its return value becomes the request body. First in `v0.11.2` (absent in `v0.11.1`). The
 `function_calling` task (default tool mode) and context-compaction summaries are separate task calls, not
-preceded by it and not merged into the reply's usage.
+preceded by it and not merged into the reply's usage. Since 0.13.0 compaction can also run after this hook,
+replaying the request for the provider's prompt cache — but only when no Function filter is attached, so a
+model with this plugin never takes that path (see "What changed in v0.13.0", item 6).
 
 ## Dunder kwargs available to filter hooks
 
@@ -271,8 +344,9 @@ instead.
 ## Request lifecycle
 
 1. Frontend `Chat.svelte:2548`-ish → `POST /api/chat/completions`. `stream_options.include_usage` is
-   sent **only when the model's `capabilities.usage` flag is on** (`Chat.svelte:3185-3189`) — the
-   root cause of most "no tokens shown in streaming" reports.
+   set **only when the model's `capabilities.usage` flag is on** — by the backend (`main.py:1178-1180` in
+   v0.13.0, already there in v0.12.5; earlier by the frontend, `Chat.svelte:3185-3189`) — the root cause
+   of most "no tokens shown in streaming" reports.
 2. `main.py:chat_completion:1054` builds `metadata` (`:1180-1209`), resolves arena/custom models,
    generates ids and sets `metadata["message_id"]` (`:1784`); `process_chat(...)` then runs the
    pipeline.
@@ -284,6 +358,7 @@ instead.
 4. Provider routers substitute `base_model_id` right before the upstream call
    (`routers/openai.py`, `routers/ollama.py` and siblings) and apply model params. Ollama usage is
    converted to OpenAI shape by `utils/response.py:convert_ollama_usage_to_openai:168`
+   (`convert_ollama_usage_to_chat_completions:178` since 0.13.0)
    (`eval_count` → tokens, duration fields, `response_token/s`).
 5. **Outlet filters run inline** in `middleware.py:outlet_filter_handler:3412`: for a saved chat it
    reloads the message map from the DB, builds the outlet body
@@ -363,6 +438,10 @@ instead.
   channel-message updates entirely (`_make_channel_emitter`), which handles only `chat:completion`,
   `response:completion`, `files` and `chat:message:error` — **`status` and `citation` are dropped**
   (`socket/main.py:1532-1599`, v0.12.5).
+- **Temporary chats deliver to the owner session only (0.13.0).** A `temporary:` chat's events go to the
+  socket session that owns it, not to the room `user:{user_id}`, and are dropped silently when that session
+  is gone (`socket/main.py:1635-1640`); the user's other tabs no longer get them. The 0.13.0 side chats
+  (`/side`, `/btw`) are temporary chats and handle `status`/`citation` in their own component.
 - **No emitter at all without a chat id:** `get_event_emitter_and_caller` builds one only when
   `chat_id` and `message_id` are both set (`middleware.py:3054-3056`, v0.12.5), so a raw API request
   passes `__event_emitter__=None` to the outlet — which still runs (`ENABLE_API_OUTLET_FILTERS`).
@@ -424,8 +503,9 @@ now verifies the target session belongs to the requesting user.
 - `Chat.svelte:chatEventHandler:949` — `status` pushes onto `message.statusHistory` (`:967-972`);
   `chat:completion` sets `message.usage` (`chatCompletionEventHandler:2377`, `:2431-2432`).
 - `Messages/ResponseMessage/StatusHistory/StatusItem.svelte` — status text renders plain-text,
-  `line-clamp-1` when collapsed, inside a `<button>` that toggles the history → **multi-line / markdown /
-  conveniently-copyable debug output in the status line is impossible**. Through 0.12.3 the clamp was
+  `line-clamp-1` when collapsed, inside a `<button>` that toggles the history (since 0.13.0 under a
+  full-size overlay button, in a `pointer-events-none` wrapper, `StatusHistory.svelte:33-45`) → **multi-line
+  / markdown / conveniently-copyable debug output in the status line is impossible**. Through 0.12.3 the clamp was
   hardcoded in every branch; since 0.12.4 a plain description is clamped only collapsed (the `clamp` prop)
   and wraps in the expanded history — still plain text, and the collapsed line still cuts the right end.
 - `ContentRenderer.svelte:282-302` — `output` wins; `content` renders **only when `output` is
