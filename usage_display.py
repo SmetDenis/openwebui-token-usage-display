@@ -3,7 +3,7 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.9.0
+version: 2.9.1
 license: MIT
 description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
@@ -32,12 +32,16 @@ from __future__ import annotations
 #     channel:, and API requests with no chat_id) rebuild the history from the
 #     request as role+content only (0.11.x outlet_filter_handler) -> no per-message
 #     usage on past turns, so both chat totals (💰Σ cost, 🧮 tokens) collapse to
-#     the current message there.
+#     the current message there. Nothing is shown at all for API requests with no
+#     chat_id (no event emitter) or in channel: chats (their emitter drops status
+#     and citation events) -> outlet returns early there (_can_show).
 #   * `message["info"]` is a redundant mirror ({"usage": ...}) of top-level usage
 #     on persisted chats -> intentionally ignored to avoid double counting.
 #   * Detail keys differ by API: Chat Completions -> prompt_tokens_details /
 #     completion_tokens_details; Responses API -> input_tokens_details /
-#     output_tokens_details; Anthropic -> top-level cache_read/creation.
+#     output_tokens_details; Anthropic -> top-level cache_read/creation (only
+#     from a pipe or a pass-through proxy: OWUI's own chat path calls an
+#     OpenAI-compatible /chat/completions even for api.anthropic.com).
 #   * merge_usage sums input/output/total + top-level cost (USAGE_COST_KEYS) +
 #     *_tokens_details, but NOT Ollama/llama.cpp durations, nor (through 0.12.4)
 #     the top-level Anthropic cache fields -> in multi-round tool turns the token
@@ -988,8 +992,8 @@ class Filter:
         modelsdev_ttl: int = Field(
             default=86400, description="Seconds to cache the fetched models.dev context table (default 24h)."
         )
-        context_warn_percent: int = Field(default=30, description="Context %% at which the icon turns orange.")
-        context_critical_percent: int = Field(default=70, description="Context %% at which the icon turns red.")
+        context_warn_percent: int = Field(default=30, description="Context % at which the icon turns orange.")
+        context_critical_percent: int = Field(default=70, description="Context % at which the icon turns red.")
         llamacpp_url: str = Field(
             default="",
             description=(
@@ -1077,7 +1081,11 @@ class Filter:
             ),
         )
         debug_mode: bool = Field(
-            default=False, description="Emit an extra status event with the raw payload for diagnostics."
+            default=False,
+            description=(
+                "Attach a sanitized diagnostic payload under each response as a 'Debug info' source (citation), "
+                "and print it to the server log."
+            ),
         )
 
     class UserValves(BaseModel):
@@ -1145,6 +1153,23 @@ class Filter:
             "moa_response_generation",
         )
 
+    def _can_show(
+        self,
+        body: dict[str, Any],
+        metadata: dict[str, Any] | None,
+        emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> bool:
+        """False when nothing the outlet produces can reach anyone, so the network lookups are skipped.
+
+        OWUI gives no emitter to a request without a chat id (raw API calls; the outlet still runs, and on the
+        non-streaming path it delays the HTTP response). A `channel:` chat's emitter drops `status` and
+        `citation` events entirely; there only debug mode is worth running, for its stdout copy.
+        """
+        if emitter is None:
+            return False
+        chat_id = (metadata or {}).get("chat_id") or body.get("chat_id") or ""
+        return self.valves.debug_mode or not str(chat_id).startswith("channel:")
+
     async def outlet(  # noqa: PLR0913 - OWUI injects each dunder kwarg the signature names; one per source
         self,
         body: dict[str, Any],
@@ -1157,7 +1182,10 @@ class Filter:
     ) -> dict[str, Any]:
         """Resolve tokens, timing, context, cost and balance for the last response and emit the stats line."""
         task = (__metadata__ or {}).get("task")
-        if self._turn_skipped(__user__, task):
+        # First, on every path: it releases the inlet's `_request_timings` entry and purges stale ones, so a
+        # turn that returns early below (stats off, nowhere to show, no reply) cannot leak it.
+        elapsed_seconds = self._resolve_wall_clock(body, __metadata__)
+        if self._turn_skipped(__user__, task) or not self._can_show(body, __metadata__, __event_emitter__):
             return body
 
         messages = body.get("messages", [])
@@ -1169,7 +1197,6 @@ class Filter:
 
         v = self.valves
 
-        elapsed_seconds = self._resolve_wall_clock(body, __metadata__)
         usage = assistant_msg.get("usage") if isinstance(assistant_msg.get("usage"), dict) else None
 
         tokens = self._extract_tokens(usage, assistant_msg, messages, body, __model__)
@@ -1336,11 +1363,17 @@ class Filter:
         `fresh_input` is the full-price (uncached) input for BOTH shapes, so callers price and
         total uniformly without a per-provider branch.
         """
-        pt_cached = _detail_num(usage, "prompt_tokens_details", "cached_tokens") or _detail_num(
-            usage, "input_tokens_details", "cached_tokens"
-        )
+        # Not an `or`-chain: a measured `cached_tokens: 0` must stay 0, or a cache-write-only turn behind a proxy
+        # (detail dict + top-level cache_creation) would be taken for Anthropic-native and count the write twice.
+        pt_cached = _detail_num(usage, "prompt_tokens_details", "cached_tokens")
+        if pt_cached is None:
+            pt_cached = _detail_num(usage, "input_tokens_details", "cached_tokens")
         pt_cache_creation = _detail_num(usage, "prompt_tokens_details", "cache_creation_tokens")
         anth_read = _num(usage.get("cache_read_input_tokens"))
+        # ...but a zero detail beside a POSITIVE top-level read is a skeleton, not a fold (a fold copies the read
+        # into the detail), so it keeps the pre-2.9.1 reading: native, cache on top.
+        if pt_cached == 0 and anth_read:
+            pt_cached = None
         anth_write = _num(usage.get("cache_creation_input_tokens"))
         has_toplevel_anth = anth_read is not None or anth_write is not None
 
@@ -2344,14 +2377,16 @@ class Filter:
     def _provider_guess(model: dict[str, Any] | None, model_id: str) -> str:
         """Best-effort provider label from outlet-visible fields (no base_url/api-key exist here).
 
-        Local backends and an admin-set `provider` are authoritative; otherwise the family is
-        inferred from the model-id substring — the same thing that drives cost/context matching.
+        Ollama and an admin-set `provider` are authoritative; otherwise the family is inferred from the
+        model-id substring — the same thing that drives cost/context matching. A connection the admin marked
+        "local" (llama.cpp, LM Studio, ...; `connection_type` is in the payload as well) is labelled "local"
+        only when the id names no family.
         """
         m = model if isinstance(model, dict) else {}
         owned = (m.get("owned_by") or "").lower()
         conn = (m.get("connection_type") or "").lower()
         provider = m.get("provider") or ""
-        if owned == "ollama" or conn == "local":
+        if owned == "ollama":
             return "ollama/local"
         if owned == "arena":
             return "arena"
@@ -2384,6 +2419,8 @@ class Filter:
         for needle, label in families:
             if needle in mid:
                 return label
+        if conn == "local":
+            return "local"
         return owned or "unknown"
 
     def _sanitize_model(
@@ -2394,7 +2431,7 @@ class Filter:
         Only known-safe keys are copied out; raw __model__/__metadata__ (which carry user_message,
         user_id, session_id, access_grants, the full ollama/openai model dict, ...) never leak here.
         OWUI strips generation params from info.params before outlet (0.12.0+ keeps only the
-        model_controls UI metadata there), so they are unavailable — surfaced
+        model_controls UI metadata there, 0.12.5 also compact_token_threshold), so they are unavailable — surfaced
         explicitly via gen_params_available rather than silently omitted.
         """
         m = model if isinstance(model, dict) else {}
@@ -2500,14 +2537,16 @@ class Filter:
         }
 
     async def _emit_debug(self, emit: Callable[[dict[str, Any]], Awaitable[None]], turn: _Turn, stats: _Stats) -> None:
-        """Diagnostics for troubleshooting, in a copyable and untruncated form.
+        """Diagnostics for troubleshooting, in a copyable form.
 
-        A chat status line is clamped to one line and not selectable, so it cannot show the raw
+        A chat status line is clamped to one line inside a toggle button, so it cannot show the raw
         JSON. The stats line only carries a small `(debug)` marker; the full payload is emitted
         two ways:
           1. a `citation` event -> a "Token Usage & Cost Display - Debug info" source whose modal renders
-             the JSON in a ```json code block WITH a Copy button (persisted with the message);
-          2. the server/container stdout (`docker logs`) as a copyable fallback.
+             the JSON in a ```json code block WITH a Copy button (persisted with the message). OWUI's modal
+             cuts content above 10,000 characters behind a "Show all" button, and with the user setting
+             "render Markdown in previews" off it shows plain text without a Copy button;
+          2. the server/container stdout (`docker logs`) as the never-truncated fallback.
         """
         content = turn.assistant_msg.get("content")
         output = turn.assistant_msg.get("output")
@@ -2555,9 +2594,9 @@ class Filter:
         except Exception as exc:  # noqa: BLE001 - same unguarded-debug rule as _valves_snapshot
             pretty = f"serialization error: {exc}"
 
-        # 1) In-chat, copyable, untruncated: a citation renders the JSON in a modal (titled from
-        #    source.name) with a Copy button. The payload MUST NOT carry a top-level `type` key or
-        #    the backend drops it.
+        # 1) In-chat, copyable: a citation renders the JSON in a modal (titled from source.name) with a
+        #    Copy button. The payload MUST NOT carry a top-level `type` key or the backend does not
+        #    persist it.
         await emit(
             {
                 "type": "citation",

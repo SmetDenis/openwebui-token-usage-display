@@ -21,22 +21,31 @@ dict was lost (server restart, multi-worker).
 
 Orchestration order (each step degrades gracefully, never raises out):
 
+0. `_resolve_wall_clock` runs first, on every path (v2.9.1): it pops the inlet's `_request_timings` entry
+   and purges stale ones, so the early returns below cannot leak entries.
 1. **UserValves kill-switch** (`_turn_skipped`, since v2.9.0) — `enabled=False` returns the body untouched.
-2. **Background-task guard** (`_turn_skipped`) — skips the 7 `metadata["task"]` values
+2. **Nowhere to show** (`_can_show`, v2.9.1, issue #38) — no `__event_emitter__` (OWUI builds none for a
+   request without `chat_id`, i.e. raw API calls; the outlet still runs because `ENABLE_API_OUTLET_FILTERS`
+   defaults on, and on the non-streaming path the HTTP response waits for it) or a `channel:` chat (its
+   emitter drops `status` and `citation` — true since channel chats appeared in OWUI 0.10.0, checked in
+   0.10.0, 0.11.0, 0.12.0 and 0.12.5; 0.9.x has no `channel:` chat ids) → return before any resolver, so no
+   probe, balance or models.dev request is made for nothing. `debug_mode` still runs in a `channel:` chat for
+   its stdout copy; without an emitter it prints nothing, as before (the debug output was always gated on it).
+3. **Background-task guard** (`_turn_skipped`) — skips the 7 `metadata["task"]` values
    (`title_generation`, `tags_generation`, `follow_up_generation`, `emoji_generation`,
    `query_generation`, `autocomplete_generation`, `moa_response_generation`). Defensive only: task
    requests never run filter functions at all, through v0.12.0 (see `docs/owui-map.md`). The guard
    list is a subset: OWUI's `TASKS` enum gained `image_prompt_generation` and `function_calling`,
    so it now has 9 members — harmless while the requests never reach filters.
-3. **Message gates** (`:957-962`) — empty `messages` or no assistant message → return.
-4. `_resolve_wall_clock` (`:966`) → `_extract_tokens` (`:969`) → `_resolve_timing` (`:970`).
-5. `_resolve_context` (`:971-974`) and `_resolve_cost` (`:977-980`) — each wrapped in its own
+4. **Message gates** (`:957-962`) — empty `messages` or no assistant message → return.
+5. `_extract_tokens` (`:969`) → `_resolve_timing` (`:970`).
+6. `_resolve_context` (`:971-974`) and `_resolve_cost` (`:977-980`) — each wrapped in its own
    `try/except Exception` with a sentinel fallback (`source="error"` / all-`None` cost), so a
    resolver bug can never kill the response pipeline. `_resolve_balance` (v2.9.0) follows under the
    same guard (`status="error"`).
-6. `_build_stats` (`:982`) joins the parts with `valves.separator`; `debug_mode` appends `(debug)`.
+7. `_build_stats` (`:982`) joins the parts with `valves.separator`; `debug_mode` appends `(debug)`.
    The `_Stats` it gets also carries the message's `finish_reason` (a string, else `None`; OWUI 0.12.0+).
-7. Emits `{"type": "status", "data": {"description": ..., "done": True}}` (`:986-992`), then in
+8. Emits `{"type": "status", "data": {"description": ..., "done": True}}` (`:986-992`), then in
    debug mode `_emit_debug` (`:994-1007`) emits a `citation` event (copyable modal, persisted) and
    mirrors the pretty JSON to server stdout as `[TUD debug]`.
 
@@ -368,6 +377,15 @@ ids are paid on Groq/Together/Fireworks — hardcoding $0 would lie for paid hos
 `model["info"]["base_model_id"]` → `model["id"]` → `body["model"]`. Workspace/"agent" models thus
 resolve context and price via the real underlying LLM, so one map entry covers every agent on it.
 
+**Arena models are left on the arena wrapper on purpose (v2.9.1 decision, issue #38).** OWUI picks the
+sub-model before inlet but builds the outlet's context from the arena wrapper, so `__model__` is the wrapper
+and `body["model"]` the arena id; the model actually called is in `__metadata__["selected_model_id"]` (checked
+in v0.12.5). The plugin does not read it (owner's choice): arena is a blind comparison and OWUI's UI never shows
+the chosen model, while the stats line would reveal it directly (model name) or indirectly (window size, price).
+So under an arena response the model metric shows the arena name and `📐`/`💰` stay empty unless a map entry
+matches the arena id. Rejected: reading the sub-model for the metrics only (window and price still identify it);
+an opt-in valve (not asked for).
+
 ### Matching semantics
 
 `_longest_key_match` (`:357-371`): case-insensitive substring, longest key wins (`gpt-4o` beats
@@ -386,7 +404,11 @@ models.dev tables. Classic failure: `claude-opus-4.8` (dot) does not substring-m
   `cache_read_input_tokens`/`cache_creation_input_tokens` present AND no `*_tokens_details` cache
   keys → cache is *on top* of reported input. Otherwise (OpenAI, or a proxy that folded Anthropic
   cache into details) cache is a *subset*: `fresh_input = max(input − cached − cache_write, 0)`.
-  Getting this wrong double-counts behind LiteLLM (fixed in v2.2.0).
+  Getting this wrong double-counts behind LiteLLM (fixed in v2.2.0). A detail key counts when it is
+  present, **zero included**: until v2.9.1 an `or`-chain turned `cached_tokens: 0` into "absent", so a
+  cache-write-only turn behind such a proxy read as native and counted the write twice (issue #38).
+  One exception keeps the pre-2.9.1 reading: a zero detail beside a **positive** top-level read is an
+  OpenAI-shaped skeleton, not a fold (a fold copies the read into the detail), so that shape stays native.
 - `_compute_total` (`:1144-1158`): `fresh_input + cached + cache_write + output`.
 - `context_used` (v2.7.0, `_last_round_context`): the last request's tokens for the `📐` numerator — see
   "Context used" above. Unlike `total`, it does not sum the rounds of a tool turn.
@@ -469,6 +491,9 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | Trigger | Handling | Code | Test |
 |---|---|---|---|
 | `UserValves.enabled=False` | outlet no-op | `:940-942` | `test_outlet_skips_when_user_disabled` |
+| no `__event_emitter__` (raw API, no `chat_id`) / `channel:` chat (v2.9.1) | return before any resolver; `channel:` with `debug_mode` still runs for stdout | `_can_show` | `test_outlet_does_no_work_where_nothing_can_be_shown` |
+| `prompt_tokens_details.cached_tokens: 0` + top-level `cache_creation_input_tokens` (v2.9.1) | detail dict present → cache is a subset, no double count | `_cache_and_fresh` | `test_cache_and_fresh_zero_cache_read_keeps_proxy_subset_semantics` |
+| outlet returns early (stats off, nowhere to show, no reply) (v2.9.1) | inlet timing entry still popped | `outlet` → `_resolve_wall_clock` | `test_outlet_releases_the_inlet_timing_entry_on_every_early_return` |
 | any of the 7 background tasks | early return | `:945-955` | `test_outlet_skips_every_background_task_string` |
 | empty `messages` / no assistant msg | early return | `:957-962` | `test_outlet_no_messages_or_no_assistant` |
 | `usage` `None`/`{}`/non-numeric/negative | all-`None` bag, no crash | `:1036`, `:230-247` | `test_outlet_survives_malformed_usage` |
@@ -552,9 +577,10 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | secret-bearing model/metadata dicts | whitelist copy-out only | `:1784-1823` | `test_sanitize_model_whitelist_only_no_secrets` |
 | RAG/file sources in web-search detect | non-http sources excluded | `:1836-1878` | `test_web_search_debug_ignores_non_web_sources` |
 
-Not handled by design: non-persistent chats (`temporary:` at 0.11.x, legacy `local:`, and
-`channel:`) are not branched on — the plugin works purely on what inlet/outlet receive, persistence
-differences don't affect it.
+Not handled by design: non-persistent chats (`temporary:` at 0.11.x and legacy `local:`) are not
+branched on — the plugin works purely on what inlet/outlet receive, persistence differences don't affect
+it. `channel:` is the one exception (v2.9.1): not for persistence, but because its emitter discards the
+plugin's events (`_can_show`).
 
 **Not detectable from inside the plugin's own logic — the #1 "it runs but nothing shows" cause.**
 OWUI's frontend gates the whole status line on the model's **Status Updates** capability and the
