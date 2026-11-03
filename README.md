@@ -33,14 +33,15 @@ tokens when a provider reports no usage; the plugin loads fine without it.
 
 ## What it displays
 
-- **Input / output / total** token counts
+- **Input / output / total** token counts. Marked `≈` when Open WebUI (0.12.5+) reports that a request of the
+  turn sent no token count, so the real numbers are higher
 - **Running chat token total** (`🧮`) - the sum of every response's `Σ` in the chat, the token twin of `💰Σ`
   (handy for local/free models with no cost). The model re-reads the history each turn, so it counts
   *processed* tokens and grows much faster than the context window
 - **Reasoning / thinking** tokens - OpenAI o3/o4-mini & GPT-5, Gemini thinking, DeepSeek R1, Claude thinking, etc. (read from both the Chat Completions and the newer Responses API shapes)
 - **Cached prompt** tokens - OpenAI prompt cache and Anthropic `cache_read` / `cache_creation`
   (Anthropic cache is correctly counted as *additional* to input)
-- **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable). On a response with tool calls (several requests to the model) it shows the last request, while `⬆︎`/`Σ`/cost add up all of them - so `⬆︎` can be far larger than `📐` (Open WebUI 0.11+; on 0.10.x `📐` is the sum too)
+- **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable). On a response with tool calls (several requests to the model) it shows the last request, while `⬆︎`/`Σ`/cost add up all of them - so `⬆︎` can be far larger than `📐` (Open WebUI 0.11+; on 0.10.x `📐` is the sum too). Marked `≈` when it is an estimate (see [Notes & limitations](#notes--limitations)). This is the model's real window, not Open WebUI's own context indicator, which divides by its compaction threshold (80k by default) and leaves Anthropic cache out, so the two percentages differ by design
 - **Generation time** and **tokens/second**
 - **Truncation marker** (`✂️ truncated`, next to `⬇︎`) - shown only when the model stopped because it hit its
   output-token limit, so a cut-off answer is not mistaken for a complete one. Needs Open WebUI 0.12.0+ and a
@@ -60,7 +61,9 @@ The filter reads Open WebUI's **normalized usage** attached to the response, so 
 - **Token counts** come straight from the reported usage. When a provider reports no usage, the plugin falls back to **tiktoken** estimation over the response text.
 - **Timing / tokens-per-second** prefer the provider's own numbers where available (Ollama
   `eval_duration`, llama.cpp `timings`). Otherwise a wall-clock measurement is shown, prefixed with `~`
-  to indicate it's approximate.
+  to indicate it's approximate. On Open WebUI 0.11.2+ it starts at the first request to the model, so time
+  spent on RAG and web search before it is left out; tools that run between requests are counted. Older
+  versions start it when the message is sent.
 
 ## Context-window detection
 
@@ -146,7 +149,12 @@ Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - 
   `ENABLE_PLUGINS=false` turns every filter off.
 - **Nothing shows below the response, but `debug_mode` prints a full payload with correct tokens to the server log.** The plugin ran fine - Open WebUI is hiding the line. Its frontend renders the status line only when the model's **Status Updates** capability is on, and the debug panel only when
   **Citations** is on (Workspace → Models → *your model* → Capabilities). This hits workspace/"agent"
-  models, which store an explicit capability set; plain connection models default to on.
+  models, which store an explicit capability set; plain connection models default to on. The debug payload's
+  `model.capabilities` shows the model's `status_updates`, `citations` and `usage` switches (`null` = not
+  set, Open WebUI's default applies).
+- **The line shows, then another one replaces it (or it vanishes).** Open WebUI shows only the latest status
+  of a message. Another filter with a higher `priority` that sends its own status after this one - even a
+  hidden one - takes that place. Raise this plugin's `priority` valve above it.
 - **Nothing shows below the response (no tokens).** The provider returned no `usage`. In streaming, most OpenAI-compatible endpoints only send a usage chunk when asked - enable the model's **Usage** capability
   (Workspace → Models → *your model* → Capabilities → **Usage**). Behind LiteLLM, set
   `general_settings: { always_include_stream_usage: true }`.
@@ -168,10 +176,19 @@ Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - 
 - The chat totals (`🧮`, `💰Σ`) are summed from each past response's stored usage. Temporary chats (and API
   requests without a chat id) don't pass that history usage to filters, so there both totals equal the
   current message and are hidden.
-- On Open WebUI 0.12.5, a response with tool calls from an Anthropic model reached natively (not through a
-  proxy like LiteLLM) shows too high a context window `📐`: Open WebUI now adds up Anthropic's cache over all
-  requests of the turn, and `📐` counts the earlier requests' cache too. A fix will follow.
-- In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn. The same holds for the truncation marker: it reflects the last request of the turn.
+- When Open WebUI (0.12.5+) reports that a request of the turn sent no token count (`incomplete` in the
+  usage), every token number of that response is marked `≈` (`⬆︎`, `⬇︎`, `Σ`, `📐`, and `🧮` for the
+  rest of the chat): the real counts are higher.
+- On Open WebUI 0.12.5+, a response with tool calls whose usage comes in Anthropic's own format (from a pipe or
+  a proxy that passes it through; LiteLLM and OpenRouter convert it) gets its cache summed over all requests of
+  the turn, and no per-request value is left. `📐` then adds the average cache per request and is marked `≈`;
+  it runs a little low, as later requests read a longer cached prefix. Open WebUI older than 0.11.2 gives no
+  request count, so there `📐` keeps the sum (too high) with `≈`.
+- In multi-round tool turns, Open WebUI only carries the last round's timing fields (Ollama, llama.cpp), so those can reflect the final round rather than the whole turn. The same holds for the truncation marker: it reflects the last request of the turn.
+- With `debug_mode` on, the debug source (valves snapshot with secrets masked, balance) is sent to everyone in a
+  shared chat and kept in share links, like the stats line itself. Open WebUI's source window cuts text above
+  10,000 characters behind a "Show all" button (large `price_map` / `context_size_map` can get there); the
+  server log copy is always complete.
 - In a Realtime voice call (Open WebUI 0.12.0+), the replies the voice model speaks on its own never pass
   through filters, so they get no stats line; the questions it hands to the chat model are ordinary responses
   and do.

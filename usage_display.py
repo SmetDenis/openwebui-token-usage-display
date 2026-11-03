@@ -3,7 +3,7 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.9.1
+version: 2.10.0
 license: MIT
 description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
@@ -21,6 +21,10 @@ from __future__ import annotations
 #     `incomplete` on a turn where a call lacked input or output).
 #     -> primary token read is the normalized triple; provider keys are backup;
 #     every read tolerates absence, and a usage with no counter is "no usage".
+#     `incomplete: true` beside counters (some call reported none) -> the token
+#     numbers are partial and render with ≈ (tokens["incomplete"]). merge_usage
+#     writes the key (True or False) on every merge of several calls, and no
+#     version before 0.12.5 writes it -> its presence also dates a summed cache.
 #   * `message["content"]` is NOT persisted at 0.10.x/0.11.x — both streaming and
 #     non-streaming save paths write only the structured `message["output"]`
 #     array. At 0.11.x the OUTLET BODY nonetheless carries a non-empty `content`:
@@ -58,9 +62,14 @@ from __future__ import annotations
 #     LAST round (0.10.x summed them like input/output; 0.12.5 takes them from
 #     that round's input/output_tokens) -> the 📐 "used" side reads them, so a
 #     tool turn shows the last request, not the sum of rounds; on 0.10.x it stays
-#     the summed total (_last_round_context). KNOWN GAP on 0.12.5+: the
-#     Anthropic-native cache added back to that pair is now the turn's sum, so
-#     📐 over-counts on a multi-round Anthropic-native turn (not fixed yet).
+#     the summed total (_last_round_context). On 0.12.5+ the Anthropic-native
+#     cache added back to that pair is the turn's sum, and no per-call value
+#     reaches the outlet -> 📐 adds the per-call average instead, the calls
+#     counted by the `request` hook (0.11.2+), and is marked ≈.
+#   * The `request` filter hook (0.11.2+) runs right before every model call,
+#     after RAG/web search, with the outlet's own __metadata__ dict -> it stamps
+#     the first call (the wall-clock start) and counts the calls. Older OWUI never
+#     calls it: the inlet stamp and no count remain.
 #   * Since 0.12.0 the current outlet message carries `finish_reason` — the
 #     value from the LAST model call of the turn, never persisted. Provider-real
 #     for Chat Completions, Ollama and pipes passing an upstream response through;
@@ -735,15 +744,20 @@ class _Stats:
     balance: dict[str, Any] | None = None
 
 
+def _approx(tokens: dict[str, Any]) -> str:
+    """`≈` for a turn whose usage OWUI marked incomplete (0.12.5+: a model call reported no count)."""
+    return "≈" if tokens["incomplete"] else ""
+
+
 def _render_input(s: _Stats) -> str | None:
     if s.valves.show_input_tokens and s.tokens["input"] is not None:
-        return _with_icon(_icon(s.valves, "input"), _fmt_count(s.valves, s.tokens["input"]))
+        return _with_icon(_icon(s.valves, "input"), _approx(s.tokens) + _fmt_count(s.valves, s.tokens["input"]))
     return None
 
 
 def _render_output(s: _Stats) -> str | None:
     if s.valves.show_output_tokens and s.tokens["output"] is not None:
-        return _with_icon(_icon(s.valves, "output"), _fmt_count(s.valves, s.tokens["output"]))
+        return _with_icon(_icon(s.valves, "output"), _approx(s.tokens) + _fmt_count(s.valves, s.tokens["output"]))
     return None
 
 
@@ -758,13 +772,13 @@ def _render_finish(s: _Stats) -> str | None:
 
 def _render_total(s: _Stats) -> str | None:
     if s.valves.show_total_tokens and s.tokens["total"] is not None:
-        return _with_icon(_icon(s.valves, "total"), _fmt_count(s.valves, s.tokens["total"]))
+        return _with_icon(_icon(s.valves, "total"), _approx(s.tokens) + _fmt_count(s.valves, s.tokens["total"]))
     return None
 
 
 def _render_tokens_total(s: _Stats) -> str | None:
     # Token twin of cost_total: omitted when it equals the message Σ (first turn, unsaved chats).
-    # ≈ marks a total that includes a tiktoken-estimated current turn.
+    # ≈ marks a total that includes a tiktoken-estimated or an incomplete (OWUI 0.12.5+) turn.
     tokens = s.tokens
     if s.valves.show_cumulative_tokens and tokens["cumulative"] is not None and tokens["cumulative"] != tokens["total"]:
         prefix = "≈" if tokens["cumulative_est"] else ""
@@ -794,7 +808,8 @@ def _render_context(s: _Stats) -> str | None:
     size, used = s.ctx["size"], s.ctx["used"]
     if s.valves.show_context_window and size and used is not None:
         pct = (used / size) * 100
-        body = f"{_format_k(used)}/{_format_k(size)} ({pct:.0f}%)"
+        prefix = "≈" if s.ctx["used_est"] else ""
+        body = f"{prefix}{_format_k(used)}/{_format_k(size)} ({pct:.0f}%)"
         return _with_icon(_context_icon(s.valves, pct), body)
     return None
 
@@ -1134,6 +1149,27 @@ class Filter:
 
         return body
 
+    # --- request: right before each model call (OWUI 0.11.2+) ------------------
+
+    async def request(
+        self,
+        body: dict[str, Any],
+        __metadata__: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Stamp the first model call of the turn and count the calls.
+
+        OWUI calls this after RAG, web search and tool resolution, right before the model call, and again
+        before every tool-loop round, with the same `__metadata__` dict the outlet gets. The first stamp
+        starts the wall-clock generation time (so it excludes that pre-processing); the count lets
+        `_last_round_context` split a summed Anthropic-native cache. Older OWUI never calls it: the inlet
+        stamp and no count remain. Keep it trivial: unlike the outlet, OWUI re-raises an error from this hook
+        into the user's chat request (`utils/filter.py`).
+        """
+        if __metadata__ is not None:
+            __metadata__.setdefault("_tud_model_start", time.time())
+            __metadata__["_tud_model_calls"] = __metadata__.get("_tud_model_calls", 0) + 1
+        return body
+
     # --- outlet: build and emit the stats line ---------------------------------
 
     @staticmethod
@@ -1199,16 +1235,25 @@ class Filter:
 
         usage = assistant_msg.get("usage") if isinstance(assistant_msg.get("usage"), dict) else None
 
-        tokens = self._extract_tokens(usage, assistant_msg, messages, body, __model__)
+        model_id = _resolve_model_id(__model__, body)
+        calls = (__metadata__ or {}).get("_tud_model_calls")
+        model_calls = calls if isinstance(calls, int) else None
+        tokens = self._extract_tokens(usage, assistant_msg, messages, model_id, model_calls)
         timing = self._resolve_timing(usage, elapsed_seconds, tokens["output"])
         # The two resolvers touch valve-parsed maps and the network; a bug in either must degrade to a
         # sentinel, never break the response pipeline.
         try:
             ctx = await self._resolve_context(body, __metadata__, __model__, tokens, __request__)
         except Exception:  # noqa: BLE001
-            ctx = {"size": None, "used": None, "used_source": None, "source": "error", "matched_key": None}
+            ctx = {
+                "size": None,
+                "used": None,
+                "used_source": None,
+                "used_est": False,
+                "source": "error",
+                "matched_key": None,
+            }
 
-        model_id = _resolve_model_id(__model__, body)
         try:
             cost = await self._resolve_cost(usage, tokens, messages, model_id)
         except Exception:  # noqa: BLE001
@@ -1254,10 +1299,14 @@ class Filter:
         usage: dict[str, Any] | None,
         assistant_msg: dict[str, Any],
         messages: list[Any],
-        body: dict[str, Any],
-        model: dict[str, Any] | None,
+        model_id: str,
+        model_calls: int | None = None,
     ) -> dict[str, Any]:
-        """Return a normalized bag of token counts across all providers/APIs."""
+        """Return a normalized bag of token counts across all providers/APIs.
+
+        `model_calls` is how many model calls the turn made, counted by the `request` hook (OWUI 0.11.2+);
+        it only splits a summed Anthropic-native cache in `_last_round_context`.
+        """
         result: dict[str, Any] = {
             "input": None,
             "output": None,
@@ -1271,6 +1320,8 @@ class Filter:
             "input_has_cache": False,
             "fresh_input": None,
             "context_used": None,
+            "context_est": False,
+            "incomplete": False,
             "cumulative": None,
             "cumulative_est": False,
         }
@@ -1281,6 +1332,9 @@ class Filter:
             result["output"] = _first_num(usage, "output_tokens", "completion_tokens", "eval_count", "predicted_n")
             if result["input"] is not None or result["output"] is not None:
                 result["is_api"] = True
+                # OWUI 0.12.5+: a model call of the turn reported no input or output count, so the counters
+                # cover only part of it (always True when merge_usage saw such a call; absent before 0.12.5).
+                result["incomplete"] = usage.get("incomplete") is True
 
             # Reasoning: Chat Completions vs Responses API naming.
             result["reasoning"] = _detail_num(usage, "completion_tokens_details", "reasoning_tokens") or _detail_num(
@@ -1307,13 +1361,14 @@ class Filter:
 
         # Fallback estimation when the provider reported no usage.
         if not result["is_api"] and self.valves.fallback_to_tiktoken and _TIKTOKEN_AVAILABLE:
-            self._estimate_tokens(result, assistant_msg, messages, body, model)
+            self._estimate_tokens(result, assistant_msg, messages, model_id)
 
         # Derived total: fresh input + cache (read+write) + output — correct for every shape.
         result["total"] = self._compute_total(result)
 
         # The "used" side of 📐: the last round's request, not the cross-round sum.
-        result["context_used"] = self._last_round_context(usage, result)
+        result["context_used"] = self._last_round_context(usage, result, model_calls)
+        result["context_est"] = result["incomplete"] or self._summed_native_cache(usage, result)
 
         # Running chat total — derived after `total`, so the current turn counts exactly as displayed.
         cumulative = self._cumulative_tokens(messages, assistant_msg, result)
@@ -1322,16 +1377,9 @@ class Filter:
         return result
 
     def _estimate_tokens(
-        self,
-        result: dict[str, Any],
-        assistant_msg: dict[str, Any],
-        messages: list[Any],
-        body: dict[str, Any],
-        model: dict[str, Any] | None,
+        self, result: dict[str, Any], assistant_msg: dict[str, Any], messages: list[Any], model_id: str
     ) -> None:
         """Estimate input/output tokens with tiktoken when the provider reported no usage."""
-        model_id = _resolve_model_id(model, body)
-
         response_text = _message_text(assistant_msg)
         if response_text:
             est_out = _count_tokens_tiktoken(response_text, model_id)
@@ -1398,7 +1446,24 @@ class Filter:
         }
 
     @staticmethod
-    def _last_round_context(usage: dict[str, Any] | None, result: dict[str, Any]) -> int | None:
+    def _summed_native_cache(usage: dict[str, Any] | None, result: dict[str, Any]) -> bool:
+        """True when Anthropic-native cache in `usage` is a sum over several model calls (OWUI 0.12.5+).
+
+        Since 0.12.5 merge_usage sums cache_read/cache_creation_input_tokens across calls and always writes
+        `incomplete` (True or False) on such a merge; no earlier version writes that key. So the key on a usage
+        with native cache means the cache covers the whole turn, not its last request.
+        """
+        return (
+            isinstance(usage, dict)
+            and "incomplete" in usage
+            and not result.get("input_has_cache")
+            and bool((result.get("cached") or 0) + (result.get("cache_write") or 0))
+        )
+
+    @staticmethod
+    def _last_round_context(
+        usage: dict[str, Any] | None, result: dict[str, Any], model_calls: int | None = None
+    ) -> int | None:
         """Tokens occupying the model's context window at the end of the turn (the last request + its output).
 
         On a multi-round (tool/agent) turn OWUI's merge_usage SUMS input/output/total_tokens over
@@ -1408,9 +1473,13 @@ class Filter:
         regression, no fix). A single round has prompt == input. Anthropic-native input EXCLUDES
         cache (input_has_cache False), so its cache is added back: it occupies the window. Through
         OWUI 0.12.4 the top-level cache fields were last-round as well (in none of merge_usage's
-        summed sets); since 0.12.5 they are summed, so on a multi-round Anthropic-native turn this
-        over-counts by the earlier rounds' cache - a known gap, not fixed yet. None when the provider
-        reported no tokens (the tiktoken path): the caller falls back.
+        summed sets); since 0.12.5 they are summed over the turn's calls, and no per-call value
+        reaches the outlet. Then the cache added back is the per-call average (the sum divided by
+        `model_calls`, from the `request` hook) - an estimate the caller marks with ≈; it runs low,
+        as later rounds read a longer cached prefix, and lower still when `incomplete` is True: the count
+        then includes calls that reported no usage (or the cache is one call's, set by the middleware
+        without a merge). Without a call count the sum stays (≈ as well).
+        None when the provider reported no tokens (the tiktoken path): the caller falls back.
         """
         if not isinstance(usage, dict):
             return None
@@ -1420,7 +1489,10 @@ class Filter:
             return None
         used = (last_prompt or 0) + (last_completion or 0)
         if not result.get("input_has_cache"):
-            used += (result.get("cached") or 0) + (result.get("cache_write") or 0)
+            cache = (result.get("cached") or 0) + (result.get("cache_write") or 0)
+            if model_calls and model_calls > 1 and Filter._summed_native_cache(usage, result):
+                cache /= model_calls
+            used += cache
         return int(used)
 
     def _compute_total(self, result: dict[str, Any]) -> int | None:
@@ -1455,15 +1527,18 @@ class Filter:
         total = 0
         counted = 0
         skipped = 0
+        partial = False  # a past turn whose usage OWUI marked incomplete (0.12.5+)
         for m in messages:
             if not (isinstance(m, dict) and m.get("role") == "assistant") or m is assistant_msg:
                 continue
-            turn = self._compute_total(self._usage_token_bag(m.get("usage")))
+            usage = m.get("usage")
+            turn = self._compute_total(self._usage_token_bag(usage))
             if turn is None:
                 skipped += 1
                 continue
             total += turn
             counted += 1
+            partial = partial or (isinstance(usage, dict) and usage.get("incomplete") is True)
         current_total = current["total"]
         if current_total is not None:
             total += current_total
@@ -1472,7 +1547,7 @@ class Filter:
             skipped += 1  # keeps counted + skipped == number of assistant messages
         return {
             "total": total if counted else None,
-            "estimated": current_total is not None and not current["is_api"],
+            "estimated": partial or (current_total is not None and (not current["is_api"] or current["incomplete"])),
             "messages_counted": counted,
             "messages_skipped_no_usage": skipped,
         }
@@ -1490,8 +1565,9 @@ class Filter:
         return value
 
     def _resolve_wall_clock(self, body: dict[str, Any], metadata: dict[str, Any] | None) -> float | None:
-        """Wall-clock seconds from inlet->outlet (multi-level fallback + leak cleanup)."""
-        start_time = _num(self._inlet_stash(body, metadata, "_tud_start"))
+        """Wall-clock seconds from the first model call (else inlet) to outlet (multi-level fallback + leak cleanup)."""
+        inlet_start = _num(self._inlet_stash(body, metadata, "_tud_start"))
+        start_time = _num((metadata or {}).get("_tud_model_start")) or inlet_start
 
         # Reconstruct the module-dict key and ALWAYS pop it (fixes the leak where
         # the metadata path resolved timing but never released the module entry).
@@ -1542,7 +1618,9 @@ class Filter:
         if gen_seconds is None and wall_seconds is not None:
             gen_seconds, source = wall_seconds, "wall"
         if tps is None and output_tokens and wall_seconds and wall_seconds > 0:
-            tps = output_tokens / wall_seconds  # approximate; wall-clock includes pre-processing
+            # Approximate: from the first model call (OWUI 0.11.2+; from inlet before, RAG and web search
+            # included), so time spent running tools between rounds is in it.
+            tps = output_tokens / wall_seconds
 
         return {"seconds": gen_seconds, "tps": tps, "source": source}
 
@@ -1557,7 +1635,14 @@ class Filter:
         request: Any = None,
     ) -> dict[str, Any]:
         if not self.valves.show_context_window:
-            return {"size": None, "used": None, "used_source": None, "source": "disabled", "matched_key": None}
+            return {
+                "size": None,
+                "used": None,
+                "used_source": None,
+                "used_est": False,
+                "source": "disabled",
+                "matched_key": None,
+            }
 
         # Last request first (see _last_round_context); the summed total only when it is unknown.
         used, used_source = tokens["context_used"], "last_round"
@@ -1573,6 +1658,8 @@ class Filter:
             "size": size,
             "used": used,
             "used_source": used_source if used is not None else None,
+            # ≈: partial usage, or a summed Anthropic-native cache split per call (see _last_round_context).
+            "used_est": used is not None and tokens["context_est"],
             "source": prov["source"],
             "matched_key": prov["matched_key"],
         }
@@ -2437,6 +2524,8 @@ class Filter:
         m = model if isinstance(model, dict) else {}
         info_raw = m.get("info")
         info: dict[str, Any] = info_raw if isinstance(info_raw, dict) else {}
+        meta = info.get("meta")
+        caps = meta.get("capabilities") if isinstance(meta, dict) else None
         params: dict[str, Any] = {}
         function_calling = None
         if isinstance(metadata, dict) and isinstance(metadata.get("params"), dict):
@@ -2461,6 +2550,15 @@ class Filter:
             "backend_context": self._backend_context_debug(m),
             "live_backend": _live_backend(m),
             "provider_guess": self._provider_guess(m, resolved_id),
+            # The model's own switches that decide whether anything shows: with status_updates off OWUI never
+            # renders the stats line, with citations off never this debug source, and without usage it does
+            # not ask a streaming provider for token counts (-> tiktoken estimates). null = not set (default).
+            "capabilities": (
+                {key: caps.get(key) for key in ("status_updates", "citations", "usage")}
+                if isinstance(caps, dict)
+                else None
+            ),
+            "loaded": m.get("loaded") if isinstance(m.get("loaded"), bool) else None,
             "function_calling": function_calling,
             "owui_params": params,
             "gen_params_available": False,
@@ -2561,6 +2659,7 @@ class Filter:
             "size": size,
             "used": used,
             "used_source": stats.ctx.get("used_source"),
+            "used_est": stats.ctx.get("used_est"),
             "percent": percent,
         }
 
@@ -2579,6 +2678,8 @@ class Filter:
             "model": self._sanitize_model(stats.model, turn.metadata, resolved_id),
             "tokens": stats.tokens,
             "timing": stats.timing,
+            # From the `request` hook (OWUI 0.11.2+); null = not called, so the wall clock started at inlet.
+            "model_calls": (turn.metadata or {}).get("_tud_model_calls"),
             "cost": {k: val for k, val in stats.cost.items() if k != "debug"},
             "cost_debug": stats.cost.get("debug"),
             "balance": stats.balance,

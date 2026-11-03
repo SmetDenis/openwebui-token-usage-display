@@ -17,6 +17,15 @@ The key, start time and hint are mirrored into both `body["metadata"]` and `__me
 (`_tud_timing_key`, `_tud_start`, `_tud_num_ctx`) so outlet can recover them even if the module
 dict was lost (server restart, multi-worker).
 
+### `request()` — v2.10.0, issue #39
+
+OWUI 0.11.2+ calls a filter's `request(body, ...)` after RAG, web search and tool resolution, right before
+the model call, and again before every tool-loop round (`middleware.py` `process_chat_payload` and the tool
+loop; checked in v0.12.5), with the same `__metadata__` dict the outlet gets. The plugin writes
+`_tud_model_start` there once (`setdefault`: the first call) and counts `_tud_model_calls`. Older OWUI never
+calls it, so the inlet stamp and no count remain. Known slack: a tool-approval resume is a new request whose
+`resume_tool_calls` runs the hook once more before the regular call, so its count can be one too high.
+
 ### `outlet()` — `usage_display.py:932-1009`
 
 Orchestration order (each step degrades gracefully, never raises out):
@@ -74,8 +83,8 @@ against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
 - Re-checked against a `v0.12.0...v0.12.5` diff (2026-11-03, v2.9.0): 0.12.5 drops the guaranteed
   triple (above), sums the top-level Anthropic cache fields across calls, and stops summing usage chunks
   within one call (`update_usage_snapshot`). The NOTE block and `_last_round_context` say so; the cache
-  change leaves a **known gap** in `📐` (see "Context used" below). Details: `docs/owui-map.md`, "What
-  changed in v0.12.1-v0.12.5".
+  change left a gap in `📐`, closed approximately in v2.10.0 (see "Context used" below). Details:
+  `docs/owui-map.md`, "What changed in v0.12.1-v0.12.5".
 
 Any change to token/cost/context reading must be reconciled against this block AND re-verified
 against real OWUI source of the version being targeted — never against memory or docs.
@@ -342,10 +351,20 @@ Design decisions:
   tokenizers, for a version being phased out).
 - **Anthropic-native cache is added back** (its `input` excludes cache); through OWUI 0.12.4 the
   top-level cache fields are in none of `merge_usage`'s summed sets, so they are last-round too and the
-  sum stays consistent. **Known gap since 0.12.5:** those two fields are summed across calls, so on a
-  multi-round Anthropic-native turn `📐` adds every round's cache to the last request and over-counts.
-  Single-request turns and proxies that fold cache into `*_tokens_details` (LiteLLM) are unaffected.
-  Not fixed yet: the turn's usage keeps no last-round cache to read instead.
+  sum stays consistent. **Since 0.12.5** those two fields are summed across calls, and no per-call value
+  reaches the outlet (per-call usage only goes into the next request's tool messages). v2.10.0 (issue
+  #39) adds the **per-call average** instead: the sum divided by the call count from the `request` hook,
+  marked `≈` (`ctx["used_est"]`). `_summed_native_cache` detects the case: native cache plus an
+  `incomplete` key, which 0.12.5's `merge_usage` writes (True or False) on every merge of several calls
+  and no earlier version writes. Single-request turns and proxies that fold cache into `*_tokens_details`
+  (LiteLLM) are unaffected; a 0.12.0-0.12.4 usage (last-call cache, no key) is left as is.
+  Owner's choice among three: the average (runs a little low - later calls read a longer cached prefix -
+  and lower when `incomplete` is True: the count then includes calls that sent no usage, and the
+  middleware's `{**usage, "incomplete": True}` can leave one call's cache unsummed);
+  rejected: keeping the sum with `≈` (the #26 symptom again: 200-300% on a free window) and dropping the
+  cache with `≈` (what OWUI's own indicator does; a lower bound that can read 5% at a real 80% and miss
+  the warning). Rejected too: counting calls from the `output` array (depends on item structure the
+  hook makes unnecessary). Without a count (hook not called) the sum stays, with `≈`.
 - **The other counters are untouched** (`⬆︎`, `⬇︎`, `Σ`, `🧮`, cost keep summing every round), so on
   a tool turn `⬆︎` can be far above `📐` — documented in the README rather than "aligned".
 - Contributed in PR #27, released as 2.7.0 (owner's choice): 2.6.1 is skipped because a withdrawn
@@ -427,8 +446,18 @@ models.dev tables. Classic failure: `claude-opus-4.8` (dot) does not substring-m
   estimated over all non-assistant messages (or just the last user message).
 - **Timing — `_resolve_timing` (`:1198+`)**: provider-reported wins (Ollama
   `eval_duration`/`response_token/s`, llama.cpp `predicted_ms`/`predicted_per_second`), else
-  wall-clock marked `~`. Wall-clock includes OWUI-side RAG/web-search time — a platform limitation
-  (no hook right before the LLM call).
+  wall-clock marked `~`. Since v2.10.0 (issue #39) the wall clock starts at the **first model call**
+  (`_tud_model_start` from the `request` hook, OWUI 0.11.2+), else at inlet as before, so RAG and web
+  search are left out. Owner's choice: from the first call, not the last — tokens are summed over every
+  round, so timing only the last round would inflate t/s on tool turns; the price is that tool execution
+  between rounds counts as generation time.
+- **Partial usage — `tokens["incomplete"]` (v2.10.0, issue #39)**: OWUI 0.12.5 writes `incomplete: true`
+  when a call of the turn reported no input or output count (`merge_usage`, and the middleware's
+  `{**usage, "incomplete": True}` for a later call with no usage). With counters present, every token
+  counter renders with `≈` (`_approx`: `⬆︎`, `⬇︎`, `Σ`; `📐` via `context_est`; `🧮` via
+  `cumulative_est`, also when a past turn carries the flag). Owner's choice: all token counters, not only
+  the totals (`⬆︎`/`⬇︎` are the partial ones) and not debug-only. Cost is not marked: it is not a token
+  counter, and an estimate already carries `≈`. Without counters the usage is "no usage" (tiktoken) as before.
 
 ### Chat token total — design decisions (v2.6.0)
 
@@ -483,6 +512,12 @@ against models.dev. All three aiohttp fetchers catch broad `Exception` and degra
   snapshot; the `balance` block carries no key or URL.
 - Includes a `web_search` hint (server-side web citations detected via http(s)-host URL check) —
   flags that a provider's search surcharge may be billed outside `usage.cost`.
+- v2.10.0 (issue #39): `model.capabilities` (`status_updates`, `citations`, `usage` from
+  `info.meta.capabilities`, whitelisted; `null` = not set) and `model.loaded` (the listing's bool) for "nothing
+  shows" reports; top-level `model_calls` (the `request` hook count, `null` when it never ran — then timing
+  started at inlet); `context_debug.used_est`. A payload with 15 entries in each map plus OpenRouter
+  `cost_details` measured 7.2k characters; OWUI's modal cuts at 10,000 behind "Show all", so no cap was
+  added (README notes it; stdout stays complete).
 
 ## Edge-case catalog
 
@@ -493,6 +528,9 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | `UserValves.enabled=False` | outlet no-op | `:940-942` | `test_outlet_skips_when_user_disabled` |
 | no `__event_emitter__` (raw API, no `chat_id`) / `channel:` chat (v2.9.1) | return before any resolver; `channel:` with `debug_mode` still runs for stdout | `_can_show` | `test_outlet_does_no_work_where_nothing_can_be_shown` |
 | `prompt_tokens_details.cached_tokens: 0` + top-level `cache_creation_input_tokens` (v2.9.1) | detail dict present → cache is a subset, no double count | `_cache_and_fresh` | `test_cache_and_fresh_zero_cache_read_keeps_proxy_subset_semantics` |
+| `incomplete: true` beside counters, current or past turn (OWUI 0.12.5, v2.10.0) | `≈` on `⬆︎` `⬇︎` `Σ` `📐`, and `🧮` | `_approx`, `_cumulative_tokens` | `test_outlet_marks_owui_0125_incomplete_usage_approximate` |
+| multi-call Anthropic-native usage, cache summed (OWUI 0.12.5, v2.10.0) | `📐` adds cache / call count from the `request` hook, `≈`; no count → sum, `≈`; no `incomplete` key (≤0.12.4) → unchanged | `_last_round_context`, `_summed_native_cache` | `test_outlet_splits_summed_anthropic_native_cache_per_model_call` |
+| `request` hook called (OWUI 0.11.2+) / never called | wall clock from the first model call / from inlet | `request`, `_resolve_wall_clock` | `test_request_hook_times_from_the_first_model_call` |
 | outlet returns early (stats off, nowhere to show, no reply) (v2.9.1) | inlet timing entry still popped | `outlet` → `_resolve_wall_clock` | `test_outlet_releases_the_inlet_timing_entry_on_every_early_return` |
 | any of the 7 background tasks | early return | `:945-955` | `test_outlet_skips_every_background_task_string` |
 | empty `messages` / no assistant msg | early return | `:957-962` | `test_outlet_no_messages_or_no_assistant` |

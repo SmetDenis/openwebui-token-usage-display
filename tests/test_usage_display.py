@@ -117,6 +117,8 @@ def make_tokens(**over: Any) -> dict[str, Any]:
         "input_has_cache": False,
         "fresh_input": 100,
         "context_used": None,
+        "context_est": False,
+        "incomplete": False,
         "cumulative": None,
         "cumulative_est": False,
     }
@@ -131,7 +133,14 @@ def make_timing(**over: Any) -> dict[str, Any]:
 
 
 def make_ctx(**over: Any) -> dict[str, Any]:
-    base: dict[str, Any] = {"size": None, "used": None, "used_source": None, "source": "none", "matched_key": None}
+    base: dict[str, Any] = {
+        "size": None,
+        "used": None,
+        "used_source": None,
+        "used_est": False,
+        "source": "none",
+        "matched_key": None,
+    }
     base.update(over)
     return base
 
@@ -827,7 +836,7 @@ def test_cache_and_fresh_zero_cache_read_keeps_proxy_subset_semantics(usage_disp
     assert out["input_has_cache"] is True
     assert out["fresh_input"] == 100
 
-    tokens = f._extract_tokens(usage, make_message("a", usage=usage), [], {}, None)
+    tokens = f._extract_tokens(usage, make_message("a", usage=usage), [], "")
     assert tokens["total"] == 5150
     assert tokens["context_used"] == 5150
 
@@ -851,7 +860,7 @@ def test_extract_tokens_openai_chat(usage_display_module: ModuleType) -> None:
         completion_tokens_details={"reasoning_tokens": 8, "audio_tokens": 2},
         prompt_tokens_details={"cached_tokens": 20, "audio_tokens": 1},
     )
-    t = f._extract_tokens(usage, make_message(), [], make_body(), None)
+    t = f._extract_tokens(usage, make_message(), [], "")
     assert t["input"] == 100
     assert t["output"] == 50
     assert t["is_api"] is True
@@ -864,7 +873,7 @@ def test_extract_tokens_openai_chat(usage_display_module: ModuleType) -> None:
 def test_extract_tokens_responses_api_naming(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     usage = make_usage(output_tokens_details={"reasoning_tokens": 5}, input_tokens_details={"cached_tokens": 10})
-    t = f._extract_tokens(usage, make_message(), [], make_body(), None)
+    t = f._extract_tokens(usage, make_message(), [], "")
     assert t["reasoning"] == 5
     assert t["cached"] == 10
 
@@ -872,7 +881,7 @@ def test_extract_tokens_responses_api_naming(usage_display_module: ModuleType) -
 def test_extract_tokens_ollama_backup_keys(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     usage = {"prompt_eval_count": 77, "eval_count": 22}  # Ollama naming, no normalized triple
-    t = f._extract_tokens(usage, make_message(), [], make_body(), None)
+    t = f._extract_tokens(usage, make_message(), [], "")
     assert t["input"] == 77
     assert t["output"] == 22
     assert t["is_api"] is True
@@ -885,7 +894,7 @@ def test_extract_tokens_estimate_fallback_when_no_usage(
     f = usage_display_module.Filter()
     assistant = make_message("one two three")  # 3 words -> 3 output tokens
     user = make_message("alpha beta", role="user")  # 2 words -> input
-    t = f._extract_tokens(None, assistant, [user, assistant], make_body(model="gpt-4o"), None)
+    t = f._extract_tokens(None, assistant, [user, assistant], "gpt-4o")
     assert t["is_api"] is False
     assert t["output"] == 3
     assert t["input"] == 2
@@ -900,7 +909,8 @@ def test_extract_tokens_estimate_uses_model_dict_id(
     assistant = make_message("one two three")
     user = make_message("alpha beta", role="user")
     model = make_model_dict("gpt-4o-est-model-dict")
-    t = f._extract_tokens(None, assistant, [user, assistant], make_body(), model)
+    model_id = usage_display_module._resolve_model_id(model, make_body())  # as outlet resolves it
+    t = f._extract_tokens(None, assistant, [user, assistant], model_id)
     assert t["output"] == 3
     assert t["input"] == 2
 
@@ -912,7 +922,7 @@ def test_estimate_tokens_skips_output_when_response_text_empty(
     f = usage_display_module.Filter()
     assistant = make_message(content="")  # no content, no output -> empty response text
     user = make_message("alpha beta", role="user")
-    t = f._extract_tokens(None, assistant, [user, assistant], make_body(model="gpt-4o"), None)
+    t = f._extract_tokens(None, assistant, [user, assistant], "gpt-4o")
     assert t["output"] is None  # empty response text -> tiktoken estimate never attempted
     assert t["input"] == 2
 
@@ -926,7 +936,7 @@ def test_estimate_tokens_est_out_none_when_tiktoken_unavailable_mid_call(
     result: dict[str, Any] = {"output": None, "input": None}
     assistant = make_message("one two three")
     user = make_message("alpha beta", role="user")
-    f._estimate_tokens(result, assistant, [user, assistant], make_body(model="gpt-4o"), None)
+    f._estimate_tokens(result, assistant, [user, assistant], "gpt-4o")
     assert result["output"] is None
     assert result["input"] is None
 
@@ -941,7 +951,7 @@ def test_estimate_tokens_last_user_message_only(
     assistant = make_message("resp one two")
     user1 = make_message("alpha", role="user")
     user2 = make_message("beta gamma delta", role="user")  # last user message -> wins
-    t = f._extract_tokens(None, assistant, [user1, assistant, user2], make_body(model="gpt-4o"), None)
+    t = f._extract_tokens(None, assistant, [user1, assistant, user2], "gpt-4o")
     assert t["input"] == 3  # "beta gamma delta" -> 3 words
 
 
@@ -953,7 +963,7 @@ def test_estimate_tokens_last_user_message_none_when_absent(
     f = usage_display_module.Filter()
     f.valves.count_all_messages_for_input = False
     assistant = make_message("resp one two")
-    t = f._extract_tokens(None, assistant, [assistant], make_body(model="gpt-4o"), None)
+    t = f._extract_tokens(None, assistant, [assistant], "gpt-4o")
     assert t["input"] is None
     assert t["output"] == 3
 
@@ -1024,7 +1034,7 @@ def test_extract_tokens_fills_cumulative(usage_display_module: ModuleType) -> No
     f = usage_display_module.Filter()
     current = make_message("a2", usage=make_usage(input_tokens=300, output_tokens=20))
     messages = [make_message("a1", usage=make_usage()), make_message("q", role="user"), current]
-    t = f._extract_tokens(current["usage"], current, messages, make_body(messages), None)
+    t = f._extract_tokens(current["usage"], current, messages, "")
     assert t["total"] == 320
     assert t["cumulative"] == 470
     assert t["cumulative_est"] is False
@@ -1482,10 +1492,17 @@ def test_sanitize_model_whitelist_only_no_secrets(usage_display_module: ModuleTy
     model = {
         "id": "gpt-4o",
         "name": "GPT-4o",
-        "info": {"base_model_id": "gpt-4o-mini"},
+        "info": {
+            "base_model_id": "gpt-4o-mini",
+            "meta": {
+                "capabilities": {"status_updates": False, "citations": True, "vision": True},
+                "description": "leaked description",
+            },
+        },
         "owned_by": "openai",
         "connection_type": "external",
         "provider": "openai",
+        "loaded": True,
         "preset": True,
         "pipe": False,
         "urlIdx": 0,
@@ -1522,6 +1539,8 @@ def test_sanitize_model_whitelist_only_no_secrets(usage_display_module: ModuleTy
         "backend_context",
         "live_backend",
         "provider_guess",
+        "capabilities",
+        "loaded",
         "function_calling",
         "owui_params",
         "gen_params_available",
@@ -1533,6 +1552,10 @@ def test_sanitize_model_whitelist_only_no_secrets(usage_display_module: ModuleTy
     assert "leaked" not in str(out)
 
     assert out["resolved_id"] == "gpt-4o-mini-resolved"
+    # Only the three render/usage switches; unset ones are null (= OWUI's default), others never copied.
+    assert out["capabilities"] == {"status_updates": False, "citations": True, "usage": None}
+    assert out["loaded"] is True
+    assert f._sanitize_model({"id": "raw"}, None, "raw")["capabilities"] is None  # plain model: no info at all
     assert out["id"] == "gpt-4o"
     assert out["name"] == "GPT-4o"
     assert out["base_model_id"] == "gpt-4o-mini"
@@ -2131,6 +2154,138 @@ def test_outlet_context_reads_last_round_of_owui_merged_usage(
     assert '"used_source": "last_round"' in doc
 
 
+# `usage` exactly as Open WebUI 0.12.5 leaves it (generated by feeding per-call payloads through the real
+# utils/response.py: update_usage_snapshot per call, merge_usage across calls, and the middleware's
+# `{**usage, "incomplete": True}` for a later call that reported no usage).
+_OWUI_0125_USAGE: dict[str, dict[str, Any]] = {
+    # Three Anthropic-native calls (a pass-through pipe), cache read 9000/9500/9800, write 500/300/0: the cache
+    # is summed; the last request really held 100 + 9800 + 150 = 10050.
+    "anthropic-native-3-calls": {
+        "cache_read_input_tokens": 28300,
+        "cache_creation_input_tokens": 800,
+        "incomplete": False,
+        "input_tokens": 600,
+        "output_tokens": 290,
+        "total_tokens": 890,
+        "prompt_tokens": 100,
+        "completion_tokens": 150,
+    },
+    # One Chat Completions call with usage, then one without any.
+    "later-call-without-usage": {
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "total_tokens": 1100,
+        "prompt_tokens": 1000,
+        "completion_tokens": 100,
+        "incomplete": True,
+    },
+    # Two complete Chat Completions calls: merged, but nothing is missing.
+    "two-complete-calls": {
+        "input_tokens": 2300,
+        "output_tokens": 150,
+        "total_tokens": 2450,
+        "prompt_tokens": 1300,
+        "completion_tokens": 50,
+        "incomplete": False,
+    },
+}
+
+
+def _outlet_line(f: Any, usage: dict[str, Any], metadata: dict[str, Any] | None = None, past: Any = None) -> str:
+    messages = [make_message("q", role="user")]
+    if past is not None:
+        messages += [past, make_message("q2", role="user")]
+    messages.append(make_message("a", usage=usage))
+    emitter = CapturingEmitter()
+    body = make_body(messages, model="gpt-4o")
+    run_async(f.outlet(body, __event_emitter__=emitter, __model__=make_model_dict("gpt-4o"), __metadata__=metadata))
+    return str(emitter.statuses()[0]["data"]["description"])
+
+
+def test_outlet_marks_owui_0125_incomplete_usage_approximate(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model call of the turn reported no count (issue #39): every token counter gets ≈, and only then."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    f.valves.context_size_override = 10_000
+    line = _outlet_line(f, _OWUI_0125_USAGE["later-call-without-usage"])
+    assert "⬆︎ ≈1,000 · ⬇︎ ≈100 · Σ ≈1,100" in line
+    assert "📐 ≈1.1k/10.0k (11%)" in line
+
+    clean = _outlet_line(f, _OWUI_0125_USAGE["two-complete-calls"])
+    assert "≈" not in clean  # a merge alone (incomplete: false) is exact
+    assert "📐 1.4k/10.0k" in clean
+
+    # 🧮: a past turn with partial usage makes the chat total approximate too.
+    past = make_message("old", usage=_OWUI_0125_USAGE["later-call-without-usage"])
+    assert "🧮 ≈" in _outlet_line(f, _OWUI_0125_USAGE["two-complete-calls"], past=past)
+
+
+def test_outlet_splits_summed_anthropic_native_cache_per_model_call(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OWUI 0.12.5 sums Anthropic-native cache over the turn's calls (issue #39): 📐 adds the per-call average.
+
+    The `request` hook counts the calls. The average runs a little low (later calls read a longer prefix), so
+    📐 carries ≈; without a count (OWUI < 0.11.2 never calls the hook) the sum stays, still with ≈.
+    """
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    f.valves.context_size_override = 100_000
+    usage = _OWUI_0125_USAGE["anthropic-native-3-calls"]
+
+    meta: dict[str, Any] = {"chat_id": "c1", "message_id": "m1"}
+    for _ in range(3):
+        run_async(f.request({"messages": []}, __metadata__=meta))
+    assert meta["_tud_model_calls"] == 3
+    line = _outlet_line(f, usage, meta)
+    assert "📐 ≈9.9k/100.0k (10%)" in line  # 100 + 150 + (28300 + 800) / 3; really 10050
+    assert "⬆︎ 600 ·" in line  # the counters themselves are complete: no ≈ there
+
+    assert "📐 ≈29.4k/100.0k (29%)" in _outlet_line(f, usage, {"chat_id": "c1", "message_id": "m2"})
+
+    # Before 0.12.5 the cache was last-call already (no `incomplete` key): unchanged, exact.
+    last_call = {k: v for k, v in usage.items() if k != "incomplete"}
+    assert "📐 29.4k/100.0k" in _outlet_line(f, last_call, dict(meta))
+
+    # Debug names the call count and the estimate.
+    f.valves.debug_mode = True
+    emitter = CapturingEmitter()
+    body = make_body([make_message("q", role="user"), make_message("a", usage=usage)], model="gpt-4o")
+    run_async(f.outlet(body, __event_emitter__=emitter, __model__=make_model_dict("gpt-4o"), __metadata__=meta))
+    doc = next(e for e in emitter.events if e.get("type") == "citation")["data"]["document"][0]
+    assert '"model_calls": 3' in doc
+    assert '"used_est": true' in doc
+
+
+def test_request_hook_times_from_the_first_model_call(usage_display_module: ModuleType) -> None:
+    """The wall clock starts at the first model call, after RAG and web search (OWUI 0.11.2+, issue #39)."""
+    f = usage_display_module.Filter()
+    meta: dict[str, Any] = {"chat_id": "c1", "message_id": "m1"}
+    run_async(f.inlet(make_body([make_message("hi", role="user")]), __metadata__=meta))
+    meta["_tud_start"] -= 60  # inlet 60 s ago: RAG and web search took a minute
+    body: dict[str, Any] = {"messages": []}
+    assert run_async(f.request(body, __metadata__=meta)) is body
+    first = meta["_tud_model_start"]
+    run_async(f.request(body, __metadata__=meta))  # a tool-loop round
+    assert meta["_tud_model_start"] == first  # the first call stays the start
+    assert meta["_tud_model_calls"] == 2
+    meta["_tud_model_start"] -= 5
+    elapsed = f._resolve_wall_clock({}, meta)
+    assert elapsed is not None
+    assert 5 <= elapsed < 30  # well below the 60 s an inlet start would give, with CI-runner slack
+
+    # No hook call (OWUI < 0.11.2): from inlet, as before.
+    old: dict[str, Any] = {"chat_id": "c1", "message_id": "m2"}
+    run_async(f.inlet(make_body([make_message("hi", role="user")]), __metadata__=old))
+    old["_tud_start"] -= 60
+    elapsed = f._resolve_wall_clock({}, old)
+    assert elapsed is not None
+    assert elapsed >= 60
+    assert run_async(f.request(body)) is body  # no metadata: nothing to stamp, body passes through
+
+
 def test_outlet_context_on_owui_010_merged_usage_stays_summed(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2276,7 +2431,14 @@ def test_resolve_context_disabled_short_circuits(
     ctx = run_async(
         f._resolve_context(make_body(model="gpt-4o"), {}, make_model_dict("gpt-4o"), make_tokens(total=100))
     )
-    assert ctx == {"size": None, "used": None, "used_source": None, "source": "disabled", "matched_key": None}
+    assert ctx == {
+        "size": None,
+        "used": None,
+        "used_source": None,
+        "used_est": False,
+        "source": "disabled",
+        "matched_key": None,
+    }
 
 
 def test_context_size_for_modelsdev_populated_table_match(
@@ -3155,7 +3317,7 @@ def test_outlet_reads_owui_0125_incomplete_usage_as_no_usage(
     assert "⬇︎ 3" in line  # tiktoken estimate of the reply
     assert line.endswith("[est.]")
     assert "🧮" not in line  # the past turn has no counter, so the chat total equals this turn and is hidden
-    tokens = f._extract_tokens(current["usage"], current, messages, {}, None)
+    tokens = f._extract_tokens(current["usage"], current, messages, "")
     cumulative = f._cumulative_tokens(messages, current, tokens)
     # The current turn counts with its estimated Σ; the past one is skipped, never re-estimated.
     assert (cumulative["messages_counted"], cumulative["messages_skipped_no_usage"]) == (1, 1)
