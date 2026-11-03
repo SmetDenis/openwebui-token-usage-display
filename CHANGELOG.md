@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.10.0]
+
+Improvements from the re-check against Open WebUI 0.12.5 ([#39](https://github.com/SmetDenis/openwebui-token-usage-display/issues/39)). No valve was added, removed or changed.
+
+- **Partial token counts are marked `≈`.** Open WebUI 0.12.5 reports when a request of a turn (say, one round of a tool call) sent no token count. The counts of such a response are lower than what was really used, so `⬆︎`, `⬇︎`, `Σ` and `📐` now show `≈`, and so does `🧮` for the rest of the chat. Older Open WebUI versions do not report this, and nothing changes there.
+- **Fixed: too high a context window `📐` on tool turns with Anthropic's own usage format** (the known gap from 2.9.0). Open WebUI 0.12.5 adds up Anthropic's cache over all requests of the turn and keeps no per-request value, so the plugin now counts the requests itself and adds the average cache per request, marked `≈`. Example: three requests reading 9,000 / 9,500 / 9,800 cached tokens now show `≈9.9k` instead of `29.4k` (the real last request: 10.1k). This applies to usage in Anthropic's format from a pipe or a pass-through proxy; LiteLLM and OpenRouter convert it and were never affected.
+- **Generation time no longer includes RAG and web search** (Open WebUI 0.11.2+). The wall-clock time (`~`) and the tokens/second computed from it now start at the first request to the model instead of when the message was sent. Tools that run between requests still count. Times the provider reports itself (Ollama, llama.cpp) are unchanged.
+- `debug_mode`: `model.capabilities` shows the model's `status_updates`, `citations` and `usage` switches (the usual reasons nothing shows, or tokens are only estimated) and `model.loaded` the backend's loaded flag; `model_calls` shows how many requests the turn made; `context_debug.used_est` whether `📐` is an estimate.
+- README: why the plugin's `📐` differs from Open WebUI's own context indicator, what another filter's status does to the line, and what a shared chat shows of `debug_mode`.
+- Not done, on purpose: reading llama.cpp's `cache_n`. llama.cpp builds since March 2026 report cached tokens in the standard `prompt_tokens_details`, which the plugin already reads.
+
 ## [2.9.1]
 
 Fixes from an independent re-check against Open WebUI 0.12.5 ([#38](https://github.com/SmetDenis/openwebui-token-usage-display/issues/38)). No valve was added or removed and none changed its type or default (two descriptions were corrected), so the update saves over any 2.x install, and rolling back stays possible.

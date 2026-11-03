@@ -106,7 +106,8 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 ## Architecture (summary — details live in the imports above)
 
 - `class Filter` implements the OWUI filter contract: async `inlet` (stashes wall-clock start and
-  a `num_ctx` hint) and async `outlet` (the orchestrator: gates → extract tokens → timing →
+  a `num_ctx` hint), async `request` (OWUI 0.11.2+, before every model call: stamps the first call as
+  the wall-clock start and counts the calls) and async `outlet` (the orchestrator: gates → extract tokens → timing →
   context → cost → build stats → emit a `status` event). Both resolver calls are individually
   exception-guarded — the plugin must never break the response pipeline.
 - Config is two Pydantic models: `Valves` (admin — all toggles, ordering, cost/context maps and
@@ -131,7 +132,7 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (247 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (250 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
 and `make_*` builders live at the top of the test file). The only outside state any test reads is git:
 `tests/test_valves_compat.py` (4 tests) loads every release tag's `usage_display.py`, and

@@ -189,6 +189,18 @@ The five things a maintainer must know before touching token/context/UX code:
   (`src/routes/(app)/admin/functions/create/+page.svelte:23` and `edit/+page.svelte:24`); the
   backend never checks it.
 
+## The `request` filter hook (0.11.2+)
+
+`process_filter_functions(filter_type='request')` runs right before a model call: at the end of
+`process_chat_payload` (after RAG, web search, tool resolution and the inlet filters; `middleware.py:3036` in
+v0.12.5), before every tool-loop round (`:6082`, `:6303`), and in `resume_tool_calls` (`:3219`) before approved
+tools run on a tool-approval resume. Its `extra_params` carry the same `__metadata__` dict that the outlet later
+gets (`:2238`, `:4169`, `:3869`), so a value written there reaches the outlet. The handler is looked up as
+`getattr(function_module, 'request')` (`utils/filter.py`) and gets `body` (the form data) plus the dunder kwargs
+it names; its return value becomes the request body. First in `v0.11.2` (absent in `v0.11.1`). The
+`function_calling` task (default tool mode) and context-compaction summaries are separate task calls, not
+preceded by it and not merged into the reply's usage.
+
 ## Dunder kwargs available to filter hooks
 
 A handler receives only the subset its signature names. Built at `middleware.py:2401-2411` (inlet),

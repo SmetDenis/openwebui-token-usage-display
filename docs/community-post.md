@@ -43,7 +43,7 @@ The filter reads Open WebUI's **normalized usage** attached to the response, so 
 
 - **Providers:** OpenAI (Chat Completions **and** Responses API), Anthropic, Google Gemini, Ollama, llama.cpp, and any OpenAI-compatible endpoint.
 - **Token counts** come straight from the reported usage. When a provider reports no usage, the plugin falls back to **tiktoken** estimation over the response text (extracted from the 0.10.x structured `output`).
-- **Timing / tokens-per-second** prefer the provider's own numbers where available (Ollama `eval_duration`, llama.cpp `timings`). Otherwise a wall-clock measurement is shown, prefixed with `~` to indicate it's approximate - note that wall-clock can include time spent on web search, RAG or tool calls, since there is no hook immediately before the model call.
+- **Timing / tokens-per-second** prefer the provider's own numbers where available (Ollama `eval_duration`, llama.cpp `timings`). Otherwise a wall-clock measurement is shown, prefixed with `~` to indicate it's approximate - on Open WebUI 0.11.2+ it starts at the first request to the model, so web search and RAG before it are left out (tools that run between requests still count); older versions start it when the message is sent.
 
 ### Context-window detection
 
@@ -133,8 +133,9 @@ Fixed in **v2.2.0** — upgrade. Some proxies (LiteLLM) fold Anthropic's cache t
 
 ### Notes & limitations
 
-- For providers that **don't** report a generation duration (OpenAI, Anthropic), time and t/s are measured as wall-clock and marked `~`; with web search / RAG / tool calls enabled, that figure includes the pre-model work. Local providers (Ollama, llama.cpp) report real generation time and are unaffected.
-- On Open WebUI 0.12.5, a response with tool calls from an Anthropic model reached natively (not through a proxy like LiteLLM) shows too high a context window `📐`: Open WebUI now adds up Anthropic's cache over all requests of the turn, and `📐` counts the earlier requests' cache too. A fix will follow.
+- For providers that **don't** report a generation duration (OpenAI, Anthropic), time and t/s are measured as wall-clock and marked `~`; it starts at the first request to the model on Open WebUI 0.11.2+ (before that, at send time, so web search / RAG are included), and tools that run between requests count. Local providers (Ollama, llama.cpp) report real generation time and are unaffected.
+- When Open WebUI (0.12.5+) reports that a request of the turn sent no token count, every token number of that response is marked `≈`: the real counts are higher.
+- On Open WebUI 0.12.5+, a response with tool calls whose usage comes in Anthropic's own format (from a pipe or a pass-through proxy; LiteLLM and OpenRouter convert it) gets its cache summed over all requests. `📐` then adds the average cache per request, marked `≈` - a close estimate that runs a little low.
 - In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn. The truncation marker likewise reflects the last request of the turn.
 - In a Realtime voice call (Open WebUI 0.12.0+), replies the voice model speaks on its own never pass through filters, so they get no stats line; questions it hands to the chat model are ordinary responses and do.
 - Estimated cost (`≈`) is a ballpark from published models.dev prices, not your invoice; long-context tier pricing isn't modelled and, when the model can't be mapped to a provider, no estimate is shown. Provider-reported cost (`auto` mode) is exact.
