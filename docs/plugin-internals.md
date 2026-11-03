@@ -21,8 +21,8 @@ dict was lost (server restart, multi-worker).
 
 Orchestration order (each step degrades gracefully, never raises out):
 
-1. **UserValves kill-switch** (`:940-942`) — `enabled=False` returns the body untouched.
-2. **Background-task guard** (`:945-955`) — skips the 7 `metadata["task"]` values
+1. **UserValves kill-switch** (`_turn_skipped`, since v2.9.0) — `enabled=False` returns the body untouched.
+2. **Background-task guard** (`_turn_skipped`) — skips the 7 `metadata["task"]` values
    (`title_generation`, `tags_generation`, `follow_up_generation`, `emoji_generation`,
    `query_generation`, `autocomplete_generation`, `moa_response_generation`). Defensive only: task
    requests never run filter functions at all, through v0.12.0 (see `docs/owui-map.md`). The guard
@@ -32,7 +32,8 @@ Orchestration order (each step degrades gracefully, never raises out):
 4. `_resolve_wall_clock` (`:966`) → `_extract_tokens` (`:969`) → `_resolve_timing` (`:970`).
 5. `_resolve_context` (`:971-974`) and `_resolve_cost` (`:977-980`) — each wrapped in its own
    `try/except Exception` with a sentinel fallback (`source="error"` / all-`None` cost), so a
-   resolver bug can never kill the response pipeline.
+   resolver bug can never kill the response pipeline. `_resolve_balance` (v2.9.0) follows under the
+   same guard (`status="error"`).
 6. `_build_stats` (`:982`) joins the parts with `valves.separator`; `debug_mode` appends `(debug)`.
    The `_Stats` it gets also carries the message's `finish_reason` (a string, else `None`; OWUI 0.12.0+).
 7. Emits `{"type": "status", "data": {"description": ..., "done": True}}` (`:986-992`), then in
@@ -44,7 +45,9 @@ Orchestration order (each step degrades gracefully, never raises out):
 The NOTE block at `usage_display.py:14-56` is the source-verified contract with OWUI. Re-verified
 against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
 
-- Normalized triple guaranteed on every save path — **confirmed** (`utils/response.py:14-51,105`).
+- Normalized triple guaranteed on every save path — **confirmed** through 0.12.4
+  (`utils/response.py:14-51,105`); **no longer true since 0.12.5** (a missing counter is left out, a
+  streamed call without usage leaves `{"incomplete": True}`) — the NOTE block says so since v2.9.0.
 - `info` is a redundant mirror of `usage` — **confirmed** (`models/chat_messages.py:370-371`).
 - Detail keys differ per API shape, passed through untouched — **confirmed**.
 - `merge_usage` sums tokens/cost/details but last-wins for Anthropic top-level cache and Ollama
@@ -59,6 +62,11 @@ against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
   block in v2.6.0 for the chat totals).
 - Whole block re-checked against a `v0.11.4...v0.12.0` diff (2026-10): none of the above changed.
   0.12.0 adds `finish_reason` to the current outlet message (added to the NOTE block in v2.8.0).
+- Re-checked against a `v0.12.0...v0.12.5` diff (2026-11-03, v2.9.0): 0.12.5 drops the guaranteed
+  triple (above), sums the top-level Anthropic cache fields across calls, and stops summing usage chunks
+  within one call (`update_usage_snapshot`). The NOTE block and `_last_round_context` say so; the cache
+  change leaves a **known gap** in `📐` (see "Context used" below). Details: `docs/owui-map.md`, "What
+  changed in v0.12.1-v0.12.5".
 
 Any change to token/cost/context reading must be reconciled against this block AND re-verified
 against real OWUI source of the version being targeted — never against memory or docs.
@@ -73,9 +81,9 @@ when non-obvious:
   `show_cumulative_tokens` (True, v2.6.0),
   `show_generation_time`, `show_tokens_per_second`, `show_reasoning_tokens`, `show_cached_tokens`,
   `show_audio_tokens` (False), `show_model_name`, `show_data_source` (False),
-  `show_context_window`, `show_cumulative_cost`. Message cost has **no** `show_*` — its visibility
+  `show_context_window`, `show_cumulative_cost`, `show_balance` (False, v2.9.0). Message cost has **no** `show_*` — its visibility
   is `cost_mode` itself.
-- **Presentation** — `display_order` (pre-filled full 15-key order), `separator` (`" · "`),
+- **Presentation** — `display_order` (pre-filled full 16-key order), `separator` (`" · "`),
   `icon_style` (`emoji`/`simple`/`off`), `compact_numbers` (False).
 - **Estimation** — `fallback_to_tiktoken` (True), `count_all_messages_for_input` (True).
 - **Context** — `context_size_override` (0 = auto), `context_size_map` (JSON string),
@@ -86,6 +94,8 @@ when non-obvious:
 - **Cost** — `cost_mode` (`auto`; Literal `off`/`auto`/`estimate`), `cost_min_display` (0.0),
   `price_map` (JSON string), `fetch_prices_from_modelsdev` (True — but only reachable in
   `estimate` mode, which is itself an explicit choice), `modelsdev_api_url`.
+- **OpenRouter balance** (v2.9.0) — `show_balance` (False), `openrouter_api_key` ("", a password
+  input; masked in the debug snapshot), `balance_for_all_users` (False), `balance_on_every_model` (False).
 - **Misc** — `priority` (10), `debug_mode` (False).
 - **UserValves** — `enabled` (True). Per-user display customization was deliberately rolled back:
   everything else is admin-only.
@@ -105,19 +115,19 @@ tags skips (`git fetch --tags`). Not covered: a tightened bound for a value outs
 
 ## Renderer dispatch
 
-`_STATS_RENDERERS` (`:737-751`) maps 15 keys (`input`, `output`, `finish`, `total`, `tokens_total`,
-`reasoning`, `cached`, `audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `model`, `source`)
+`_STATS_RENDERERS` (`:737-751`) maps 16 keys (`input`, `output`, `finish`, `total`, `tokens_total`,
+`reasoning`, `cached`, `audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `balance`, `model`, `source`)
 to `_render_*`
 functions with one signature `(s: _Stats) -> str | None`. `_Stats` is a frozen dataclass bundling
 `valves`, `tokens`, `timing`, `ctx`, `cost`, `model`, plus `finish_reason` (default `None`, added in
-v2.8.0). It arrived in v2.6.0 and replaced a fixed 6-positional-arg
+v2.8.0) and `balance` (default `None`, v2.9.0). It arrived in v2.6.0 and replaced a fixed 6-positional-arg
 signature that forced suppressing `PLR0913`/`PLR0917` and left every renderer with unused
 arguments. `_build_stats` walks the resolved order, drops `None` results, and suppresses a line
 consisting solely of `source` parts. `_emit_debug` takes the same `_Stats` plus a `_Turn` (task,
 messages, assistant message, usage, metadata).
 
 Rules: **`show_*` valves gate visibility; `display_order` only sorts.** `_resolve_display_order`
-(`:451-458`) always returns a full 15-key permutation — removed keys move to the end, unknown keys
+(`:451-458`) always returns a full 16-key permutation — removed keys move to the end, unknown keys
 are ignored (surfaced only in the debug payload). To add a metric: add a `show_*` valve, write a
 `_render_*(s: _Stats)`, register it in `_STATS_RENDERERS`, append the key to `_DEFAULT_ORDER`, add
 an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
@@ -144,6 +154,55 @@ an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
 - **Last request of the turn:** on a tool turn it is the final model call's reason — the call whose
   text the user reads.
 - **Debug:** top-level `finish_reason` (`null` when absent).
+
+### OpenRouter balance — `_resolve_balance` / `_render_balance` (v2.9.0, issue #36) — design decisions
+
+`💳` shows OpenRouter's `total_credits - total_usage` from `GET /api/v1/credits`, signed when the account
+is below zero. `_resolve_balance` returns `{usd, status, key_source, on_openrouter}`; the whole dict is
+the debug payload's top-level `balance`. Status values: `off`, `admins_only`, `not_openrouter`, `no_key`,
+`ok`, `aiohttp_unavailable`, `malformed_response`, `error: <ExceptionType>`, `error <code>: <message>`
+(OpenRouter's own refusal, message cut to 200 chars).
+
+- **Any account key works (measured 2026-11-03, contradicting OpenRouter's docs).** The reference page
+  says "Management key required" and shows a 403 for other keys. Tested with two keys of one account: a
+  regular inference key (`is_management_key: false`) and a management key both got `200` with identical
+  `total_credits`/`total_usage`; the issue reporter saw the same. So a management key is never asked for,
+  and the valve description says not to use one (it can create and delete every key on the account).
+  Accepted risk: OpenRouter may start enforcing its docs; the debug status then shows the `403` and an
+  admin can paste a management key into `openrouter_api_key` with no code change.
+- **Rejected: `GET /api/v1/key`** (works with any key). It reports the key's own credit cap
+  (`limit_remaining`, `null` without a cap) and budgets, not the account balance — the reporter tried it
+  and found re-adjusting a cap after every top-up a chore.
+- **Key: the model's own openrouter.ai connection, else `openrouter_api_key`; a filled valve wins**
+  (owner's choice: no source selector and no key-type selector — for the plugin both key types are the same
+  bearer string, and an explicit selector only adds a way to misconfigure). The connection is found like
+  tier 4 of the context chain (`urlIdx` of the model or of a workspace model's base entry,
+  `_owui_connection`). Only a bearer-auth connection gives a key; a session/OAuth/Entra one has none to
+  reuse (`no_key`), so the admin sets `openrouter_api_key` there.
+- **Valves are named an unsafe place for a key** (owner's requirement): every OWUI admin reads valves back
+  in clear text (`GET /functions/id/{id}/valves`; encrypted at rest with `WEBUI_SECRET_KEY` only), and any
+  other function or tool runs in the same process. The field is a `password` input (OWUI 0.8.0+), which
+  only masks it on screen.
+- **Sent to one fixed URL, `https://openrouter.ai/api/v1/credits`**, never to the connection's URL, and the
+  connection counts as OpenRouter only by host (`openrouter.ai` or a subdomain) — OWUI's own check is a
+  substring (`'openrouter.ai' in url`, `utils/headers.py`), which a proxy URL mentioning it would pass.
+- **Off by default; admins only by default** (`__user__["role"] == "admin"`; `balance_for_all_users`
+  widens it). It is the account owner's money, and the status line is persisted in `statusHistory` and
+  re-broadcast to shared chats (0.12.0+). A missing role counts as non-admin. Nothing is fetched for a
+  viewer who would not see it.
+- **Only under models on an openrouter.ai connection**, unless `balance_on_every_model` (for OpenRouter
+  behind a proxy such as LiteLLM, where the connection URL is the proxy's). With that valve and a valve key
+  the connection is not looked up at all.
+- **No cache, one request per response** (owner's choice). A TTL cache would show the same number under
+  consecutive messages that each cost something. Cost: up to 2 s (timeout) before the status line, and
+  OWUI's `background_tasks_handler` (title, tags, follow-ups) runs after outlet, so it waits as well; the
+  reply itself is already on screen (`chat:completion` done precedes `outlet_filter_handler`, v0.12.5).
+  OpenRouter settles a charge shortly after completion, so the number may not include the message it sits
+  under — said in the valve description and the README.
+- **Placed after `cost_total`**: it belongs with the costs; saved custom orders get it at the end, as usual.
+- **Not done:** reporting the key type (`/key` → `is_management_key`) in the debug payload — a second
+  request per response for a hint; can be added if admins paste management keys anyway. Other providers'
+  balance endpoints (DeepSeek, Moonshot) — no source abstraction until a second one is asked for.
 
 ## Resolution chains
 
@@ -217,6 +276,8 @@ re-cut v2.6.0 (see the release note in `CLAUDE.md`). The two sections below keep
 - **Not fixed here:** the screenshot's `211ms · 23.7 t/s` next to 645 output tokens (5 tokens / 0.211 s =
   23.7 t/s) suggests the llama.cpp timings cover only the last round or chunk — OWUI's `merge_usage` keeps
   the last `predicted_ms`/`predicted_per_second` while summing tokens. Needs a debug payload to confirm.
+  OWUI 0.12.5 stopped summing repeated usage chunks within one call (`update_usage_snapshot`), which
+  may change these numbers; not re-checked.
 
 ### Design decisions (v2.6.0, issue #14)
 
@@ -270,8 +331,12 @@ Design decisions:
   `USAGE_TOKEN_KEYS`, so `context_used` equals the summed total — no regression, no improvement.
   Rejected: re-estimating the last request with tiktoken on 0.10.x (approximate, wrong for non-OpenAI
   tokenizers, for a version being phased out).
-- **Anthropic-native cache is added back** (its `input` excludes cache); the top-level cache fields are
-  in none of `merge_usage`'s summed sets, so they are last-round too and the sum stays consistent.
+- **Anthropic-native cache is added back** (its `input` excludes cache); through OWUI 0.12.4 the
+  top-level cache fields are in none of `merge_usage`'s summed sets, so they are last-round too and the
+  sum stays consistent. **Known gap since 0.12.5:** those two fields are summed across calls, so on a
+  multi-round Anthropic-native turn `📐` adds every round's cache to the last request and over-counts.
+  Single-request turns and proxies that fold cache into `*_tokens_details` (LiteLLM) are unaffected.
+  Not fixed yet: the turn's usage keeps no last-round cache to read instead.
 - **The other counters are untouched** (`⬆︎`, `⬇︎`, `Σ`, `🧮`, cost keep summing every round), so on
   a tool turn `⬆︎` can be far above `📐` — documented in the README rather than "aligned".
 - Contributed in PR #27, released as 2.7.0 (owner's choice): 2.6.1 is skipped because a withdrawn
@@ -392,7 +457,8 @@ against models.dev. All three aiohttp fetchers catch broad `Exception` and degra
   actual logic. `matched_key: null` = table-matching miss, the #1 support diagnosis.
 - **Sanitization is a whitelist, not a blacklist** (`_sanitize_model:1784-1823`): `__metadata__`
   carries the raw prompt (`user_message`), `user_id`, `session_id`, `chat_id` — raw dicts are
-  never included. `llamacpp_url`/`llama_swap_url` are masked `******` in the valves snapshot.
+  never included. `llamacpp_url`/`llama_swap_url`/`openrouter_api_key` are masked `******` in the valves
+  snapshot; the `balance` block carries no key or URL.
 - Includes a `web_search` hint (server-side web citations detected via http(s)-host URL check) —
   flags that a provider's search surcharge may be billed outside `usage.cost`.
 
@@ -406,6 +472,7 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | any of the 7 background tasks | early return | `:945-955` | `test_outlet_skips_every_background_task_string` |
 | empty `messages` / no assistant msg | early return | `:957-962` | `test_outlet_no_messages_or_no_assistant` |
 | `usage` `None`/`{}`/non-numeric/negative | all-`None` bag, no crash | `:1036`, `:230-247` | `test_outlet_survives_malformed_usage` |
+| `usage == {"incomplete": True}` (OWUI 0.12.5+: a streamed call reported no usage), current or past | read as no usage: tiktoken estimate, skipped by the chat totals | `_extract_tokens`, `_cumulative_tokens` | `test_outlet_reads_owui_0125_incomplete_usage_as_no_usage` |
 | `NaN`/`±inf` in current or past `usage` (v2.6.0) | rejected by `_num` → field omitted, no `int()` crash | `_num` | `test_outlet_survives_non_finite_usage_in_history_and_current`, `test_num_rejects_bool_and_nonnumbers` |
 | `Infinity` value in `context_size_map` | entry skipped (`OverflowError` caught) | `_context_size_map_table` | `test_context_size_map_table_skips_infinite_entry` |
 | streaming: no `content`, text in `output` | content-first, fall through to output walk | `:291-306` | `test_message_text_prefers_content_then_output` |
@@ -469,6 +536,17 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | `display_order` unknown/dup/empty | ignored+debug / dedup / default | `:432-458` | `test_normalize_order_dedups_and_flags_unknown` |
 | reasoning/cached/audio == 0 | hidden (truthiness); context `used=0` still renders | `:597-636` | `test_render_reasoning_hidden_when_zero_or_none`, `test_render_context` |
 | only `source` parts rendered | whole line suppressed | `:1734-1735` | (build_stats tests) |
+| `show_balance` off (default) | no request, `status: off` | `_resolve_balance` | `test_balance_is_off_by_default_and_asks_nothing` |
+| model on an openrouter.ai connection (v2.9.0, #36) | that connection's bearer key → `/credits`; asked every response | `_resolve_balance` | `test_balance_reuses_the_openrouter_connection_key_on_every_response` |
+| `openrouter_api_key` set (stray whitespace stripped) | valve key wins | `_resolve_balance` | `test_balance_valve_key_beats_the_connection_key` |
+| workspace model on an OpenRouter base | base entry's `urlIdx` | `_openrouter_connection` | `test_balance_workspace_model_finds_the_connection_of_its_base_model` |
+| other provider, proxy URL mentioning openrouter.ai, no/bool `urlIdx`, lookup raising | `not_openrouter`, no request even with a valve key | `_openrouter_connection` | `test_balance_never_sends_a_key_for_a_model_not_served_by_openrouter` |
+| OpenRouter behind a proxy | `balance_on_every_model` + valve key, connection not looked up | `_resolve_balance` | `test_balance_on_every_model_serves_openrouter_behind_a_proxy` |
+| viewer not an admin / no role | `admins_only`, no request, unless `balance_for_all_users` | `_resolve_balance` | `test_balance_is_shown_to_admins_only_unless_widened` |
+| OpenRouter connection without a bearer key | `no_key`, no request | `_resolve_balance` | `test_balance_needs_a_bearer_key_on_the_connection` |
+| `/credits` refuses / errors / junk / below zero / aiohttp missing | `error <code>: <message>`, `error: <Type>`, `malformed_response`, signed value, `aiohttp_unavailable` | `_fetch_openrouter_balance`, `_render_balance` | `test_fetch_openrouter_balance_reports_why_it_failed`, `test_render_balance_signs_a_negative_balance` |
+| balance resolver raises | no `💳`, response survives | `outlet` | `test_outlet_survives_a_balance_resolver_bug` |
+| end to end | `💳` right after `💰Σ`; key masked, never in debug | `outlet`, `_valves_snapshot` | `test_outlet_shows_balance_after_chat_cost_and_keeps_the_key_out_of_debug` |
 | `valves.model_dump()` raises | `{}` snapshot | `:1825-1830` | `test_valves_snapshot_returns_empty_dict_on_dump_failure` |
 | debug `json.dumps` raises | error-string fallback | `:1940-1943` | `test_emit_debug_json_dumps_failure_falls_back_to_error_string` |
 | secret-bearing model/metadata dicts | whitelist copy-out only | `:1784-1823` | `test_sanitize_model_whitelist_only_no_secrets` |

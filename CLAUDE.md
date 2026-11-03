@@ -33,7 +33,7 @@ and listed in the official Open WebUI docs Community Plugins catalog
 - Plugin internals — pipeline, valves, resolution chains, token/cache semantics, debug payload,
   edge-case catalog with covering tests: @docs/plugin-internals.md
 - Open WebUI source map — filter machinery, request lifecycle, usage normalization, persistence,
-  events, frontend constraints (verified against v0.11.1, diff-checked through v0.12.0):
+  events, frontend constraints (verified against v0.11.1, diff-checked through v0.12.5):
   @docs/owui-map.md
 
 ## Commands
@@ -112,7 +112,7 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 - Config is two Pydantic models: `Valves` (admin — all toggles, ordering, cost/context maps and
   URLs) and `UserValves` (per-user `enabled` kill-switch only; per-user customization was
   deliberately rolled back).
-- The stats line is a dispatch table (`_STATS_RENDERERS`, 15 metric keys, every renderer takes one
+- The stats line is a dispatch table (`_STATS_RENDERERS`, 16 metric keys, every renderer takes one
   frozen `_Stats` object). Key rule: **`show_*` valves gate visibility; `display_order` only sorts.**
 - Context, price and model identity resolve through priority-ordered fallback chains
   (short-circuit on first hit); table lookups use longest-key case-insensitive substring match.
@@ -121,7 +121,8 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
   model. Reconcile any token/cost/context change against it — and re-verify it against real OWUI
   source for the targeted version.
 - Live network access (models.dev context/prices, llama.cpp probe) is opt-in via valves and
-  TTL-cached in module-level dicts; all fetch failures degrade silently.
+  TTL-cached in module-level dicts; all fetch failures degrade silently. The opt-in OpenRouter
+  balance (`show_balance`) is the exception to the caching: asked on every response, on purpose.
 - `debug_mode` emits a sanitized diagnostic payload as a copyable `citation` event + stdout — the
   primary support tool. Sanitization is whitelist-based; never include raw `__model__`/
   `__metadata__` dicts (they carry the prompt and user/session ids).
@@ -130,7 +131,7 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (231 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (244 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
 and `make_*` builders live at the top of the test file). The only outside state any test reads is git:
 `tests/test_valves_compat.py` (4 tests) loads every release tag's `usage_display.py`, and
@@ -138,7 +139,7 @@ and `make_*` builders live at the top of the test file). The only outside state 
 on a throwaway repository — which is why CI checks out with `fetch-depth: 0`. Both get the tags from the
 `release_tags` fixture in `tests/conftest.py`: without tags it fails in CI and skips locally — run
 `git fetch --tags` in a clone that lacks the newest release tag. `pydantic` is pinned (`==`) in the `dev`
-dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.12.0), so the plugin
+dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.12.5), so the plugin
 is tested against the same pydantic it runs on in production — keep that pin tracking OWUI's, and
 don't merge a Dependabot bump that drifts it (Dependabot runs weekly for the `uv` and
 `github-actions` ecosystems).

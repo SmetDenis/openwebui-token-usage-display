@@ -3,9 +3,9 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.8.0
+version: 2.9.0
 license: MIT
-description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, and message/chat cost below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
+description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """  # noqa: D205, D212, D415, E501 - OWUI frontmatter: first line must be bare quotes, one `key: value` per line
 
@@ -13,9 +13,14 @@ from __future__ import annotations
 
 # NOTE (0.9.0+ target, built around the 0.10.x/0.11.x model, verified against source):
 #   * OWUI runs `normalize_usage`/`merge_usage` on every usage-save path, so a
-#     saved `message["usage"]` is GUARANTEED to carry input_tokens/output_tokens/
-#     total_tokens, while provider-native keys/detail dicts are preserved.
-#     -> primary token read is the normalized triple; provider keys are backup.
+#     saved `message["usage"]` carries input_tokens/output_tokens/total_tokens,
+#     while provider-native keys/detail dicts are preserved. Through 0.12.4 the
+#     triple was guaranteed (a missing counter became 0); since 0.12.5 a missing
+#     or invalid counter (negative, bool) is left out, and a streamed model call
+#     that reported no usage leaves `{"incomplete": True}` (merge_usage also sets
+#     `incomplete` on a turn where a call lacked input or output).
+#     -> primary token read is the normalized triple; provider keys are backup;
+#     every read tolerates absence, and a usage with no counter is "no usage".
 #   * `message["content"]` is NOT persisted at 0.10.x/0.11.x — both streaming and
 #     non-streaming save paths write only the structured `message["output"]`
 #     array. At 0.11.x the OUTLET BODY nonetheless carries a non-empty `content`:
@@ -34,17 +39,24 @@ from __future__ import annotations
 #     completion_tokens_details; Responses API -> input_tokens_details /
 #     output_tokens_details; Anthropic -> top-level cache_read/creation.
 #   * merge_usage sums input/output/total + top-level cost (USAGE_COST_KEYS) +
-#     *_tokens_details, but NOT top-level Anthropic cache fields nor Ollama
-#     durations -> in multi-round tool turns the token totals AND the native cost
-#     cover the whole turn (every LLM round-trip is summed), while cache/timing
-#     reflect the last round only (an OWUI limitation we surface, not fix).
+#     *_tokens_details, but NOT Ollama/llama.cpp durations, nor (through 0.12.4)
+#     the top-level Anthropic cache fields -> in multi-round tool turns the token
+#     totals AND the native cost cover the whole turn (every LLM round-trip is
+#     summed), while timing reflects the last round only (an OWUI limitation we
+#     surface, not fix). Since 0.12.5 cache_read/cache_creation_input_tokens are
+#     summed too, so Anthropic-native cache covers the whole turn like input does.
+#     Since 0.12.5 merge_usage also runs only ACROSS model calls: usage chunks
+#     within one call are snapshots (update_usage_snapshot), no longer summed.
 #     -> the displayed 💰 already covers Open-WebUI-orchestrated tool/MCP calls;
 #     what it can't see is a surcharge the provider never puts in usage.cost
 #     (e.g. an OpenRouter BYOK web-search engine billed outside the generation).
 #   * Since 0.11.0 merge_usage rewrites prompt_tokens/completion_tokens from the
-#     LAST round (0.10.x summed them like input/output) -> the 📐 "used" side
-#     reads them, so a tool turn shows the last request, not the sum of rounds;
-#     on 0.10.x it stays the summed total (_last_round_context).
+#     LAST round (0.10.x summed them like input/output; 0.12.5 takes them from
+#     that round's input/output_tokens) -> the 📐 "used" side reads them, so a
+#     tool turn shows the last request, not the sum of rounds; on 0.10.x it stays
+#     the summed total (_last_round_context). KNOWN GAP on 0.12.5+: the
+#     Anthropic-native cache added back to that pair is now the turn's sum, so
+#     📐 over-counts on a multi-round Anthropic-native turn (not fixed yet).
 #   * Since 0.12.0 the current outlet message carries `finish_reason` — the
 #     value from the LAST model call of the turn, never persisted. Provider-real
 #     for Chat Completions, Ollama and pipes passing an upstream response through;
@@ -354,6 +366,9 @@ _MILLION = 1_000_000
 _MIN_SHOWN_USD = 0.0001  # smallest amount _format_cost prints exactly; anything below reads "<$0.0001"
 _COST_EQUAL_EPSILON = 1e-9  # float tolerance when deduping the chat cost total against the message cost
 _PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")  # per-1M rates read from a price entry
+# The only place an OpenRouter key is ever sent, whichever connection or valve it came from.
+_OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+_ERROR_MESSAGE_CHARS = 200  # an upstream error message is cut to this length in the debug payload
 
 
 def _format_duration(seconds: float) -> str:
@@ -549,10 +564,10 @@ def _resolve_model_id(model: dict[str, Any] | None, body: dict[str, Any] | None 
 
 # --- stats-line order (see configurable-order design doc) ----------------------
 
-# The 15 metric keys in their default display order (identical to the historical
+# The 16 metric keys in their default display order (identical to the historical
 # hard-coded order of _build_stats). Registry populated in the renderers section.
 # `finish` sits right after `output`: the status line is clamped to one line, so a
-# warning at the end could be cut off on a narrow screen.
+# warning at the end could be cut off on a narrow screen. `balance` follows the costs.
 _DEFAULT_ORDER: list[str] = [
     "input",
     "output",
@@ -567,6 +582,7 @@ _DEFAULT_ORDER: list[str] = [
     "tps",
     "cost",
     "cost_total",
+    "balance",
     "model",
     "source",
 ]
@@ -595,7 +611,7 @@ def _normalize_order(order_str: str) -> tuple[list[str], list[str]]:
 def _resolve_display_order(admin_order: str) -> list[str]:
     """Resolve the admin-configured metric order, else the default.
 
-    Returns a permutation of all 15 keys: the parsed (valid) keys first, then the
+    Returns a permutation of all 16 keys: the parsed (valid) keys first, then the
     remaining keys in default order. Empty input -> _DEFAULT_ORDER unchanged.
     """
     valid, _ = _normalize_order(admin_order)
@@ -633,6 +649,7 @@ _ICON_EMOJI: dict[str, str] = {
     "tps": "⚡",
     "cost": "💰",
     "cost_total": "💰Σ",
+    "balance": "💳",
     "model": "🤖",
 }
 _ICON_SIMPLE: dict[str, str] = {
@@ -648,6 +665,7 @@ _ICON_SIMPLE: dict[str, str] = {
     "tps": "»",
     "cost": "",  # cost value already carries "$"
     "cost_total": "Σ",
+    "balance": "¤",  # unlike cost, needs a glyph: both values carry "$"
     "model": "◇",
 }
 # context has a severity triplet (normal / warn / critical) instead of a flat icon.
@@ -710,6 +728,7 @@ class _Stats:
     cost: dict[str, Any]
     model: dict[str, Any] | None
     finish_reason: str | None = None
+    balance: dict[str, Any] | None = None
 
 
 def _render_input(s: _Stats) -> str | None:
@@ -813,6 +832,15 @@ def _render_cost_total(s: _Stats) -> str | None:
     return None
 
 
+def _render_balance(s: _Stats) -> str | None:
+    # An OpenRouter account can run below zero; _format_cost would print that as $0.00.
+    usd = s.balance.get("usd") if s.balance else None
+    if s.valves.show_balance and usd is not None:
+        body = f"-{_format_cost(-usd)}" if usd < 0 else _format_cost(usd)
+        return _with_icon(_icon(s.valves, "balance"), body)
+    return None
+
+
 def _render_model(s: _Stats) -> str | None:
     if s.valves.show_model_name and isinstance(s.model, dict):
         info = s.model.get("info")
@@ -844,6 +872,7 @@ _STATS_RENDERERS: dict[str, Callable[[_Stats], str | None]] = {
     "tps": _render_tps,
     "cost": _render_cost,
     "cost_total": _render_cost_total,
+    "balance": _render_balance,
     "model": _render_model,
     "source": _render_source,
 }
@@ -901,7 +930,7 @@ class Filter:
             description=(
                 "Comma-separated metric order, pre-filled with the default order — reorder or trim "
                 "to taste (empty also means default). Keys: input, output, finish, total, tokens_total, reasoning, "
-                "cached, audio, context, time, tps, cost, cost_total, model, source. This only sorts: "
+                "cached, audio, context, time, tps, cost, cost_total, balance, model, source. This only sorts: "
                 "visibility is governed by the show_* toggles, and removing a key here does NOT hide "
                 "it (use show_* for that) — it just moves to the end, like any enabled-but-unlisted metric."
             ),
@@ -915,7 +944,8 @@ class Filter:
             description=(
                 "Icon rendering: 'emoji' (colorful, default), 'simple' (monochrome unicode symbols), "
                 "'off' (no icons — bare values; pure counters like input/output/total become ambiguous, "
-                "while cost/context/time/tps/source stay self-labeled via $, %, s, t/s, [API])."
+                "while cost/context/time/tps/source stay self-labeled via $, %, s, t/s, [API]; the balance "
+                "also reads $ and is told from cost by its place after it)."
             ),
         )
         compact_numbers: bool = Field(
@@ -1012,6 +1042,40 @@ class Filter:
             default="https://models.dev/api.json",
             description="models.dev price endpoint used when fetch_prices_from_modelsdev is on.",
         )
+        # --- OpenRouter balance ---
+        show_balance: bool = Field(
+            default=False,
+            description=(
+                "Show the remaining OpenRouter account balance (💳), asked from openrouter.ai after every response "
+                "of a model served through an openrouter.ai connection, with that connection's key. Off by default: "
+                "it adds one request per response (the stats line waits for it, up to 2 s), and the balance may not "
+                "include the message it is shown under yet, since OpenRouter settles a charge shortly after it ends."
+            ),
+        )
+        openrouter_api_key: str = Field(
+            default="",
+            description=(
+                "Optional OpenRouter key for the balance; empty = the key of the model's openrouter.ai connection. "
+                "An ordinary API key is enough - a management key is NOT needed and can manage every key on the "
+                "account. WARNING: valves are not a safe place for a key - every Open WebUI admin can read it back "
+                "and any other function or tool on this server can read it. Use at your own risk."
+            ),
+            json_schema_extra={"input": {"type": "password"}},
+        )
+        balance_for_all_users: bool = Field(
+            default=False,
+            description=(
+                "Show the balance to every user, not only admins. It is the account owner's money, and the stats "
+                "line stays in the chat history and in shared chats."
+            ),
+        )
+        balance_on_every_model: bool = Field(
+            default=False,
+            description=(
+                "Show the balance under every model's responses, not only those served by an openrouter.ai "
+                "connection - for OpenRouter behind a proxy such as LiteLLM. Needs openrouter_api_key."
+            ),
+        )
         debug_mode: bool = Field(
             default=False, description="Emit an extra status event with the raw payload for diagnostics."
         )
@@ -1064,6 +1128,23 @@ class Filter:
 
     # --- outlet: build and emit the stats line ---------------------------------
 
+    @staticmethod
+    def _turn_skipped(user: dict[str, Any] | None, task: object) -> bool:
+        """True when the user switched the stats off or the request is a non-chat background task."""
+        user_valves = user.get("valves") if user else None
+        if user_valves is not None and hasattr(user_valves, "enabled") and not user_valves.enabled:
+            return True
+        # Skip non-chat background tasks (title/tag/query/etc.).
+        return task in (
+            "title_generation",
+            "tags_generation",
+            "follow_up_generation",
+            "emoji_generation",
+            "query_generation",
+            "autocomplete_generation",
+            "moa_response_generation",
+        )
+
     async def outlet(  # noqa: PLR0913 - OWUI injects each dunder kwarg the signature names; one per source
         self,
         body: dict[str, Any],
@@ -1074,22 +1155,9 @@ class Filter:
         __model__: dict[str, Any] | None = None,
         __request__: Any = None,
     ) -> dict[str, Any]:
-        """Resolve tokens, timing, context and cost for the last response and emit the stats line."""
-        user_valves = __user__.get("valves") if __user__ else None
-        if user_valves is not None and hasattr(user_valves, "enabled") and not user_valves.enabled:
-            return body
-
-        # Skip non-chat background tasks (title/tag/query/etc.).
+        """Resolve tokens, timing, context, cost and balance for the last response and emit the stats line."""
         task = (__metadata__ or {}).get("task")
-        if task in (
-            "title_generation",
-            "tags_generation",
-            "follow_up_generation",
-            "emoji_generation",
-            "query_generation",
-            "autocomplete_generation",
-            "moa_response_generation",
-        ):
+        if self._turn_skipped(__user__, task):
             return body
 
         messages = body.get("messages", [])
@@ -1118,6 +1186,10 @@ class Filter:
             cost = await self._resolve_cost(usage, tokens, messages, model_id)
         except Exception:  # noqa: BLE001
             cost = {"message": None, "message_est": False, "cumulative": None, "cumulative_est": False}
+        try:
+            balance = await self._resolve_balance(__model__, __user__, __request__)
+        except Exception:  # noqa: BLE001
+            balance = {"usd": None, "status": "error", "key_source": None, "on_openrouter": None}
 
         finish = assistant_msg.get("finish_reason")
         stats = _Stats(
@@ -1128,6 +1200,7 @@ class Filter:
             cost=cost,
             model=__model__,
             finish_reason=finish if isinstance(finish, str) else None,
+            balance=balance,
         )
         stats_parts = self._build_stats(stats)
         if v.debug_mode:
@@ -1300,9 +1373,11 @@ class Filter:
         last round (`utils/response.py:merge_usage`) - so they are the only per-request numbers
         left. On 0.10.x merge_usage summed them too, so there this equals the summed total (no
         regression, no fix). A single round has prompt == input. Anthropic-native input EXCLUDES
-        cache (input_has_cache False), so its cache is added back: it occupies the window, and the
-        top-level cache fields are last-round as well (in none of merge_usage's summed sets).
-        None when the provider reported no tokens (the tiktoken path): the caller falls back.
+        cache (input_has_cache False), so its cache is added back: it occupies the window. Through
+        OWUI 0.12.4 the top-level cache fields were last-round as well (in none of merge_usage's
+        summed sets); since 0.12.5 they are summed, so on a multi-round Anthropic-native turn this
+        over-counts by the earlier rounds' cache - a known gap, not fixed yet. None when the provider
+        reported no tokens (the tiktoken path): the caller falls back.
         """
         if not isinstance(usage, dict):
             return None
@@ -1912,6 +1987,93 @@ class Filter:
             }
         return result
 
+    async def _resolve_balance(
+        self, model: dict[str, Any] | None, user: dict[str, Any] | None, request: Any
+    ) -> dict[str, Any]:
+        """Remaining OpenRouter account balance (issue #36): {usd, status, key_source, on_openrouter}.
+
+        Asked only when show_balance is on and the viewer may see it (admins, unless
+        balance_for_all_users). The key is openrouter_api_key, else the bearer key of the model's own
+        openrouter.ai connection, and it goes only to _OPENROUTER_CREDITS_URL. Not cached: a cached
+        number would sit unchanged under messages that each cost something. `status` says why
+        nothing is shown; the key itself never leaves this method.
+        """
+        v = self.valves
+        result: dict[str, Any] = {"usd": None, "status": "off", "key_source": None, "on_openrouter": None}
+        if not v.show_balance:
+            return result
+        if not v.balance_for_all_users and (user or {}).get("role") != "admin":
+            result["status"] = "admins_only"
+            return result
+
+        valve_key = v.openrouter_api_key.strip()
+        connection_headers: dict[str, str] = {}
+        # With a valve key and every model allowed, the connection has nothing left to decide.
+        if not (v.balance_on_every_model and valve_key):
+            found = await self._openrouter_connection(model, request)
+            result["on_openrouter"] = found is not None
+            if found is None and not v.balance_on_every_model:
+                result["status"] = "not_openrouter"
+                return result
+            connection_headers = found or {}
+
+        if valve_key:
+            headers, result["key_source"] = {"Authorization": f"Bearer {valve_key}"}, "valve"
+        elif connection_headers:
+            headers, result["key_source"] = connection_headers, "connection"
+        else:
+            result["status"] = "no_key"
+            return result
+        result["usd"], result["status"] = await self._fetch_openrouter_balance(headers)
+        return result
+
+    async def _openrouter_connection(self, model: dict[str, Any] | None, request: Any) -> dict[str, str] | None:
+        """Auth headers of the model's OWUI connection when it is openrouter.ai ({} without a bearer key), else None.
+
+        The connection is found the way the tier-4 context probe finds it (urlIdx of the model or of a
+        workspace model's base entry). Judged by the URL's host, so a proxy whose URL merely mentions
+        openrouter.ai is not taken for it.
+        """
+        if not isinstance(model, dict):
+            return None
+        entry = model if isinstance(model.get("openai"), dict) else self._base_model_entry(model, request)
+        url_idx = entry.get("urlIdx") if entry is not None else None
+        if not isinstance(url_idx, int) or isinstance(url_idx, bool):
+            return None
+        connection = await self._owui_connection(url_idx, request)
+        if connection is None:
+            return None
+        host = _url_host(connection[0])
+        return connection[1] if host == "openrouter.ai" or host.endswith(".openrouter.ai") else None
+
+    @staticmethod
+    async def _fetch_openrouter_balance(headers: dict[str, str]) -> tuple[float | None, str]:
+        """(total_credits - total_usage, "ok") from OpenRouter's /credits, else (None, why).
+
+        Any API key of the account is accepted there (checked 2026-11-03), although OpenRouter's docs
+        ask for a management key. A refusal is reported with OpenRouter's own code and message.
+        """
+        if not _AIOHTTP_AVAILABLE:
+            return None, "aiohttp_unavailable"
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as session,
+                session.get(_OPENROUTER_CREDITS_URL, headers=headers) as resp,
+            ):
+                payload = await resp.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001 - timeout, network or a non-JSON reply: the line just omits the balance
+            return None, f"error: {type(exc).__name__}"
+        body: dict[str, Any] = payload if isinstance(payload, dict) else {}
+        data = body.get("data")
+        if isinstance(data, dict):
+            total, used = _num(data.get("total_credits")), _num(data.get("total_usage"))
+            if total is not None and used is not None:
+                return float(total - used), "ok"
+        error = body.get("error")
+        if isinstance(error, dict):
+            return None, f"error {error.get('code')}: {str(error.get('message'))[:_ERROR_MESSAGE_CHARS]}"
+        return None, "malformed_response"
+
     @staticmethod
     def _cumulative_cost(messages: list[Any], price: dict[str, Any] | None) -> tuple[float | None, bool]:
         """Chat cost total over every assistant turn on the branch + whether any part is estimated.
@@ -2283,12 +2445,12 @@ class Filter:
         return found if any(val is not None for val in found.values()) else None
 
     def _valves_snapshot(self) -> dict[str, Any]:
-        """Full valve dump for reproducing issues; the two local-backend URLs are masked."""
+        """Full valve dump for reproducing issues; the two local-backend URLs and the OpenRouter key are masked."""
         try:
             data = self.valves.model_dump()
         except Exception:  # noqa: BLE001 - debug output runs unguarded in outlet and must not break the response
             return {}
-        for key in ("llamacpp_url", "llama_swap_url"):
+        for key in ("llamacpp_url", "llama_swap_url", "openrouter_api_key"):
             if data.get(key):
                 data[key] = "******"
         return data
@@ -2380,6 +2542,7 @@ class Filter:
             "timing": stats.timing,
             "cost": {k: val for k, val in stats.cost.items() if k != "debug"},
             "cost_debug": stats.cost.get("debug"),
+            "balance": stats.balance,
             "cumulative_tokens_debug": self._cumulative_tokens(turn.messages, turn.assistant_msg, stats.tokens),
             "web_search": self._web_search_debug(turn.assistant_msg),
             "context_debug": context_debug,

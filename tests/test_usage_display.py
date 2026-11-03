@@ -29,12 +29,15 @@ def test_module_loads_and_exposes_filter(usage_display_module: ModuleType) -> No
     assert f.valves.icon_style == "emoji"
     assert f.valves.cost_mode == "auto"
     assert mod._DEFAULT_ORDER[0] == "input"
-    assert len(mod._DEFAULT_ORDER) == 15
+    assert len(mod._DEFAULT_ORDER) == 16
     assert mod._DEFAULT_ORDER.index("tokens_total") == mod._DEFAULT_ORDER.index("total") + 1  # tokens grouped
     assert f.valves.show_cumulative_tokens is True  # on by default, like show_cumulative_cost
     # the truncation flag sits next to the output count, early enough to survive the one-line clamp
     assert mod._DEFAULT_ORDER.index("finish") == mod._DEFAULT_ORDER.index("output") + 1
     assert f.valves.show_finish_reason is True
+    # the OpenRouter balance follows the two costs and is opt-in (it sends a request per response)
+    assert mod._DEFAULT_ORDER.index("balance") == mod._DEFAULT_ORDER.index("cost_total") + 1
+    assert f.valves.show_balance is False
 
 
 def run_async(coro: Any) -> Any:
@@ -471,8 +474,8 @@ def test_resolve_display_order_is_full_permutation(usage_display_module: ModuleT
     assert mod._resolve_display_order("") == mod._DEFAULT_ORDER  # empty -> default
     resolved = mod._resolve_display_order("cost, model")
     assert resolved[:2] == ["cost", "model"]
-    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all 15, no dupes
-    assert len(resolved) == len(set(resolved)) == 15
+    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all 16, no dupes
+    assert len(resolved) == len(set(resolved)) == 16
 
 
 def test_display_order_debug_provenance(usage_display_module: ModuleType) -> None:
@@ -490,7 +493,7 @@ def valves(usage_display_module: ModuleType) -> Any:
 
 
 def renderer(mod: ModuleType, name: str) -> Callable[..., str | None]:
-    """A `_render_*(stats)` renderer, called here as `r(valves, tokens, timing, ctx, cost, model[, finish_reason])`."""
+    """A `_render_*(stats)` renderer: `r(valves, tokens, timing, ctx, cost, model[, finish_reason, balance])`."""
     render = getattr(mod, name)
     return lambda *fields: render(mod._Stats(*fields))
 
@@ -731,6 +734,24 @@ def test_render_cost_total_dedupes_when_equal_to_message(usage_display_module: M
     )
     valves.show_cumulative_cost = False
     assert r(valves, make_tokens(), make_timing(), make_ctx(), make_cost(message=1.5, cumulative=4.0), None) is None
+
+
+def test_render_balance_signs_a_negative_balance(usage_display_module: ModuleType, valves: Any) -> None:
+    r = renderer(usage_display_module, "_render_balance")
+
+    def line(balance: dict[str, Any] | None) -> str | None:
+        return r(valves, make_tokens(), make_timing(), make_ctx(), make_cost(), None, None, balance)
+
+    valves.show_balance = True
+    assert line({"usd": 17.054976898}) == "💳 $17.05"
+    assert line({"usd": 0.42}) == "💳 $0.4200"
+    assert line({"usd": -3.1}) == "💳 -$3.10"  # OpenRouter lets an account run below zero
+    assert line({"usd": None, "status": "error 403: refused"}) is None
+    assert line(None) is None
+    valves.icon_style = "simple"
+    assert line({"usd": 17.05}) == "¤ $17.05"  # a glyph, unlike simple cost: both carry "$"
+    valves.show_balance = False
+    assert line({"usd": 17.05}) is None
 
 
 def test_render_model_uses_base_model_id(usage_display_module: ModuleType, valves: Any) -> None:
@@ -2616,6 +2637,206 @@ def test_sanitize_model_reports_live_backend_without_secrets(usage_display_modul
     assert f._sanitize_model(make_model_dict("gpt-4o"), None, "gpt-4o")["live_backend"] is None
 
 
+# --- OpenRouter balance (issue #36) -------------------------------------------- #
+
+_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+_CREDITS_OK = {"data": {"total_credits": 130, "total_usage": 112.945023102}}  # shape measured 2026-11-03
+_ADMIN = {"role": "admin"}
+
+
+def _openrouter_model(listed_id: str = "openai/gpt-4o", url_idx: int = 3) -> dict[str, Any]:
+    """An OWUI model dict for an OpenRouter connection (its /v1/models row carries no owned_by)."""
+    row = {"id": listed_id, "name": listed_id, "context_length": 128000}
+    return {**row, "owned_by": "openai", "openai": row, "urlIdx": url_idx}
+
+
+def _balance_filter(mod: ModuleType, **valves: Any) -> Any:
+    f = mod.Filter()
+    f.valves.show_balance = True
+    for name, value in valves.items():
+        setattr(f.valves, name, value)
+    return f
+
+
+def test_balance_is_off_by_default_and_asks_nothing(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1", "sk-or-conn", {})
+    fake = install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    result = run_async(mod.Filter()._resolve_balance(_openrouter_model(), _ADMIN, None))
+    assert result == {"usd": None, "status": "off", "key_source": None, "on_openrouter": None}
+    assert fake.requests == []
+
+
+def test_balance_reuses_the_openrouter_connection_key_on_every_response(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod)
+    _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1/", "sk-or-conn", {"prefix_id": "or"})
+    fake = install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    result = run_async(f._resolve_balance(_openrouter_model("or.openai/gpt-4o"), _ADMIN, None))
+    assert result["usd"] == pytest.approx(17.054976898)
+    assert (result["status"], result["key_source"], result["on_openrouter"]) == ("ok", "connection", True)
+    assert fake.requests == [(_CREDITS_URL, {"Authorization": "Bearer sk-or-conn"})]
+    # Not cached: the next response asks again, so the number follows the spending.
+    run_async(f._resolve_balance(_openrouter_model(), _ADMIN, None))
+    assert len(fake.requests) == 2
+
+
+def test_balance_valve_key_beats_the_connection_key(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod, openrouter_api_key="  sk-or-valve\n")  # pasted with stray whitespace
+    _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1", "sk-or-conn", {})
+    fake = install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    result = run_async(f._resolve_balance(_openrouter_model(), _ADMIN, None))
+    assert (result["status"], result["key_source"]) == ("ok", "valve")
+    assert fake.requests == [(_CREDITS_URL, {"Authorization": "Bearer sk-or-valve"})]
+
+
+def test_balance_workspace_model_finds_the_connection_of_its_base_model(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod)
+    _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1", "sk-or-conn", {})
+    install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    request = _FakeRequest({"openai/gpt-4o": _openrouter_model()})
+    preset = make_model_dict("research-agent", base="openai/gpt-4o")
+    assert run_async(f._resolve_balance(preset, _ADMIN, request))["key_source"] == "connection"
+
+
+def test_balance_never_sends_a_key_for_a_model_not_served_by_openrouter(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod, openrouter_api_key="sk-or-valve")
+    fake = install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    # Another provider, and a proxy whose URL merely mentions openrouter.ai: judged by host.
+    for url in ("https://api.openai.com/v1", "https://proxy.example/openrouter.ai/v1"):
+        _install_owui_connection(monkeypatch, url, "sk-other", {})
+        result = run_async(f._resolve_balance(_openrouter_model(), _ADMIN, None))
+        assert (result["status"], result["on_openrouter"]) == ("not_openrouter", False)
+    # No connection to look at: no model dict, no urlIdx, a bool urlIdx, a failing lookup.
+    _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1", "sk-or-conn", {})
+    for model in (None, make_model_dict("llama3"), {**_openrouter_model(), "urlIdx": True}):
+        assert run_async(f._resolve_balance(model, _ADMIN, None))["status"] == "not_openrouter"
+    _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1", "k", RuntimeError("config db down"))
+    assert run_async(f._resolve_balance(_openrouter_model(), _ADMIN, None))["status"] == "not_openrouter"
+    assert fake.requests == []
+
+
+def test_balance_on_every_model_serves_openrouter_behind_a_proxy(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod, balance_on_every_model=True, openrouter_api_key="sk-or-valve")
+    fake = install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    result = run_async(f._resolve_balance(make_model_dict("litellm/gpt-4o"), _ADMIN, None))
+    # The connection is not even looked up: the valve key and the valve decide.
+    assert (result["status"], result["key_source"], result["on_openrouter"]) == ("ok", "valve", None)
+    assert fake.requests == [(_CREDITS_URL, {"Authorization": "Bearer sk-or-valve"})]
+
+    # Without a valve key a non-OpenRouter connection has no key to give.
+    f.valves.openrouter_api_key = ""
+    _install_owui_connection(monkeypatch, "http://litellm:4000/v1", "sk-litellm", {})
+    result = run_async(f._resolve_balance(_openrouter_model(), _ADMIN, None))
+    assert (result["status"], result["on_openrouter"]) == ("no_key", False)
+    assert len(fake.requests) == 1
+
+
+def test_balance_is_shown_to_admins_only_unless_widened(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod)
+    _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1", "sk-or-conn", {})
+    fake = install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    for user in ({"role": "user"}, {"role": "pending"}, {}, None):
+        assert run_async(f._resolve_balance(_openrouter_model(), user, None))["status"] == "admins_only"
+    assert fake.requests == []
+    f.valves.balance_for_all_users = True
+    assert run_async(f._resolve_balance(_openrouter_model(), {"role": "user"}, None))["status"] == "ok"
+
+
+def test_balance_needs_a_bearer_key_on_the_connection(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod)
+    fake = install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    for key, api_config in (("", {}), ("per-user", {"auth_type": "session"})):
+        _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1", key, api_config)
+        result = run_async(f._resolve_balance(_openrouter_model(), _ADMIN, None))
+        assert (result["status"], result["on_openrouter"]) == ("no_key", True)
+    assert fake.requests == []
+
+
+def test_fetch_openrouter_balance_reports_why_it_failed(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+
+    def fetch(payload: Any) -> Any:
+        install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: payload})
+        return run_async(mod.Filter._fetch_openrouter_balance({}))
+
+    refused = {"error": {"code": 403, "message": "Only management keys can perform this operation"}}
+    assert fetch(refused) == (None, "error 403: Only management keys can perform this operation")
+    assert fetch({"error": {"code": 500, "message": "x" * 500}})[1] == "error 500: " + "x" * 200
+    assert fetch(RuntimeError("connection reset")) == (None, "error: RuntimeError")
+    for junk in ({"data": {"total_credits": "130", "total_usage": 1}}, {"data": None}, ["data"], None):
+        assert fetch(junk) == (None, "malformed_response")
+    assert fetch({"data": {"total_credits": 5, "total_usage": 8.1}})[0] == pytest.approx(-3.1)
+
+    install_fake_aiohttp(monkeypatch, mod, session_error=RuntimeError("boom"))
+    assert run_async(mod.Filter._fetch_openrouter_balance({})) == (None, "error: RuntimeError")
+    monkeypatch.setattr(mod, "_AIOHTTP_AVAILABLE", False)
+    assert run_async(mod.Filter._fetch_openrouter_balance({})) == (None, "aiohttp_unavailable")
+
+
+def test_outlet_shows_balance_after_chat_cost_and_keeps_the_key_out_of_debug(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod, openrouter_api_key="sk-or-secret", debug_mode=True)
+    _patch_no_network(monkeypatch, f)
+    _install_owui_connection(monkeypatch, "https://openrouter.ai/api/v1", "sk-or-conn", {})
+    install_fake_aiohttp(monkeypatch, mod, {_CREDITS_URL: _CREDITS_OK})
+    messages = [
+        make_message("q1", role="user"),
+        make_message("a1", usage=make_usage(cost=0.01)),
+        make_message("q2", role="user"),
+        make_message("a2", usage=make_usage(cost=0.02)),
+    ]
+    emitter = CapturingEmitter()
+    run_async(f.outlet(make_body(messages), __event_emitter__=emitter, __model__=_openrouter_model(), __user__=_ADMIN))
+    assert "💰 $0.0200 · 💰Σ $0.0300 · 💳 $17.05" in emitter.statuses()[0]["data"]["description"]
+    debug = next(e for e in emitter.events if e.get("type") == "citation")["data"]["document"][0]
+    assert '"key_source": "valve"' in debug
+    assert '"openrouter_api_key": "******"' in debug
+    assert "sk-or-secret" not in debug
+
+
+def test_outlet_survives_a_balance_resolver_bug(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = usage_display_module
+    f = _balance_filter(mod)
+    _patch_no_network(monkeypatch, f)
+
+    async def broken(*_args: Any) -> dict[str, Any]:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(f, "_resolve_balance", broken)
+    emitter = CapturingEmitter()
+    run_async(f.outlet(make_body([make_message("a", usage=make_usage())]), __event_emitter__=emitter, __user__=_ADMIN))
+    assert "💳" not in emitter.statuses()[0]["data"]["description"]
+
+
 # --- _resolve_cost: off / auto (native) / estimate branches -------------------- #
 
 
@@ -2808,6 +3029,31 @@ def test_outlet_survives_malformed_usage(
     # Must complete without raising; may or may not emit, but never errors.
     result = run_async(f.outlet(body, __event_emitter__=emitter, __model__=make_model_dict("mystery-model")))
     assert result is body
+
+
+def test_outlet_reads_owui_0125_incomplete_usage_as_no_usage(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OWUI 0.12.5 leaves `{"incomplete": True}` for a streamed call that reported no usage, persisted too."""
+    mod = usage_display_module
+    f = mod.Filter()
+    _patch_no_network(monkeypatch, f)
+    install_fake_tiktoken(monkeypatch, mod)
+    f.valves.show_data_source = True
+    past = make_message("old answer", usage={"incomplete": True})
+    current = make_message("three word answer", usage={"incomplete": True})
+    messages = [make_message("q1", role="user"), past, make_message("q2", role="user"), current]
+    emitter = CapturingEmitter()
+    run_async(f.outlet(make_body(messages, model="gpt-4o"), __event_emitter__=emitter, __model__=make_model_dict()))
+    line = emitter.statuses()[0]["data"]["description"]
+    assert "⬇︎ 3" in line  # tiktoken estimate of the reply
+    assert line.endswith("[est.]")
+    assert "🧮" not in line  # the past turn has no counter, so the chat total equals this turn and is hidden
+    tokens = f._extract_tokens(current["usage"], current, messages, {}, None)
+    cumulative = f._cumulative_tokens(messages, current, tokens)
+    # The current turn counts with its estimated Σ; the past one is skipped, never re-estimated.
+    assert (cumulative["messages_counted"], cumulative["messages_skipped_no_usage"]) == (1, 1)
+    assert cumulative["estimated"] is True
 
 
 def test_outlet_survives_network_resolver_exception(
