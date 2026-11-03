@@ -33,7 +33,7 @@ and listed in the official Open WebUI docs Community Plugins catalog
 - Plugin internals — pipeline, valves, resolution chains, token/cache semantics, debug payload,
   edge-case catalog with covering tests: @docs/plugin-internals.md
 - Open WebUI source map — filter machinery, request lifecycle, usage normalization, persistence,
-  events, frontend constraints (verified against v0.11.1, diff-checked through v0.12.5):
+  events, frontend constraints (verified against v0.11.1, diff-checked through v0.13.0):
   @docs/owui-map.md
 
 ## Commands
@@ -132,7 +132,7 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (250 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (252 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
 and `make_*` builders live at the top of the test file). The only outside state any test reads is git:
 `tests/test_valves_compat.py` (4 tests) loads every release tag's `usage_display.py`, and
@@ -140,7 +140,7 @@ and `make_*` builders live at the top of the test file). The only outside state 
 on a throwaway repository — which is why CI checks out with `fetch-depth: 0`. Both get the tags from the
 `release_tags` fixture in `tests/conftest.py`: without tags it fails in CI and skips locally — run
 `git fetch --tags` in a clone that lacks the newest release tag. `pydantic` is pinned (`==`) in the `dev`
-dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.12.5), so the plugin
+dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.13.0), so the plugin
 is tested against the same pydantic it runs on in production — keep that pin tracking OWUI's, and
 don't merge a Dependabot bump that drifts it (Dependabot runs weekly for the `uv` and
 `github-actions` ecosystems).

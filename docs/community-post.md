@@ -137,6 +137,8 @@ Fixed in **v2.2.0** — upgrade. Some proxies (LiteLLM) fold Anthropic's cache t
 - When Open WebUI (0.12.5+) reports that a request of the turn sent no token count, every token number of that response is marked `≈`: the real counts are higher.
 - On Open WebUI 0.12.5+, a response with tool calls whose usage comes in Anthropic's own format (from a pipe or a pass-through proxy; LiteLLM and OpenRouter convert it) gets its cache summed over all requests. `📐` then adds the average cache per request, marked `≈` - a close estimate that runs a little low.
 - In multi-round tool turns, Open WebUI only carries the last round's provider-specific cache/timing fields, so those can reflect the final round rather than the whole turn. The truncation marker likewise reflects the last request of the turn.
+- Open WebUI 0.13.0 can compact a long chat more cheaply by replaying it to the provider's prompt cache, but only for models with no filter function attached. On a model with this plugin (or any other filter) compaction works as in 0.12.x; Open WebUI decides this, the plugin cannot change it.
+- Side chats (`/side`, `/btw`, Open WebUI 0.13.0+) are temporary chats: the chat totals (`🧮`, `💰Σ`) equal the current message there and are hidden.
 - In a Realtime voice call (Open WebUI 0.12.0+), replies the voice model speaks on its own never pass through filters, so they get no stats line; questions it hands to the chat model are ordinary responses and do.
 - Estimated cost (`≈`) is a ballpark from published models.dev prices, not your invoice; long-context tier pricing isn't modelled and, when the model can't be mapped to a provider, no estimate is shown. Provider-reported cost (`auto` mode) is exact.
 

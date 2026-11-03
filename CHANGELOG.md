@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.10.1]
+
+Checked against Open WebUI 0.13.0 ([#42](https://github.com/SmetDenis/openwebui-token-usage-display/issues/42)): the plugin works there unchanged. This release only updates the source-verified notes inside `usage_display.py`; no behaviour, metric or valve changed.
+
+- Open WebUI 0.13.0 sends real stop reasons for non-streaming Responses API replies, so the truncation marker `✂️` now also shows there when a reply hits its output-token limit.
+- Open WebUI 0.13.0 gives non-streaming Responses API usage in both naming schemes (`input_tokens_details` and `prompt_tokens_details`). The plugin reads each count once; a new test checks it.
+- A Responses API stream cut by the token limit now keeps its token counts in Open WebUI 0.13.0, so it shows real numbers instead of a `≈` estimate.
+- README: side chats (`/side`, `/btw`) behave like temporary chats for the chat totals, and Open WebUI 0.13.0's cheaper prompt-cache compaction only runs on models with no filter attached, this plugin included.
+
 ## [2.10.0]
 
 Improvements from the re-check against Open WebUI 0.12.5 ([#39](https://github.com/SmetDenis/openwebui-token-usage-display/issues/39)). No valve was added, removed or changed.

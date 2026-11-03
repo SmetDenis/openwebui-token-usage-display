@@ -85,6 +85,10 @@ against OWUI v0.11.0 + a `v0.11.0...v0.11.1` diff check (2026-08):
   within one call (`update_usage_snapshot`). The NOTE block and `_last_round_context` say so; the cache
   change left a gap in `📐`, closed approximately in v2.10.0 (see "Context used" below). Details:
   `docs/owui-map.md`, "What changed in v0.12.1-v0.12.5".
+- Re-checked against a `v0.12.5...v0.13.0` diff (2026-11-03, v2.10.1, issue #42): the usage core did not
+  change. Non-streaming Responses replies now carry a real `finish_reason` and both detail-key families
+  (`input_*` copied to `prompt_*`), and a truncated Responses stream keeps its usage; the NOTE block says so,
+  and no reader counts a family twice. Details: `docs/owui-map.md`, "What changed in v0.13.0".
 
 Any change to token/cost/context reading must be reconciled against this block AND re-verified
 against real OWUI source of the version being targeted — never against memory or docs.
@@ -158,8 +162,9 @@ an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
   status; `tool_calls` ends a turn paused for tool approval or stopped at the tool-call limit;
   `content_filter` was offered and declined (rare, provider-specific). Absence means "unknown" —
   Responses API streams and OWUI < 0.12 send none — so it is never read as "stopped normally". Plain
-  pipes and non-streaming Responses replies get a synthesized `stop`/`tool_calls`, never `length`, so
-  the marker cannot show there; a pipe passing an upstream response through keeps its real value. Rejected: also matching
+  pipes (and, before OWUI 0.13.0, non-streaming Responses replies) get a synthesized `stop`/`tool_calls`,
+  never `length`, so the marker cannot show there; a pipe passing an upstream response through keeps its
+  real value. Since 0.13.0 a non-streaming Responses reply reports `length` from `status: incomplete`. Rejected: also matching
   `max_tokens` (Anthropic-native wording): OWUI passes the upstream's OpenAI-shaped
   `choices[0].finish_reason` as sent and maps no native `stop_reason` into it (`utils/anthropic.py`
   maps only the other way, for OWUI's own Anthropic-compatible API), so only a non-conforming proxy
@@ -453,7 +458,8 @@ models.dev tables. Classic failure: `claude-opus-4.8` (dot) does not substring-m
   between rounds counts as generation time.
 - **Partial usage — `tokens["incomplete"]` (v2.10.0, issue #39)**: OWUI 0.12.5 writes `incomplete: true`
   when a call of the turn reported no input or output count (`merge_usage`, and the middleware's
-  `{**usage, "incomplete": True}` for a later call with no usage). With counters present, every token
+  `{**usage, "incomplete": True}` for a later call with no usage). A Responses API stream cut by the token
+  limit was one such call until OWUI 0.13.0, which reads the usage of `response.incomplete`. With counters present, every token
   counter renders with `≈` (`_approx`: `⬆︎`, `⬇︎`, `Σ`; `📐` via `context_est`; `🧮` via
   `cumulative_est`, also when a past turn carries the flag). Owner's choice: all token counters, not only
   the totals (`⬆︎`/`⬇︎` are the partial ones) and not debug-only. Cost is not marked: it is not a token
@@ -501,7 +507,7 @@ against models.dev. All three aiohttp fetchers catch broad `Exception` and degra
 ## Debug payload — `_emit_debug` (`:1903+`)
 
 - Ships as a `citation` event (copyable Markdown modal, persisted with the message) + stdout
-  mirror, because the status line is `line-clamp-1` plain text inside a toggle `<button>` and
+  mirror, because the status line is `line-clamp-1` plain text under a toggle button and
   `content` is invisible when `output` is non-empty (see `docs/owui-map.md`, frontend constraints).
 - **Provenance-first**: `source`/`matched_key`/rates come from the real resolvers
   (`_resolve_price`, `_context_size_for` return provenance), so debug can never drift from the
@@ -559,6 +565,7 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | `wall_seconds == 0.0` | no div-by-zero (falsy guard) | `:1225-1226` | `test_resolve_timing_zero_wall_seconds_no_divide_by_zero` |
 | provider-reported tps present | beats computed `output/seconds` | `:1214-1221` | `test_resolve_timing_ollama_reported_tps` |
 | proxy folds Anthropic cache into details | treated as subset (no double count) | `:1127-1134` | `test_cache_and_fresh_openai_subset` / `_anthropic_native_on_top` |
+| non-streaming Responses usage with both detail families (OWUI 0.13.0) | first family read, never both; one call and a merged two-call turn | `_cache_and_fresh`, `_extract_tokens` | `test_outlet_reads_owui_0130_responses_usage_with_both_detail_families_once` |
 | `auto` mode, no native cost key | never estimates/fetches | `:1442-1446` | `test_resolve_cost_auto_no_native_key_never_estimates` |
 | zero-value token bag | cost `None` | `:1583-1584` | `test_cost_components_zero_token_bag_returns_none` |
 | price missing `input`+`output` rates | cost `None` | `:1561-1564` | `test_cost_components_none_price_or_no_rates` |
@@ -626,5 +633,6 @@ debug citation on **Citations** (`ResponseMessage.svelte:683,882`). With either 
 emits normally, the backend persists normally, and the user sees nothing — only the stdout
 `[TUD debug]` mirror survives. Workspace/preset models are the ones affected (they store an
 explicit `info.meta.capabilities`; plain connection models have no `info` and default to on).
-`__model__["info"]["meta"]["capabilities"]` **is** readable in outlet, so the debug payload could
-surface this directly — not implemented yet, see `docs/owui-map.md` → frontend constraints.
+`__model__["info"]["meta"]["capabilities"]` **is** readable in outlet, so the debug payload shows it
+as `model.capabilities` (since v2.10.0) — but only where the citation itself can render, i.e. with
+Citations on; with it off, the stdout copy carries it. See `docs/owui-map.md` → frontend constraints.
