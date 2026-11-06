@@ -69,7 +69,9 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 ## Releasing a change
 
 **Every merge to `main` that changes `usage_display.py` is a release** (users paste the file from
-`main`, so `main` must always equal a published version). The number is never a judgment call:
+`main`, so `main` must always equal a published version). The project skill **`/release`**
+(`.claude/skills/release/SKILL.md`) walks the preparation: refresh the built-in tables (`make tables`),
+pick the semver part, `make bump`, the CHANGELOG section, `make pre-commit`. The number is never a judgment call:
 
 - **Pick the part, not the number:** `make bump PART=major|minor|patch` counts from the latest release
   tag and writes the version into all four places — the docstring `version:` (the single source of
@@ -132,14 +134,17 @@ Run a single test: `uv run --locked pytest tests/test_usage_display.py::test_ren
 
 OWUI plugins are not importable packages, so `tests/conftest.py` loads `usage_display.py` via
 `SourceFileLoader` and exposes it through the session-scoped **`usage_display_module`** fixture;
-tests (252 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
+tests (262 collected from `tests/test_usage_display.py`) call the module's functions directly. There is **no
 OWUI runtime and no network** — `tiktoken`/`aiohttp` and all provider payloads are faked (fakes
 and `make_*` builders live at the top of the test file). The only outside state any test reads is git:
 `tests/test_valves_compat.py` (4 tests) loads every release tag's `usage_display.py`, and
 `tests/test_release.py` (8 tests) checks the release rules of `scripts/release.py` against the tags and
 on a throwaway repository — which is why CI checks out with `fetch-depth: 0`. Both get the tags from the
 `release_tags` fixture in `tests/conftest.py`: without tags it fails in CI and skips locally — run
-`git fetch --tags` in a clone that lacks the newest release tag. `pydantic` is pinned (`==`) in the `dev`
+`git fetch --tags` in a clone that lacks the newest release tag. `tests/test_refresh_tables.py` (9 tests)
+checks the table generator of `scripts/refresh_tables.py` on a hand-made models.dev file, never the live
+one; tests that need a built-in price monkeypatch `_STATIC_PRICES`, since its rows change every release.
+`pydantic` is pinned (`==`) in the `dev`
 dependency group to the version OWUI ships (`2.13.4` for OWUI 0.10.2 through 0.13.0), so the plugin
 is tested against the same pydantic it runs on in production — keep that pin tracking OWUI's, and
 don't merge a Dependabot bump that drifts it (Dependabot runs weekly for the `uv` and
@@ -153,10 +158,12 @@ don't merge a Dependabot bump that drifts it (Dependabot runs weekly for the `uv
   narrow an `except`); a justified one-off gets a per-line `# noqa: RULE - reason`, not a wider
   ignore list. The intentional `except Exception` guards (the plugin must never break the
   response) are exactly the `# noqa: BLE001` lines.
-- `_STATIC_CONTEXT_SIZES` and `_STATIC_PRICES` are hand-maintained offline seed tables (from
-  models.dev, seeded 2026-07) — refresh them periodically; keep the `llama` family out of
-  `_STATIC_PRICES` on purpose (free on Meta's API, paid on Groq/Together — a hardcoded $0 would
-  lie).
+- `_STATIC_PRICES` is **generated** by `make tables` (`scripts/refresh_tables.py`) from models.dev
+  between its `# BEGIN/END generated static prices` markers — never edit it by hand. It holds the
+  first-party vendors' models of the last 4 months and is matched by exact id (`_price_key`), so it never
+  needs family keys; free local hosts (a `$0` Llama) are out by construction. `_STATIC_CONTEXT_SIZES` stays
+  **hand-written** with family keys (substring match); `make tables` prints where it disagrees with
+  models.dev. Both are refreshed before every release (the `/release` skill).
 - Issue templates ask reporters for the sanitized `debug_mode` payload; the PR template requires a
   version bump + CHANGELOG entry for user-facing changes and naming the OWUI version verified
   against.

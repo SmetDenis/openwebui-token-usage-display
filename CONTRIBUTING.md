@@ -82,7 +82,11 @@ tested against the same pydantic it runs on in production.
 Every merge to `main` that changes `usage_display.py` is a release; CI tags and publishes it.
 
 1. Make the change with a test.
-2. If it touches `usage_display.py`, run `make bump PART=<part>`:
+2. If it touches `usage_display.py`, run `make tables`: it regenerates the built-in price table from
+   models.dev and prints where the hand-written context table disagrees with it — fix those entries by
+   hand (specialised TTS/image/live variants may stay on their family size). The `/release` Claude Code
+   skill walks steps 2-5.
+3. Run `make bump PART=<part>`:
    - `major` — breaks an install: raises `required_open_webui_version`, removes a metric or valve, or
      changes a default incompatibly;
    - `minor` — adds a metric, a valve or a capability;
@@ -91,9 +95,9 @@ Every merge to `main` that changes `usage_display.py` is a release; CI tags and 
    It counts the next number from the latest release tag and writes it into the docstring `version:`
    (the single source of truth), `pyproject.toml`, the `uv.lock` project line and a new top
    `## [X.Y.Z]` section of `CHANGELOG.md`. Rerunning it is safe.
-3. Describe the change for users under that `CHANGELOG.md` heading: it becomes the release text.
-4. `make pre-commit` must be green — it includes the release check (`make release-check`).
-5. Merge. The `release` job in `ci.yml` creates tag `vX.Y.Z` on the merge commit and a GitHub release
+4. Describe the change for users under that `CHANGELOG.md` heading: it becomes the release text.
+5. `make pre-commit` must be green — it includes the release check (`make release-check`).
+6. Merge. The `release` job in `ci.yml` creates tag `vX.Y.Z` on the merge commit and a GitHub release
    (the CHANGELOG section, then GitHub's list of merged PRs). Do not create tags or releases by hand.
 
 Changes that leave `usage_display.py` alone (docs, CI, tests, dependency bumps) keep the version and

@@ -1,4 +1,4 @@
-"""Load usage_display.py and scripts/release.py as importable modules for the test suite."""
+"""Load usage_display.py and the scripts/ tools as importable modules for the test suite."""
 
 from __future__ import annotations
 
@@ -39,6 +39,12 @@ def usage_display_module() -> ModuleType:
 def release_module() -> ModuleType:
     """Load scripts/release.py (the release rules CI applies) as module `release`."""
     return _load("release", RELEASE_SCRIPT_PATH)
+
+
+@pytest.fixture(scope="session")
+def refresh_tables_module() -> ModuleType:
+    """Load scripts/refresh_tables.py (the built-in table generator) as module `refresh_tables`."""
+    return _load("refresh_tables", REPO_ROOT / "scripts" / "refresh_tables.py")
 
 
 @pytest.fixture
