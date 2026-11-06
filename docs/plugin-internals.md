@@ -409,8 +409,11 @@ Meta's own API is free but the same ids are paid on Groq/Together.
 
 `cost_debug.modelsdev` / `context_debug.modelsdev` (`_modelsdev_status`) give the last fetch of each live
 table: `status` (`not_fetched`, `ok`, `empty`, `http <code>`, `error: <ExceptionType>`,
-`aiohttp_unavailable`), `entries`, `age_s`. Both fetches share `_fetch_modelsdev` with a 10 s total timeout
-(`_MODELSDEV_TIMEOUT_S`; `api.json` is ~6 MB as of 2026-11).
+`aiohttp_unavailable`), `entries`, `age_s`. Both fetches share `_fetch_modelsdev`: 30 s total, 5 s to connect
+(`_MODELSDEV_TIMEOUT_S`, `_MODELSDEV_CONNECT_TIMEOUT_S`; aiohttp's `connect` covers DNS, TCP and TLS,
+`connector.py` in 3.14.5). `api.json` is ~6 MB, `models.json` ~0.5 MB (2026-11): the reporter's second
+payload fetched context from `models.json` while the first one got no price from `api.json` under the old 5 s
+total — the slow-link case. Owner's choice over a flat 10 s.
 
 ### Built-in prices and matching — design decisions (v2.10.2, issue #49)
 

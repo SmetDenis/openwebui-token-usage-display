@@ -444,10 +444,11 @@ _MIN_SHOWN_USD = 0.0001  # smallest amount _format_cost prints exactly; anything
 _COST_EQUAL_EPSILON = 1e-9  # float tolerance when deduping the chat cost total against the message cost
 _PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")  # per-1M rates read from a price entry
 _PRICE_PREFIX_CUT = re.compile(r"/|\.(?=[a-z])")  # where _price_key cuts a provider prefix off a model id
-# models.dev api.json is ~6 MB (2026-11); 5 s was too tight on a slow link (issue #49). Fetched once per TTL,
-# after the reply is on screen, but a firewall that drops packets would stall the status line this long
-# again on every retry (min(300, ttl)), so not more.
-_MODELSDEV_TIMEOUT_S = 10
+# models.dev api.json is ~6 MB (2026-11), 12x models.json: a 5 s total cut it off on a link that still fetched
+# models.json (issue #49). The download may take 30 s (once per TTL, after the reply is on screen), but
+# connecting (DNS, TCP, TLS) only 5 s, so a firewall that drops packets fails as fast as before on every retry.
+_MODELSDEV_TIMEOUT_S = 30
+_MODELSDEV_CONNECT_TIMEOUT_S = 5
 _HTTP_ERROR = 400  # the first HTTP status that is not a usable answer
 # The only place an OpenRouter key is ever sent, whichever connection or valve it came from.
 _OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
@@ -501,7 +502,9 @@ async def _fetch_modelsdev(url: str) -> tuple[object, str]:
         return None, "aiohttp_unavailable"
     try:
         async with (
-            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_MODELSDEV_TIMEOUT_S)) as session,
+            aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_MODELSDEV_TIMEOUT_S, connect=_MODELSDEV_CONNECT_TIMEOUT_S)
+            ) as session,
             session.get(url) as resp,
         ):
             if resp.status >= _HTTP_ERROR:
