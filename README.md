@@ -76,7 +76,7 @@ The context window size is resolved in this order:
 5. **What the serving backend reports for the model** - automatic, no network: llama.cpp (builds since May 2026) and llama-swap (with `capabilities.context` set) list the running window as `meta.n_ctx` in `/v1/models`, vLLM as `max_model_len`, and Open WebUI hands that listing to the plugin. This is your server's real `--ctx-size`, not the model's trained maximum
 6. **llama.cpp / llama-swap probe** - optional, opt-in via URL valves, for backends not reached through an Open WebUI connection; asks llama.cpp `/v1/models` (then `/props` on older builds) or llama-swap `/running` (then `/props?model=` for a loaded model), and wins over the tables only when the row matches the called model's id
 7. **Live models.dev lookup** - optional, opt-in; fetches current sizes and caches them (default off)
-8. **Built-in table** - seeded from [models.dev](https://models.dev), covering the popular OpenAI / Anthropic / Gemini / Llama / DeepSeek / Grok / Mistral / Qwen / Kimi / GLM / MiniMax / Cohere families
+8. **Built-in table** - from [models.dev](https://models.dev), refreshed before every release, covering the popular OpenAI / Anthropic / Gemini / Llama / DeepSeek / Grok / Mistral / Qwen / Kimi / GLM / MiniMax / Cohere families
 9. **A probed backend's only running model, when its id differs from the called one** (an alias) - last, because with a cloud model called it would be another model's window
 
 **Workspace models resolve via their base model.** For a custom model / "agent" built on a base model, matching (context size **and** cost) uses the model's **`base_model_id`** - the real underlying LLM - not your custom model id. So a single `context_size_map` entry keyed on the base model covers every agent built on it.
@@ -92,6 +92,17 @@ Cost has three modes, set by the **`cost_mode`** valve:
 
 In `estimate` mode the price is resolved as: your manual **`price_map`** valve → live models.dev
 `api.json` (per-provider prices, cached ~24h) → a built-in offline price table. Cached and reasoning tokens are priced correctly.
+
+- **`price_map`** matches any part of the model id (`{"deepseek": {...}}` prices every DeepSeek model).
+- **models.dev and the built-in table** match only the model's own id, also behind a provider prefix
+  (`openai/gpt-6.1-terra`, a connection prefix `openai.gpt-6.1-terra`, `au.anthropic.claude-opus-4-8`). A
+  related model is a different price, so an id they don't list (a dated snapshot such as
+  `gpt-6.1-terra-2026-10-01`, a `-fast` variant) gets no estimate rather than its neighbour's price - add it
+  to `price_map`.
+- **The built-in table** is rebuilt from models.dev before every release and holds only the models the
+  vendors themselves sell that came out in the last 4 months. It is there for when models.dev cannot be
+  reached; older models are priced by models.dev or your `price_map`.
+- If a chat has a response the plugin could not price, the chat total `💰Σ` is marked `≈`: it is too low.
 
 > **Estimates are approximate on purpose.** models.dev lists *published* per-provider prices; your real
 > bill can differ, sometimes by a large multiple (gateways route the same model id to different upstream
@@ -168,7 +179,9 @@ Turn on the **`debug_mode`** valve and open the **"Token Usage & Cost Display - 
   was used; the key itself is never in the payload.
 - **`estimate` cost is blank / context % missing.** The model id matched no price/context entry (common when Open WebUI exposes a display name like `Anthropic - Opus`). Add a `price_map` / `context_size_map`
   keyed to a substring of the id, or use a canonical id. For a workspace model, key the map on the
-  **base** model.
+  **base** model. `cost_debug.price.source: none` with `cost_debug.modelsdev.status` other than `ok` means the
+  models.dev download failed (`http 503`, `error: TimeoutError`, `aiohttp_unavailable`): check that the
+  server can reach `https://models.dev`. `context_debug.modelsdev` does the same for the context lookup.
 
 ## Notes & limitations
 

@@ -3,7 +3,7 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.10.1
+version: 2.10.2
 license: MIT
 description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
@@ -128,20 +128,30 @@ _request_timings: dict[str, float] = {}
 # Context-window size cache: model_key -> (size, expiry_epoch, provenance).
 _ctx_size_cache: dict[str, tuple[int, float, dict[str, Any]]] = {}
 
-# Cached models.dev lookup table (id -> context tokens): {"map": dict|None, "expiry": epoch}.
-_modelsdev_cache: dict[str, Any] = {"map": None, "expiry": 0.0}
+# Cached models.dev lookup table (id -> context tokens): {"map": dict|None, "expiry": epoch, "status": str,
+# "fetched_at": epoch|None}; status and fetched_at describe the last fetch, for the debug payload.
+_modelsdev_cache: dict[str, Any] = {"map": None, "expiry": 0.0, "status": "not_fetched", "fetched_at": None}
 
-# Cached models.dev price map (id -> {input,output,cache_read,cache_write} USD/1M): {"map": dict|None, "expiry": epoch}.
-_modelsdev_prices_cache: dict[str, Any] = {"map": None, "expiry": 0.0}
+# Cached models.dev price map (id -> {input,output,cache_read,cache_write} USD/1M), same shape as above.
+_modelsdev_prices_cache: dict[str, Any] = {"map": None, "expiry": 0.0, "status": "not_fetched", "fetched_at": None}
 
-# Static context-window table — offline default, seeded from models.dev (2026-07).
-# Matched as a case-insensitive substring of the model id; the LONGEST matching key
-# wins, so specific keys (gpt-4o) override generic ones (gpt-4). Enable the
+# Static context-window table — offline default, seeded from models.dev (2026-07), refreshed before every
+# release from the report of scripts/refresh_tables.py (last: 2026-11). Hand-written on purpose: family keys
+# keep older and future members covered. Matched as a case-insensitive substring of the model id; the
+# LONGEST matching key wins, so specific keys (gpt-4o) override generic ones (gpt-4). Enable the
 # `fetch_context_from_modelsdev` valve for always-current sizes across every model.
 _STATIC_CONTEXT_SIZES: dict[str, int] = {
     # --- OpenAI ---
+    "gpt-6": 1050000,
+    "gpt-daybreak-blue": 1050000,
+    "gpt-daybreak-red": 400000,
+    "gpt-realtime": 128000,
+    "gpt-5.6": 1050000,
     "gpt-5.5": 1050000,
+    "gpt-5.4-mini": 400000,
+    "gpt-5.4-nano": 400000,
     "gpt-5.4": 1050000,
+    "gpt-5.3-codex-spark": 128000,
     "gpt-5": 400000,
     "gpt-4.1": 1047576,
     "gpt-4o": 128000,
@@ -152,6 +162,8 @@ _STATIC_CONTEXT_SIZES: dict[str, int] = {
     "o3": 200000,
     "o1": 200000,
     # --- Anthropic (Opus 4.6+/Sonnet 5 moved to 1M) ---
+    "claude-opus-5": 1000000,
+    "claude-haiku-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4-7": 1000000,
     "claude-opus-4-6": 1000000,
@@ -179,24 +191,47 @@ _STATIC_CONTEXT_SIZES: dict[str, int] = {
     "deepseek-r1": 128000,
     "deepseek-reasoner": 1000000,
     "deepseek-chat": 1000000,
-    "deepseek-v4": 1000000,
-    "deepseek-flash": 1000000,
+    "deepseek-v4": 1048576,
+    "deepseek-flash": 1048576,
     "deepseek": 128000,
     # --- xAI Grok ---
+    "grok-4.7": 500000,
+    "grok-4.6": 500000,
+    "grok-4.5": 500000,
     "grok-4": 1000000,
     "grok-3": 131072,
     "grok": 256000,
     # --- Mistral ---
+    "mistral-large-4": 1048576,
     "mistral-large": 262144,
     "mistral-medium": 262144,
-    "mistral-small": 256000,
+    "mistral-small": 262144,
+    "ministral-3b": 131072,
+    "ministral": 262144,
+    "voxtral": 32768,
     "codestral": 256000,
     "devstral": 262144,
     "magistral": 128000,
     "mistral-nemo": 128000,
     "pixtral": 128000,
     "mistral": 32768,
-    # --- Alibaba Qwen ---
+    # --- Alibaba Qwen (the proprietary flash/plus/max lines are 1M; open weights vary by host) ---
+    "qwen3.8-omni-flash": 1000000,
+    "qwen3.8-flash": 1000000,
+    "qwen3.8-max": 1000000,
+    "qwen3.7-flash": 1000000,
+    "qwen3.7-plus": 1000000,
+    "qwen3.7-max": 1000000,
+    "qwen3.6-flash": 1000000,
+    "qwen3.6-plus": 1000000,
+    "qwen3.6": 262144,
+    "qwen3.5-flash": 1000000,
+    "qwen3.5-plus": 1000000,
+    "qwen3.5": 262144,
+    "qwen3-coder-flash": 1000000,
+    "qwen3-vl-plus": 262144,
+    "qwen-flash": 1000000,
+    "qwen-plus": 1000000,
     "qwen3-coder": 262144,
     "qwen3-max": 262144,
     "qwen3": 131072,
@@ -204,80 +239,103 @@ _STATIC_CONTEXT_SIZES: dict[str, int] = {
     "qwen2.5": 128000,
     "qwen": 32768,
     # --- Moonshot Kimi ---
+    "kimi-k3": 1048576,
     "kimi-k2": 262144,
     "kimi": 200000,
     # --- Zhipu GLM ---
+    "glm-5.3": 1000000,
+    "glm-5-3": 1048576,  # Mistral's id for it (zai-glm-5-3)
     "glm-5.2": 1000000,
+    "glm-5.1": 200000,
     "glm-5": 204800,
+    "glm-4.6v": 128000,
+    "glm-4.5v": 64000,
     "glm-4.7": 204800,
     "glm-4.6": 204800,
     "glm-4.5": 131072,
     "glm": 131072,
     # --- MiniMax ---
-    "minimax-m3": 512000,
+    "minimax-m3": 1000000,
     "minimax": 204800,
     # --- Cohere Command ---
+    "command-a-plus": 128000,
+    "command-a-vision": 128000,
+    "command-a-translate": 8000,
     "command-a": 256000,
     "command-r": 128000,
     "command": 128000,
 }
 
-# Static price table — offline fallback for cost estimation (USD per 1M tokens),
-# seeded from models.dev (2026-07). Matched like the context table: case-insensitive
-# substring of the model id, LONGEST key wins. `cache_read` is the discounted price
-# for cached-prompt tokens; `cache_write` (Anthropic only) is the cache-write premium.
-# Prices are provider-specific — these use each family's first-party ("canonical")
-# provider, so an estimate is only ever an approximation. Enable
-# `fetch_prices_from_modelsdev` for exact, always-current per-provider prices.
-# NOTE: local/free backends (Ollama, llama.cpp, Meta's free Llama API) are omitted on
-# purpose — their price is $0 or varies by host, so estimating would mislead.
+# Static price table — offline fallback for cost estimation in `estimate` mode (USD per 1M tokens), used
+# only when the price_map valve and live models.dev have no price. Matched by the exact model id, else the
+# id without a provider prefix (_price_key) — never by substring: a related id (deepseek-v4-1-flash vs
+# deepseek-v4) is a different tariff, so an unknown model gets no price instead of a wrong one (issue #49).
+# Generated by scripts/refresh_tables.py from models.dev before every release; never edit by hand. It holds
+# the models the vendors themselves sell (first-party providers, so no reseller prices and no free local
+# hosts) that came out in the last 4 months and are not deprecated: older models are priced by models.dev
+# or price_map. Rates are models.dev's base tier (long-context tiers are not modelled) and its own
+# cache_read/cache_write fields; an id several vendors list keeps the first vendor's price.
+# BEGIN generated static prices
+# models.dev https://models.dev/api.json of 2026-11-06: 46 models released on or after 2026-07-06.
 _STATIC_PRICES: dict[str, dict[str, float]] = {
-    # --- OpenAI ---
-    "gpt-5.5": {"input": 5.00, "output": 30.00, "cache_read": 0.50},
-    "gpt-5-mini": {"input": 0.25, "output": 2.00, "cache_read": 0.025},
-    "gpt-5": {"input": 1.25, "output": 10.00, "cache_read": 0.125},
-    "gpt-4.1": {"input": 2.00, "output": 8.00, "cache_read": 0.50},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60, "cache_read": 0.075},
-    "gpt-4o": {"input": 2.50, "output": 10.00, "cache_read": 1.25},
-    "o4-mini": {"input": 1.10, "output": 4.40, "cache_read": 0.275},
-    "o3": {"input": 2.00, "output": 8.00, "cache_read": 0.50},
-    # --- Anthropic (cache_write = cache-write premium) ---
-    "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-sonnet-5": {"input": 2.00, "output": 10.00, "cache_read": 0.20, "cache_write": 2.50},
-    "claude-haiku-4-5": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
-    # --- Google Gemini ---
-    "gemini-3.5-flash": {"input": 1.50, "output": 9.00, "cache_read": 0.15},
-    "gemini-3-pro": {"input": 2.00, "output": 12.00, "cache_read": 0.20},
-    "gemini-2.5-pro": {"input": 1.25, "output": 10.00, "cache_read": 0.125},
-    "gemini-2.5-flash": {"input": 0.30, "output": 2.50, "cache_read": 0.03},
-    # --- DeepSeek ---
-    "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cache_read": 0.003625},
-    "deepseek-v4": {"input": 0.14, "output": 0.28, "cache_read": 0.0028},
-    "deepseek-reasoner": {"input": 0.14, "output": 0.28, "cache_read": 0.0028},
-    "deepseek-chat": {"input": 0.14, "output": 0.28, "cache_read": 0.0028},
-    # --- xAI Grok ---
-    "grok-4": {"input": 1.25, "output": 2.50, "cache_read": 0.20},
-    # --- Mistral ---
-    "mistral-large": {"input": 0.50, "output": 1.50},
-    "mistral-medium": {"input": 0.40, "output": 2.00},
-    "mistral-small": {"input": 0.15, "output": 0.60},
-    "pixtral": {"input": 2.00, "output": 6.00},
-    # --- Alibaba Qwen ---
-    "qwen3-coder": {"input": 1.00, "output": 5.00},
-    "qwen3-max": {"input": 1.20, "output": 6.00},
-    # --- Moonshot Kimi ---
-    "kimi-k2.6": {"input": 0.95, "output": 4.00, "cache_read": 0.16},
-    "kimi-k2": {"input": 0.60, "output": 2.50, "cache_read": 0.15},
-    # --- Zhipu GLM ---
-    "glm-5.2": {"input": 1.40, "output": 4.40, "cache_read": 0.26},
-    "glm-5": {"input": 1.00, "output": 3.20, "cache_read": 0.20},
-    "glm-4.6": {"input": 0.60, "output": 2.20, "cache_read": 0.11},
-    # --- MiniMax ---
-    "minimax-m3": {"input": 0.30, "output": 1.20, "cache_read": 0.06},
-    # --- Cohere Command ---
-    "command-a": {"input": 2.50, "output": 10.00},
-    "command-r": {"input": 0.15, "output": 0.60},
+    # --- openai ---
+    "gpt-5.6": {"input": 4.0, "output": 20.0, "cache_read": 0.4, "cache_write": 5.0},
+    "gpt-5.6-luna": {"input": 0.2, "output": 1.2, "cache_read": 0.02, "cache_write": 0.25},
+    "gpt-5.6-sol": {"input": 4.0, "output": 20.0, "cache_read": 0.4, "cache_write": 5.0},
+    "gpt-5.6-terra": {"input": 2.0, "output": 12.0, "cache_read": 0.2, "cache_write": 2.5},
+    "gpt-6-astra": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
+    "gpt-6-luna": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125},
+    "gpt-6-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5},
+    "gpt-6.1-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.1, "cache_write": 2.5},
+    "gpt-6.1-terra": {"input": 1.0, "output": 5.0, "cache_read": 0.05, "cache_write": 1.25},
+    "gpt-daybreak-blue-latest": {"input": 4.0, "output": 20.0, "cache_read": 0.4, "cache_write": 5.0},
+    "gpt-daybreak-red-latest": {"input": 12.5, "output": 75.0, "cache_read": 1.25, "cache_write": 15.625},
+    "gpt-realtime-2.1": {"input": 4.0, "output": 24.0, "cache_read": 0.4},
+    # --- anthropic ---
+    "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
+    "claude-haiku-5-5": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125},
+    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
+    "claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0},
+    "claude-sonnet-5-5": {"input": 2.0, "output": 10.0, "cache_read": 0.1, "cache_write": 2.5},
+    # --- google ---
+    "gemini-3.5-flash-lite": {"input": 0.3, "output": 2.5, "cache_read": 0.03},
+    "gemini-3.6-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
+    "gemini-3.7-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
+    "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
+    "gemini-4-argon": {"input": 2.0, "output": 10.0, "cache_read": 0.1},
+    "gemini-flash-latest": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
+    "gemini-flash-lite-latest": {"input": 0.3, "output": 2.5, "cache_read": 0.03},
+    # --- deepseek ---
+    "deepseek-flash": {"input": 0.15, "output": 0.6, "cache_read": 0.003},
+    "deepseek-v4-pro": {"input": 0.66, "output": 1.98, "cache_read": 0.022},
+    # --- xai ---
+    "grok-4.5": {"input": 2.0, "output": 6.0, "cache_read": 0.3},
+    "grok-4.6": {"input": 2.0, "output": 6.0, "cache_read": 0.5},
+    "grok-4.7": {"input": 2.0, "output": 6.0, "cache_read": 0.5},
+    # --- moonshotai ---
+    "kimi-k3": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.0},
+    "kimi-k3.1-pro": {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.0},
+    "kimi-k3.1-pro-highspeed": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 4.0},
+    # --- zai ---
+    "glm-5.3": {"input": 1.4, "output": 4.4, "cache_read": 0.26},
+    "glm-5.3-flash": {"input": 0.15, "output": 0.5, "cache_read": 0.03},
+    "glm-5.3-flashx": {"input": 0.37, "output": 1.25, "cache_read": 0.075},
+    # --- minimax ---
+    "minimax-m3.1-flash": {"input": 0.15, "output": 0.6, "cache_read": 0.015},
+    # --- mistral ---
+    "deepseek-v4-1-flash-1017": {"input": 0.3, "output": 1.2, "cache_read": 0.007},
+    "mistral-large-4": {"input": 0.7, "output": 2.1, "cache_read": 0.07},
+    "mistral-large-4-0-8": {"input": 0.7, "output": 2.1, "cache_read": 0.07},
+    "zai-glm-5-3": {"input": 1.4, "output": 4.4, "cache_read": 0.14},
+    "zai-glm-5-3-flash": {"input": 0.15, "output": 0.5, "cache_read": 0.03},
+    # --- alibaba ---
+    "deepseek-v4-flash-0731": {"input": 0.44, "output": 1.32, "cache_read": 0.088},
+    "qwen3.7-flash": {"input": 0.03, "output": 0.13, "cache_read": 0.006, "cache_write": 0.0375},
+    "qwen3.8-flash": {"input": 0.15, "output": 0.47, "cache_read": 0.016, "cache_write": 0.2},
+    "qwen3.8-max": {"input": 2.0, "output": 6.0, "cache_read": 0.25, "cache_write": 2.5},
+    "qwen3.8-omni-flash": {"input": 0.15, "output": 0.47, "cache_read": 0.016},
 }
+# END generated static prices
 
 
 # --- Helpers -------------------------------------------------------------------
@@ -385,6 +443,12 @@ _MILLION = 1_000_000
 _MIN_SHOWN_USD = 0.0001  # smallest amount _format_cost prints exactly; anything below reads "<$0.0001"
 _COST_EQUAL_EPSILON = 1e-9  # float tolerance when deduping the chat cost total against the message cost
 _PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")  # per-1M rates read from a price entry
+_PRICE_PREFIX_CUT = re.compile(r"/|\.(?=[a-z])")  # where _price_key cuts a provider prefix off a model id
+# models.dev api.json is ~6 MB (2026-11); 5 s was too tight on a slow link (issue #49). Fetched once per TTL,
+# after the reply is on screen, but a firewall that drops packets would stall the status line this long
+# again on every retry (min(300, ttl)), so not more.
+_MODELSDEV_TIMEOUT_S = 10
+_HTTP_ERROR = 400  # the first HTTP status that is not a usable answer
 # The only place an OpenRouter key is ever sent, whichever connection or valve it came from.
 _OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 _ERROR_MESSAGE_CHARS = 200  # an upstream error message is cut to this length in the debug payload
@@ -427,11 +491,43 @@ def _url_host(url: str) -> str:
     return m.group(1).lower() if m else ""
 
 
+async def _fetch_modelsdev(url: str) -> tuple[object, str]:
+    """GET a models.dev file as JSON: (data, "ok"), else (None, why) — never raises.
+
+    The reason (`aiohttp_unavailable`, `http <code>`, `error: <ExceptionType>`) goes to the debug
+    payload: a failed fetch otherwise looks exactly like a model models.dev does not list (issue #49).
+    """
+    if not _AIOHTTP_AVAILABLE:
+        return None, "aiohttp_unavailable"
+    try:
+        async with (
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_MODELSDEV_TIMEOUT_S)) as session,
+            session.get(url) as resp,
+        ):
+            if resp.status >= _HTTP_ERROR:
+                return None, f"http {resp.status}"
+            return await resp.json(content_type=None), "ok"
+    except Exception as exc:  # noqa: BLE001 - optional network fetch: any failure means "no live data"
+        return None, f"error: {type(exc).__name__}"
+
+
+def _modelsdev_status(cache: dict[str, Any]) -> dict[str, Any]:
+    """Debug view of a models.dev cache: last fetch status, entry count and age in seconds."""
+    fetched_at = cache.get("fetched_at")
+    table = cache.get("map")
+    return {
+        "status": cache.get("status"),
+        "entries": len(table) if isinstance(table, dict) else None,
+        "age_s": round(time.time() - fetched_at) if fetched_at else None,
+    }
+
+
 def _longest_key_match(table: dict[str, Any], model_id: str) -> str | None:
     """Longest case-insensitive substring key of `table` contained in `model_id`, else None.
 
-    Single source of truth for the substring lookup used by both context-size and price
-    resolution: specific keys (gpt-4o) beat generic ones (gpt-4). Empty keys are ignored.
+    The substring lookup of the context-size tables and of the admin's own maps (context_size_map,
+    price_map): specific keys (gpt-4o) beat generic ones (gpt-4). Empty keys are ignored. Built-in and
+    live prices use the exact _price_key instead.
     """
     if not isinstance(table, dict) or not table:
         return None
@@ -444,8 +540,31 @@ def _longest_key_match(table: dict[str, Any], model_id: str) -> str | None:
     return None
 
 
+def _price_key(table: dict[str, Any], model_id: str) -> str | None:
+    """Key of a price table for `model_id`: the id itself, else the id without a provider prefix, else None.
+
+    Prefixes are cut one at a time from the left at `/` (org/model) and at a `.` that is followed by a
+    letter (an OWUI connection prefix_id, a vendor or a cloud region: openai.gpt-6.1-terra,
+    au.anthropic.claude-opus-4-8), so a version dot (gpt-6.1, qwen3.8) is never a cut. Never a substring
+    or family match: a related id (deepseek-v4-1-flash vs deepseek-v4, claude-opus-4-8-fast vs
+    claude-opus-4-8) is a different tariff, so an unknown or dated id gets no price rather than a
+    wrong one (issue #49). The admin's price_map keeps substring matching (_longest_key_match).
+    """
+    if not isinstance(table, dict) or not table:
+        return None
+    mid = (model_id or "").lower()
+    while mid:
+        if mid in table:
+            return mid
+        cut = _PRICE_PREFIX_CUT.search(mid)
+        if cut is None:
+            return None
+        mid = mid[cut.end() :]
+    return None
+
+
 def _modelsdev_match(table: dict[str, Any], model_id: str) -> str | None:
-    """models.dev key matching `model_id`: exact -> bare (last path segment) -> longest substring."""
+    """models.dev context key matching `model_id`: exact -> bare (last path segment) -> longest substring."""
     if not isinstance(table, dict) or not table:
         return None
     mid = (model_id or "").lower()
@@ -1872,30 +1991,24 @@ class Filter:
         if cached_map is not None and _modelsdev_cache.get("expiry", 0) > now:
             return cached_map  # type: ignore[no-any-return]
 
+        data, status = await _fetch_modelsdev(self.valves.modelsdev_url)
         result: dict[str, Any] = {}
-        if _AIOHTTP_AVAILABLE:
-            try:
-                timeout = aiohttp.ClientTimeout(total=5)
-                async with (
-                    aiohttp.ClientSession(timeout=timeout) as session,
-                    session.get(self.valves.modelsdev_url) as resp,
-                ):
-                    data = await resp.json(content_type=None)
-                if isinstance(data, dict):
-                    for key, entry in data.items():
-                        limit = entry.get("limit") if isinstance(entry, dict) else None
-                        ctx = _num(limit.get("context")) if isinstance(limit, dict) else None
-                        if ctx:
-                            full = str(key).lower()
-                            result[full] = int(ctx)
-                            result.setdefault(full.split("/")[-1], int(ctx))
-            except Exception:  # noqa: BLE001 - optional network fetch: any failure means "no live sizes"
-                result = {}
+        for key, entry in (data if isinstance(data, dict) else {}).items():
+            limit = entry.get("limit") if isinstance(entry, dict) else None
+            ctx = _num(limit.get("context")) if isinstance(limit, dict) else None
+            if ctx:
+                full = str(key).lower()
+                result[full] = int(ctx)
+                result.setdefault(full.split("/")[-1], int(ctx))
 
         # Cache success for the full TTL; a failure only briefly so it retries soon.
         ttl = self.valves.modelsdev_ttl if result else min(300, self.valves.modelsdev_ttl)
-        _modelsdev_cache["map"] = result
-        _modelsdev_cache["expiry"] = now + max(60, ttl)
+        _modelsdev_cache.update(
+            map=result,
+            expiry=now + max(60, ttl),
+            status="empty" if status == "ok" and not result else status,
+            fetched_at=now,
+        )
         return result
 
     async def _probe_context(self, model_id: str) -> tuple[int, str | None] | None:
@@ -2091,10 +2204,11 @@ class Filter:
                 result["message"] = est
                 result["message_est"] = True
 
+        unpriced = None  # turns the chat total could not price; None = the total was not computed
         if self.valves.show_cumulative_cost:
             if price is None and mode == "estimate":
                 price, price_prov = await self._resolve_price(model_id)
-            result["cumulative"], result["cumulative_est"] = self._cumulative_cost(
+            result["cumulative"], result["cumulative_est"], unpriced = self._cumulative_cost(
                 messages, price if mode == "estimate" else None
             )
 
@@ -2109,7 +2223,9 @@ class Filter:
                     "matched_key": price_prov["matched_key"],
                     "rates_per_1m": price,
                 },
+                "modelsdev": _modelsdev_status(_modelsdev_prices_cache),
                 "breakdown": self._cost_components(tokens, price),
+                "cumulative_unpriced_messages": unpriced,
             }
         return result
 
@@ -2201,28 +2317,35 @@ class Filter:
         return None, "malformed_response"
 
     @staticmethod
-    def _cumulative_cost(messages: list[Any], price: dict[str, Any] | None) -> tuple[float | None, bool]:
-        """Chat cost total over every assistant turn on the branch + whether any part is estimated.
+    def _cumulative_cost(messages: list[Any], price: dict[str, Any] | None) -> tuple[float | None, bool, int]:
+        """Chat cost total over every assistant turn on the branch, whether it is approximate, unpriced turns.
 
         Native cost wins per message; a message without it is estimated only when `price` is given
-        (estimate mode). None when no message contributed at all.
+        (estimate mode). None when no message contributed at all. A turn that reports tokens (more than
+        zero) but gets no cost (no native cost and no price for it) leaves the sum short, so it is counted and the
+        total is marked approximate; a turn without token counts is skipped silently, like the chat
+        token total does (unsaved chats carry no history usage at all).
         """
         total = 0.0
         seen = False
         any_est = False
+        unpriced = 0
         for m in messages:
             usage = m.get("usage") if isinstance(m, dict) and m.get("role") == "assistant" else None
             if not isinstance(usage, dict):
                 continue
             cost, _ = Filter._native_cost(usage)
             estimated = cost is None
+            bag = Filter._usage_token_bag(usage)
             if estimated and price:
-                cost = Filter._estimate_cost(Filter._usage_token_bag(usage), price)
+                cost = Filter._estimate_cost(bag, price)
             if cost is not None:
                 total += cost
                 seen = True
                 any_est = any_est or estimated
-        return (total if seen else None), any_est
+            elif (bag["input"] or 0) + (bag["output"] or 0) > 0:  # a measured 0/0 turn costs nothing: nothing missing
+                unpriced += 1
+        return (total if seen else None), any_est or unpriced > 0, unpriced
 
     @staticmethod
     def _native_cost_details(usage: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -2348,8 +2471,9 @@ class Filter:
     async def _resolve_price(self, model_id: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """Per-1M price + provenance ({source, matched_key}): manual map -> models.dev -> static.
 
-        Provenance is debug-only; the returned price is what the hot path uses. Order and
-        matching semantics are unchanged from the previous per-source lookups.
+        Provenance is debug-only; the returned price is what the hot path uses. The admin's price_map
+        matches by substring (its keys are the admin's own choice); models.dev and the built-in table
+        match only the exact id or the id without a provider prefix (_price_key, issue #49).
         """
         table = self._price_map_table()
         key = _longest_key_match(table, model_id)
@@ -2357,10 +2481,10 @@ class Filter:
             return table[key], {"source": "price_map", "matched_key": key}
         if self.valves.fetch_prices_from_modelsdev:
             mtable = await self._modelsdev_prices_map()
-            mkey = _modelsdev_match(mtable, model_id)
+            mkey = _price_key(mtable, model_id)
             if mkey is not None and mtable[mkey]:
                 return mtable[mkey], {"source": "modelsdev", "matched_key": mkey}
-        skey = _longest_key_match(_STATIC_PRICES, model_id)
+        skey = _price_key(_STATIC_PRICES, model_id)
         if skey is not None:
             return _STATIC_PRICES[skey], {"source": "static", "matched_key": skey}
         return None, {"source": "none", "matched_key": None}
@@ -2385,22 +2509,16 @@ class Filter:
         if cached_map is not None and _modelsdev_prices_cache.get("expiry", 0) > now:
             return cached_map  # type: ignore[no-any-return]
 
-        result: dict[str, Any] = {}
-        if _AIOHTTP_AVAILABLE:
-            try:
-                timeout = aiohttp.ClientTimeout(total=5)
-                async with (
-                    aiohttp.ClientSession(timeout=timeout) as session,
-                    session.get(self.valves.modelsdev_api_url) as resp,
-                ):
-                    data = await resp.json(content_type=None)
-                result = self._parse_prices(data)
-            except Exception:  # noqa: BLE001 - optional network fetch: any failure means "no live prices"
-                result = {}
+        data, status = await _fetch_modelsdev(self.valves.modelsdev_api_url)
+        result = self._parse_prices(data)
 
         ttl = self.valves.modelsdev_ttl if result else min(300, self.valves.modelsdev_ttl)
-        _modelsdev_prices_cache["map"] = result
-        _modelsdev_prices_cache["expiry"] = now + max(60, ttl)
+        _modelsdev_prices_cache.update(
+            map=result,
+            expiry=now + max(60, ttl),
+            status="empty" if status == "ok" and not result else status,
+            fetched_at=now,
+        )
         return result
 
     @staticmethod
@@ -2667,6 +2785,7 @@ class Filter:
             "used_source": stats.ctx.get("used_source"),
             "used_est": stats.ctx.get("used_est"),
             "percent": percent,
+            "modelsdev": _modelsdev_status(_modelsdev_cache),
         }
 
         display_order_debug = _display_order_debug(self.valves.display_order or "")
