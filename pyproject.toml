@@ -1,6 +1,6 @@
 [project]
 name = "openwebui-token-usage-display"
-version = "2.10.1"
+version = "2.10.2"
 description = "Open WebUI filter plugin: token usage & cost display below each response"
 requires-python = ">=3.11"
 
@@ -82,7 +82,7 @@ python_version = "3.11"
 strict = true
 warn_unused_configs = true
 warn_unreachable = true
-files = ["usage_display.py", "scripts/release.py", "tests"]
+files = ["usage_display.py", "scripts/release.py", "scripts/refresh_tables.py", "tests"]
 
 [[tool.mypy.overrides]]
 module = ["tiktoken", "aiohttp", "open_webui.*"]  # open_webui: only present inside Open WebUI

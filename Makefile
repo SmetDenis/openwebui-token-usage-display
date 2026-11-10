@@ -10,7 +10,7 @@ PY_LINT_TARGETS := usage_display.py tests scripts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install-dev lock bump release-check upgrade test test-cov lint format typecheck pre-commit clean
+.PHONY: help install-dev lock bump tables release-check upgrade test test-cov lint format typecheck pre-commit clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?$(HASH)$(HASH) .*$$' $(MAKEFILE_LIST) \
@@ -24,6 +24,9 @@ lock:  ## Re-lock after editing [dependency-groups] in pyproject.toml (never for
 
 bump:  ## Set the next version from the latest release tag in every file: make bump PART=major|minor|patch
 	python3 scripts/release.py bump $(PART)
+
+tables:  ## Before a release: regenerate the built-in price table from models.dev and report context-table drift
+	python3 scripts/refresh_tables.py
 
 release-check:  ## Check the version is written the same everywhere and is above every release
 	python3 scripts/release.py check

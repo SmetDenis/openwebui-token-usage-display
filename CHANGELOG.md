@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.10.2]
+
+Cost estimates for new models, and no more wrong prices from a related model ([#49](https://github.com/SmetDenis/openwebui-token-usage-display/issues/49)). No metric or valve changed.
+
+- **The built-in price table is now generated, and covers new models.** Before every release it is rebuilt from models.dev with the models the vendors themselves sell (OpenAI, Anthropic, Google, DeepSeek, xAI, Moonshot, Z.ai, MiniMax, Cohere, Mistral, Alibaba) that came out in the last 4 months, so `gpt-6.x`, `claude-opus-5`, `kimi-k3` and others get an estimate even when models.dev cannot be reached. The table is only a fallback for `cost_mode` `estimate` when the live models.dev prices are unavailable.
+- **Prices from models.dev and the built-in table now need the model's own id.** A model id matches when it is the same id, or the same id behind a provider prefix (`openai/gpt-6.1-terra`, a connection prefix `openai.gpt-6.1-terra`, `au.anthropic.claude-opus-4-8`). Before, a model also took the price of any id contained in its own name: `deepseek-v4-1-flash` was priced as `deepseek-v4`, about 4 times too low, and `claude-opus-4-8-fast` as `claude-opus-4-8`, half its price. Such models now show no estimate until models.dev lists them or you add them to `price_map`, which still matches by any part of the id.
+- **Older models are no longer in the built-in price table** (`gpt-4o`, `o3`, `gpt-5.5`, `claude-sonnet-5` and the rest of the previous list): without access to models.dev, add the ones you use to `price_map`. With models.dev reachable nothing changes for them.
+- In `cost_mode` `auto` (the default) a direct OpenAI, Anthropic or Google connection shows no cost: they do not report one. README now says so; use `estimate` there.
+- **The chat total `💰Σ` shows `≈` when it misses a turn.** A turn that reports tokens but has no cost (no cost from the provider and no price for it) used to drop out of the sum silently.
+- The built-in context-window table got the new families too (`gpt-6`, `gpt-5.6`, `claude-opus-5`, `claude-haiku-5`, `kimi-k3`, `glm-5.3`, `grok-4.5`-`4.7`, `mistral-large-4`, newer Qwen lines) and corrected sizes (DeepSeek V4, MiniMax M3, Mistral Small).
+- **The models.dev price download no longer gives up after 5 s.** The price file is about 6 MB now, 12 times the context file, so on a slower link the context sizes arrived and the prices did not. It may now take up to 30 s (once a day, after the reply is shown); connecting still gives up after 5 s, so an unreachable models.dev does not hold the stats line longer than before.
+- `debug_mode`: `cost_debug.modelsdev` and `context_debug.modelsdev` show whether the last models.dev download worked and why not (`http 503`, `error: TimeoutError`, ...); `cost_debug.cumulative_unpriced_messages` counts the turns `💰Σ` could not price.
+- For maintainers: `make tables` (`scripts/refresh_tables.py`) regenerates the price table and reports where the context table differs from models.dev; it is a step of every release.
+
 ## [2.10.1]
 
 Checked against Open WebUI 0.13.0 ([#42](https://github.com/SmetDenis/openwebui-token-usage-display/issues/42)): the plugin works there unchanged. This release only updates the source-verified notes inside `usage_display.py`; no behaviour, metric or valve changed.

@@ -10,9 +10,11 @@ built by the factories below, shaped to OWUI 0.10.2.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 import types
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
 import pytest
@@ -197,11 +199,19 @@ def install_fake_tiktoken(monkeypatch: pytest.MonkeyPatch, mod: ModuleType, *, p
     monkeypatch.setattr(mod, "_TIKTOKEN_AVAILABLE", True, raising=False)
 
 
+@dataclass(frozen=True)
+class HttpStatus:
+    """A canned reply that is only an HTTP status (e.g. 503), for `install_fake_aiohttp` responses."""
+
+    code: int
+
+
 class _FakeAiohttpResponse:
-    """Stand-in for an aiohttp response: async context manager + async `.json()`."""
+    """Stand-in for an aiohttp response: async context manager, `.status` and async `.json()`."""
 
     def __init__(self, payload: Any) -> None:
         self._payload = payload
+        self.status = payload.code if isinstance(payload, HttpStatus) else 200
 
     async def __aenter__(self) -> Self:
         if isinstance(self._payload, Exception):
@@ -2581,7 +2591,7 @@ class _FakeRequest:
 def test_context_backend_n_ctx_beats_static_table(
     usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Issue #6: llama-server --ctx-size 16384 showed Qwen3's trained 131072 from the static table."""
+    """Issue #6: llama-server --ctx-size 16384 showed Qwen3's trained window from the static table."""
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)
     model = _llamacpp_model("qwen3.6-27b-issue6", 16384)
@@ -2593,7 +2603,7 @@ def test_context_backend_n_ctx_beats_static_table(
     plain = run_async(
         f._resolve_context(make_body(), {}, make_model_dict("qwen3.6-27b-issue6"), make_tokens(total=7200))
     )
-    assert plain["size"] == 131072
+    assert plain["size"] == usage_display_module._STATIC_CONTEXT_SIZES["qwen3.6"]
     assert plain["source"] == "static_table"
 
 
@@ -2660,7 +2670,7 @@ def test_context_workspace_model_registry_failure_falls_through(
 
     for request in (_FakeRequest(_BrokenModels()), object(), _FakeRequest({})):
         size, prov = run_async(f._context_size_for("qwen3.6-27b-registry-broken", None, preset, request))
-        assert size == 131072
+        assert size == usage_display_module._STATIC_CONTEXT_SIZES["qwen3.6"]
         assert prov["source"] == "static_table"
 
 
@@ -3181,6 +3191,7 @@ def test_resolve_cost_estimate_from_static_price(
 ) -> None:
     f = usage_display_module.Filter()
     _patch_no_network(monkeypatch, f)  # no live prices -> static _STATIC_PRICES only
+    monkeypatch.setattr(usage_display_module, "_STATIC_PRICES", {"gpt-4o": {"input": 2.5, "output": 10.0}})
     f.valves.cost_mode = "estimate"
     f.valves.fetch_prices_from_modelsdev = False
     usage = make_usage(input_tokens=1_000_000, output_tokens=1_000_000)
@@ -3189,7 +3200,7 @@ def test_resolve_cost_estimate_from_static_price(
             usage, make_tokens(fresh_input=1_000_000, output=1_000_000), [make_message("a", usage=usage)], "gpt-4o"
         )
     )
-    # _STATIC_PRICES["gpt-4o"] = {"input": 2.50, "output": 10.00, ...} -> 1M*2.5 + 1M*10.0 over 1e6
+    # 1M*2.5 + 1M*10.0 over 1e6
     assert cost["message"] == pytest.approx(12.5)
     assert cost["message_est"] is True  # estimate marked ≈
     assert cost["cumulative"] == pytest.approx(12.5)  # single assistant message, same usage
@@ -3301,7 +3312,7 @@ def test_resolve_price_modelsdev_populated_map_match(
 
     monkeypatch.setattr(f, "_modelsdev_prices_map", _prices)
     f.valves.fetch_prices_from_modelsdev = True
-    price, prov = run_async(f._resolve_price("gpt-4o-modelsdev-price-check"))
+    price, prov = run_async(f._resolve_price("openai/gpt-4o"))
     assert price == {"input": 3.0, "output": 12.0}
     assert prov == {"source": "modelsdev", "matched_key": "gpt-4o"}
 
@@ -3323,11 +3334,52 @@ def test_resolve_price_modelsdev_no_match_falls_through_to_static(
     async def _prices() -> dict[str, Any]:
         return {"some-other-model": {"input": 1.0, "output": 2.0}}
 
+    static = {"gpt-4o": {"input": 2.5, "output": 10.0}}
+    monkeypatch.setattr(usage_display_module, "_STATIC_PRICES", static)
     monkeypatch.setattr(f, "_modelsdev_prices_map", _prices)
     f.valves.fetch_prices_from_modelsdev = True
-    price, prov = run_async(f._resolve_price("gpt-4o-price-modelsdev-nomatch-check"))
-    assert price == usage_display_module._STATIC_PRICES["gpt-4o"]
+    price, prov = run_async(f._resolve_price("my-proxy.gpt-4o"))
+    assert price == static["gpt-4o"]
     assert prov == {"source": "static", "matched_key": "gpt-4o"}
+
+
+def test_price_key_matches_whole_ids_never_families(usage_display_module: ModuleType) -> None:
+    """Issue #49: a related id is a different tariff, so only the id itself or a provider prefix is cut off."""
+    fn = usage_display_module._price_key
+    ids = ("deepseek-v4", "claude-opus-4-8", "anthropic.claude-sonnet-5", "gpt-6.1-terra", "qwen3.8-27b")
+    table: dict[str, Any] = {model_id: {"input": 1.0} for model_id in ids}
+    assert fn(table, "GPT-6.1-Terra") == "gpt-6.1-terra"
+    assert fn(table, "openai/gpt-6.1-terra") == "gpt-6.1-terra"  # org/model
+    assert fn(table, "openai.gpt-6.1-terra") == "gpt-6.1-terra"  # an OWUI connection prefix_id
+    assert fn(table, "au.anthropic.claude-opus-4-8") == "claude-opus-4-8"  # region + vendor, cut one at a time
+    assert fn(table, "eu.anthropic.claude-sonnet-5") == "anthropic.claude-sonnet-5"  # the longest listed id wins
+    assert fn(table, "groq/qwen/qwen3.8-27b") == "qwen3.8-27b"
+    # never a family or a neighbour: the version dot is not a cut, and no substring match
+    assert fn(table, "deepseek-v4-1-flash") is None
+    assert fn(table, "claude-opus-4-8-fast") is None
+    assert fn(table, "gpt-6.1-terra-2026-10-01") is None  # a dated snapshot needs its own entry or price_map
+    assert fn(table, "6.1-terra") is None
+    assert fn({}, "gpt-6.1-terra") is None
+    assert fn(table, "") is None
+
+
+def test_resolve_price_modelsdev_no_longer_matches_a_family(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #49: deepseek-v4-1-flash took deepseek-v4's price (about 4x too low) from models.dev or the table."""
+    f = usage_display_module.Filter()
+
+    async def _prices() -> dict[str, Any]:
+        return {"deepseek-v4": {"input": 0.14, "output": 0.28}}
+
+    monkeypatch.setattr(f, "_modelsdev_prices_map", _prices)
+    monkeypatch.setattr(usage_display_module, "_STATIC_PRICES", {"deepseek-v4": {"input": 0.14, "output": 0.28}})
+    f.valves.fetch_prices_from_modelsdev = True
+    assert run_async(f._resolve_price("deepseek-v4-1-flash")) == (None, {"source": "none", "matched_key": None})
+    # the admin's own price_map still matches by substring: its keys are a deliberate choice
+    f.valves.price_map = '{"deepseek-v4": {"input": 0.6, "output": 1.45}}'
+    price, prov = run_async(f._resolve_price("deepseek-v4-1-flash"))
+    assert (price, prov["source"]) == ({"input": 0.6, "output": 1.45}, "price_map")
 
 
 def test_price_map_table_malformed_json_returns_empty(usage_display_module: ModuleType) -> None:
@@ -3609,6 +3661,112 @@ def test_modelsdev_prices_map_network_error_returns_empty(
     install_fake_aiohttp(monkeypatch, mod, session_error=RuntimeError("boom"))
     result = run_async(f._modelsdev_prices_map())
     assert result == {}
+
+
+def _reset_modelsdev_caches(monkeypatch: pytest.MonkeyPatch, mod: ModuleType) -> None:
+    for cache in (mod._modelsdev_cache, mod._modelsdev_prices_cache):
+        monkeypatch.setitem(cache, "map", None)
+        monkeypatch.setitem(cache, "expiry", 0.0)
+        monkeypatch.setitem(cache, "status", "not_fetched")
+        monkeypatch.setitem(cache, "fetched_at", None)
+
+
+@pytest.mark.parametrize(
+    ("reply", "aiohttp_on", "status"),
+    [
+        ({"openai": {"models": {"gpt-x": {"cost": {"input": 1.0, "output": 2.0}}}}}, True, "ok"),
+        ({"openai": {"models": {}}}, True, "empty"),  # reachable, but nothing usable: a changed format
+        (HttpStatus(503), True, "http 503"),
+        (RuntimeError("boom"), True, "error: RuntimeError"),  # DNS, timeout, refused, bad JSON ...
+        ({}, False, "aiohttp_unavailable"),
+    ],
+)
+def test_modelsdev_fetch_reports_why_it_failed(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch, reply: Any, *, aiohttp_on: bool, status: str
+) -> None:
+    """Issue #49: a failed models.dev fetch looked exactly like an unlisted model; now debug says which it was."""
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    _reset_modelsdev_caches(monkeypatch, mod)
+    assert mod._modelsdev_status(mod._modelsdev_prices_cache) == {
+        "status": "not_fetched",
+        "entries": None,
+        "age_s": None,
+    }
+    install_fake_aiohttp(monkeypatch, mod, {f.valves.modelsdev_api_url: reply})
+    monkeypatch.setattr(mod, "_AIOHTTP_AVAILABLE", aiohttp_on, raising=False)
+    result = run_async(f._modelsdev_prices_map())
+    debug = mod._modelsdev_status(mod._modelsdev_prices_cache)
+    assert debug == {"status": status, "entries": len(result), "age_s": 0}
+    assert bool(result) is (status == "ok")
+
+
+def test_modelsdev_context_fetch_reports_its_status_too(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = usage_display_module.Filter()
+    mod = usage_display_module
+    _reset_modelsdev_caches(monkeypatch, mod)
+    install_fake_aiohttp(monkeypatch, mod, {f.valves.modelsdev_url: HttpStatus(404)})
+    assert run_async(f._modelsdev_map()) == {}
+    assert mod._modelsdev_cache["status"] == "http 404"
+    _reset_modelsdev_caches(monkeypatch, mod)
+    install_fake_aiohttp(monkeypatch, mod, {f.valves.modelsdev_url: {"gpt-x": {"limit": {"context": 1000}}}})
+    assert run_async(f._modelsdev_map()) == {"gpt-x": 1000}
+    assert mod._modelsdev_cache["status"] == "ok"
+
+
+def test_outlet_issue_49_prices_from_the_table_when_modelsdev_fails_and_says_why(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reporter's turn: gpt-6.1-terra, estimate mode, models.dev unreachable -> the built-in price, ≈."""
+    mod = usage_display_module
+    f = mod.Filter()
+    _reset_modelsdev_caches(monkeypatch, mod)
+    install_fake_aiohttp(monkeypatch, mod, session_error=TimeoutError())
+    monkeypatch.setattr(mod, "_STATIC_PRICES", {"gpt-6.1-terra": {"input": 1.0, "output": 5.0, "cache_read": 0.05}})
+    f.valves.cost_mode = "estimate"
+    f.valves.debug_mode = True
+    usage = {
+        "input_tokens": 1841,
+        "input_tokens_details": {"cache_write_tokens": 1838, "cached_tokens": 0},
+        "output_tokens": 12,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": 1853,
+    }
+    emitter = CapturingEmitter()
+    body = make_body([make_message("answer", usage=usage)], model="gpt-6.1-terra")
+    run_async(f.outlet(body, __event_emitter__=emitter, __model__=make_model_dict("gpt-6.1-terra")))
+    assert "💰 ≈$0.0019" in emitter.statuses()[0]["data"]["description"]
+    citation = next(e for e in emitter.events if e.get("type") == "citation")
+    payload = json.loads(citation["data"]["document"][0].split("```json\n", 1)[1].rsplit("```", 1)[0])
+    assert payload["cost_debug"]["price"]["source"] == "static"
+    assert payload["cost_debug"]["modelsdev"] == {"status": "error: TimeoutError", "entries": 0, "age_s": 0}
+    assert payload["cost_debug"]["cumulative_unpriced_messages"] == 0
+    assert payload["context_debug"]["modelsdev"]["status"] == "not_fetched"  # context fetch is opt-in, off
+
+
+def test_cumulative_cost_marks_a_total_that_misses_unpriced_turns(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn with tokens but no cost leaves 💰Σ short -> ≈ and a count; a turn without usage is skipped silently."""
+    f = usage_display_module.Filter()
+    _patch_no_network(monkeypatch, f)
+    f.valves.cost_mode = "auto"
+    messages = [
+        make_message("native", usage=make_usage(cost=0.05)),
+        make_message("no cost reported", usage=make_usage(input_tokens=100, output_tokens=10)),
+        make_message("unsaved chat history"),  # no usage at all
+        make_message("streamed call without usage", usage={"incomplete": True}),  # no counters -> no usage
+        make_message("aborted", usage=make_usage(input_tokens=0, output_tokens=0, total_tokens=0)),  # costs nothing
+        make_message("native too", usage=make_usage(cost=0.02)),
+    ]
+    assert f._cumulative_cost(messages, None) == (pytest.approx(0.07), True, 1)
+    assert f._cumulative_cost([messages[0], *messages[2:5]], None) == (pytest.approx(0.05), False, 0)
+    cost = run_async(f._resolve_cost(make_usage(cost=0.02), make_tokens(), messages, "gpt-x"))
+    assert (cost["cumulative"], cost["cumulative_est"]) == (pytest.approx(0.07), True)
+    render = renderer(usage_display_module, "_render_cost_total")
+    assert render(f.valves, make_tokens(), make_timing(), make_ctx(), cost, None) == "💰Σ ≈$0.0700"
 
 
 def test_probe_context_aiohttp_unavailable_returns_none(usage_display_module: ModuleType) -> None:
