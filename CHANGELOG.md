@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.11.0]
+
+- Add native prompt-processing speed (`⏩ prefill … t/s`) separately from output speed,
+  with a `show_prefill_tokens_per_second` valve (on by default) and `prefill` display-order key.
+- Read llama.cpp and Ollama prompt timings. For streamed vLLM Chat Completions, preserve native
+  per-request prefill timing in usage; enable `--enable-per-request-metrics` and
+  `--enable-prompt-tokens-details` on vLLM. Cached tokens and queue wait are excluded.
+- Keep each tool round's prefill count paired with its duration; display the last call rather
+  than dividing cumulative turn tokens by one call's time. Missing/invalid measurements and
+  fully cached requests are hidden, and later calls without timing clear stale measurements.
+- Verified against installed Open WebUI 0.13.0 normalization and streaming hooks, including a
+  real saved chat response with the new field. Existing output-speed behavior is unchanged.
+
 ## [2.10.2]
 
 Cost estimates for new models, and no more wrong prices from a related model ([#49](https://github.com/SmetDenis/openwebui-token-usage-display/issues/49)). No metric or valve changed.

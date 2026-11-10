@@ -101,11 +101,11 @@ when non-obvious:
 - **Visibility** — `show_input_tokens`, `show_output_tokens`, `show_finish_reason` (True, v2.8.0),
   `show_total_tokens`,
   `show_cumulative_tokens` (True, v2.6.0),
-  `show_generation_time`, `show_tokens_per_second`, `show_reasoning_tokens`, `show_cached_tokens`,
+  `show_generation_time`, `show_tokens_per_second`, `show_prefill_tokens_per_second` (True, v2.11.0), `show_reasoning_tokens`, `show_cached_tokens`,
   `show_audio_tokens` (False), `show_model_name`, `show_data_source` (False),
   `show_context_window`, `show_cumulative_cost`, `show_balance` (False, v2.9.0). Message cost has **no** `show_*` — its visibility
   is `cost_mode` itself.
-- **Presentation** — `display_order` (pre-filled full 16-key order), `separator` (`" · "`),
+- **Presentation** — `display_order` (pre-filled full 17-key order), `separator` (`" · "`),
   `icon_style` (`emoji`/`simple`/`off`), `compact_numbers` (False).
 - **Estimation** — `fallback_to_tiktoken` (True), `count_all_messages_for_input` (True).
 - **Context** — `context_size_override` (0 = auto), `context_size_map` (JSON string),
@@ -137,8 +137,8 @@ tags skips (`git fetch --tags`). Not covered: a tightened bound for a value outs
 
 ## Renderer dispatch
 
-`_STATS_RENDERERS` (`:737-751`) maps 16 keys (`input`, `output`, `finish`, `total`, `tokens_total`,
-`reasoning`, `cached`, `audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `balance`, `model`, `source`)
+`_STATS_RENDERERS` (`:737-751`) maps 17 keys (`input`, `output`, `finish`, `total`, `tokens_total`,
+`reasoning`, `cached`, `audio`, `context`, `time`, `prefill`, `tps`, `cost`, `cost_total`, `balance`, `model`, `source`)
 to `_render_*`
 functions with one signature `(s: _Stats) -> str | None`. `_Stats` is a frozen dataclass bundling
 `valves`, `tokens`, `timing`, `ctx`, `cost`, `model`, plus `finish_reason` (default `None`, added in
@@ -149,7 +149,7 @@ consisting solely of `source` parts. `_emit_debug` takes the same `_Stats` plus 
 messages, assistant message, usage, metadata).
 
 Rules: **`show_*` valves gate visibility; `display_order` only sorts.** `_resolve_display_order`
-(`:451-458`) always returns a full 16-key permutation — removed keys move to the end, unknown keys
+(`:451-458`) always returns a full 17-key permutation — removed keys move to the end, unknown keys
 are ignored (surfaced only in the debug payload). To add a metric: add a `show_*` valve, write a
 `_render_*(s: _Stats)`, register it in `_STATS_RENDERERS`, append the key to `_DEFAULT_ORDER`, add
 an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
@@ -502,6 +502,18 @@ used for the live models.dev prices and `_STATIC_PRICES` (see Price above). Clas
   falls through to walking the structured `output` array (`_extract_output_text:268-288` — only
   `type=="message"` items; `reasoning` items excluded so they are not double-counted). Input is
   estimated over all non-assistant messages (or just the last user message).
+- **Prefill timing (v2.11.0)** — `stream` bridges vLLM's native final-chunk `metrics`
+  into `usage.tud_prefill_ms` / `tud_prefill_tokens` / `tud_prefill_source` before OWUI
+  discards top-level metrics. Its scheduling-to-first-token interval excludes queue wait;
+  prompt counts subtract the per-call cached count. Unknown cache counts are not assumed zero.
+  OWUI 0.13.0 `normalize_usage` and `update_usage_snapshot` preserve unknown fields, while
+  `merge_usage` takes their latest value. Thus `_resolve_prefill_timing` always pairs one
+  call's count and duration, even when normalized input tokens sum several tool rounds.
+  A later usage chunk without native timing explicitly clears earlier custom fields.
+  llama.cpp (`prompt_n` / `prompt_ms`) and Ollama (`prompt_eval_count` /
+  `prompt_eval_duration`, ns) already expose native timing in usage; direct provider rates
+  are also accepted. Missing, invalid, non-finite, and zero-compute rates are hidden.
+  This path never infers prefill from wall time or fetches global server metrics.
 - **Timing — `_resolve_timing` (`:1198+`)**: provider-reported wins (Ollama
   `eval_duration`/`response_token/s`, llama.cpp `predicted_ms`/`predicted_per_second`), else
   wall-clock marked `~`. Since v2.10.0 (issue #39) the wall clock starts at the **first model call**

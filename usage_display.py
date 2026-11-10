@@ -5,7 +5,7 @@ author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
 version: 2.10.2
 license: MIT
-description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
+description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, native prefill tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
 """  # noqa: D205, D212, D415, E501 - OWUI frontmatter: first line must be bare quotes, one `key: value` per line
 
@@ -720,6 +720,7 @@ _DEFAULT_ORDER: list[str] = [
     "audio",
     "context",
     "time",
+    "prefill",
     "tps",
     "cost",
     "cost_total",
@@ -752,7 +753,7 @@ def _normalize_order(order_str: str) -> tuple[list[str], list[str]]:
 def _resolve_display_order(admin_order: str) -> list[str]:
     """Resolve the admin-configured metric order, else the default.
 
-    Returns a permutation of all 16 keys: the parsed (valid) keys first, then the
+    Returns a permutation of all metric keys: the parsed (valid) keys first, then the
     remaining keys in default order. Empty input -> _DEFAULT_ORDER unchanged.
     """
     valid, _ = _normalize_order(admin_order)
@@ -787,6 +788,7 @@ _ICON_EMOJI: dict[str, str] = {
     "cached": "💾",
     "audio": "🔊",
     "time": "⏱",
+    "prefill": "⏩",
     "tps": "⚡",
     "cost": "💰",
     "cost_total": "💰Σ",
@@ -803,6 +805,7 @@ _ICON_SIMPLE: dict[str, str] = {
     "cached": "≡",
     "audio": "♪",
     "time": "◷",
+    "prefill": "⇥",
     "tps": "»",
     "cost": "",  # cost value already carries "$"
     "cost_total": "Σ",
@@ -949,6 +952,13 @@ def _render_time(s: _Stats) -> str | None:
     return None
 
 
+def _render_prefill(s: _Stats) -> str | None:
+    speed = s.timing.get("prefill_tps")
+    if s.valves.show_prefill_tokens_per_second and speed is not None and speed > 0:
+        return _with_icon(_icon(s.valves, "prefill"), f"prefill {speed:,.1f} t/s")
+    return None
+
+
 def _render_tps(s: _Stats) -> str | None:
     if s.valves.show_tokens_per_second and s.timing["tps"]:
         return _with_icon(_icon(s.valves, "tps"), f"{s.timing['tps']:.1f} t/s")
@@ -1016,6 +1026,7 @@ _STATS_RENDERERS: dict[str, Callable[[_Stats], str | None]] = {
     "audio": _render_audio,
     "context": _render_context,
     "time": _render_time,
+    "prefill": _render_prefill,
     "tps": _render_tps,
     "cost": _render_cost,
     "cost_total": _render_cost_total,
@@ -1065,6 +1076,16 @@ class Filter:
         )
         show_generation_time: bool = Field(default=True, description="Display generation time.")
         show_tokens_per_second: bool = Field(default=True, description="Display output tokens per second.")
+        show_prefill_tokens_per_second: bool = Field(
+            default=True,
+            description=(
+                "Display native prompt-processing tokens/sec when timing is available. "
+                "vLLM streaming requires --enable-per-request-metrics and "
+                "--enable-prompt-tokens-details; cached tokens are excluded. "
+                "Tool turns show the last model call's rate. Missing timings are hidden."
+            ),
+        )
+
         show_reasoning_tokens: bool = Field(
             default=True, description="Display reasoning/thinking tokens (o1/o3/o4, Gemini thinking)."
         )
@@ -1077,7 +1098,8 @@ class Filter:
             description=(
                 "Comma-separated metric order, pre-filled with the default order — reorder or trim "
                 "to taste (empty also means default). Keys: input, output, finish, total, tokens_total, reasoning, "
-                "cached, audio, context, time, tps, cost, cost_total, balance, model, source. This only sorts: "
+                "cached, audio, context, time, prefill, tps, cost, cost_total, balance, model, source. "
+                "This only sorts: "
                 "visibility is governed by the show_* toggles, and removing a key here does NOT hide "
                 "it (use show_* for that) — it just moves to the end, like any enabled-but-unlisted metric."
             ),
@@ -1297,6 +1319,39 @@ class Filter:
             __metadata__.setdefault("_tud_model_start", time.time())
             __metadata__["_tud_model_calls"] = __metadata__.get("_tud_model_calls", 0) + 1
         return body
+
+    async def stream(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Preserve vLLM's native per-call prefill timing in saved usage.
+
+        In this vLLM version time_to_first_token_ms is scheduled-to-first-token,
+        excluding queue wait. OWUI otherwise drops the top-level metrics object.
+        Keep the count alongside its duration: tool-loop usage totals are summed,
+        but these extra fields describe only the last model call.
+        """
+        if not self.valves.show_prefill_tokens_per_second or not isinstance(event, dict):
+            return event
+        metrics, usage = event.get("metrics"), event.get("usage")
+        if not isinstance(usage, dict) or not usage:
+            return event
+        # Explicitly clear a previous tool round's timing if this call has none.
+        # OWUI keeps unknown usage fields from earlier rounds during merge.
+        usage.update(tud_prefill_ms=None, tud_prefill_tokens=None, tud_prefill_source=None)
+        if not isinstance(metrics, dict):
+            return event
+        # Identify the native vLLM timing schema; do not treat arbitrary network
+        # TTFT (which can contain queue/transport time) as compute time.
+        if not all(key in metrics for key in ("queue_time_ms", "generation_time_ms")):
+            return event
+        ms = _num(metrics.get("time_to_first_token_ms"))
+        prompt = _first_num(usage, "prompt_tokens", "input_tokens")
+        cached = _detail_num(usage, "prompt_tokens_details", "cached_tokens")
+        if cached is None:
+            cached = _detail_num(usage, "input_tokens_details", "cached_tokens")
+        if ms is not None and ms > 0 and prompt is not None and cached is not None and 0 <= cached <= prompt:
+            usage["tud_prefill_ms"] = ms
+            usage["tud_prefill_tokens"] = prompt - cached
+            usage["tud_prefill_source"] = "vllm_native"
+        return event
 
     # --- outlet: build and emit the stats line ---------------------------------
 
@@ -1750,7 +1805,49 @@ class Filter:
             # included), so time spent running tools between rounds is in it.
             tps = output_tokens / wall_seconds
 
-        return {"seconds": gen_seconds, "tps": tps, "source": source}
+        return {"seconds": gen_seconds, "tps": tps, "source": source, **self._resolve_prefill_timing(usage)}
+
+    @staticmethod
+    def _resolve_prefill_timing(usage: dict[str, Any] | None) -> dict[str, Any]:
+        """Read native prefill timing; never divide input tokens by full reply time."""
+        result: dict[str, Any] = {
+            "prefill_tps": None,
+            "prefill_seconds": None,
+            "prefill_tokens": None,
+            "prefill_source": None,
+        }
+        if not isinstance(usage, dict):
+            return result
+        seconds = count = source = speed = None
+        ms = _num(usage.get("tud_prefill_ms"))
+        native_count = _num(usage.get("tud_prefill_tokens"))
+        if ms is not None and ms > 0 and native_count is not None and native_count >= 0:
+            seconds, count, source = ms / 1000.0, native_count, "vllm_native"
+        else:
+            duration = _num(usage.get("prompt_eval_duration"))  # Ollama: ns
+            prompt_ms = _num(usage.get("prompt_ms"))  # llama.cpp: ms
+            if duration is not None and duration > 0:
+                seconds = duration / 1e9
+                count = _num(usage.get("prompt_eval_count"))
+                source = "ollama_native"
+            elif prompt_ms is not None and prompt_ms > 0:
+                seconds = prompt_ms / 1000.0
+                count = _num(usage.get("prompt_n"))
+                source = "llamacpp_native"
+            if source is None or count is None:
+                speed = _first_num(usage, "prompt_per_second", "prompt_token/s")
+                if speed is not None and speed > 0:
+                    source = "provider_native"
+        if seconds is not None and count is not None and count >= 0:
+            speed = count / seconds
+        if speed is not None and speed > 0 and math.isfinite(speed):
+            result.update(
+                prefill_tps=speed,
+                prefill_seconds=seconds,
+                prefill_tokens=count,
+                prefill_source=source,
+            )
+        return result
 
     # --- context window --------------------------------------------------------
 

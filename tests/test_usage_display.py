@@ -31,7 +31,7 @@ def test_module_loads_and_exposes_filter(usage_display_module: ModuleType) -> No
     assert f.valves.icon_style == "emoji"
     assert f.valves.cost_mode == "auto"
     assert mod._DEFAULT_ORDER[0] == "input"
-    assert len(mod._DEFAULT_ORDER) == 16
+    assert len(mod._DEFAULT_ORDER) == 17
     assert mod._DEFAULT_ORDER.index("tokens_total") == mod._DEFAULT_ORDER.index("total") + 1  # tokens grouped
     assert f.valves.show_cumulative_tokens is True  # on by default, like show_cumulative_cost
     # the truncation flag sits next to the output count, early enough to survive the one-line clamp
@@ -493,8 +493,8 @@ def test_resolve_display_order_is_full_permutation(usage_display_module: ModuleT
     assert mod._resolve_display_order("") == mod._DEFAULT_ORDER  # empty -> default
     resolved = mod._resolve_display_order("cost, model")
     assert resolved[:2] == ["cost", "model"]
-    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all 16, no dupes
-    assert len(resolved) == len(set(resolved)) == 16
+    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all metric keys, no duplicates
+    assert len(resolved) == len(set(resolved)) == 17
 
 
 def test_display_order_debug_provenance(usage_display_module: ModuleType) -> None:
@@ -1093,7 +1093,15 @@ def test_resolve_timing_wall_clock_fallback(usage_display_module: ModuleType) ->
 def test_resolve_timing_neither_source_available(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     timing = f._resolve_timing(None, wall_seconds=None, output_tokens=30)
-    assert timing == {"seconds": None, "tps": None, "source": None}
+    assert timing == {
+        "seconds": None,
+        "tps": None,
+        "source": None,
+        "prefill_tps": None,
+        "prefill_seconds": None,
+        "prefill_tokens": None,
+        "prefill_source": None,
+    }
 
 
 def test_resolve_timing_zero_wall_seconds_no_divide_by_zero(usage_display_module: ModuleType) -> None:
@@ -3976,3 +3984,157 @@ def test_probe_context_outer_exception_returns_none(
     f.valves.llamacpp_url = "http://localhost:8080"
     install_fake_aiohttp(monkeypatch, mod, session_error=RuntimeError("session boom"))
     assert run_async(f._probe_context("some-model")) is None
+
+
+# --- native prefill timing -----------------------------------------------------
+
+
+def _prefill_packet(*, prompt: int = 1000, cached: int = 200, milliseconds: object = 400) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-test",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": 40,
+            "total_tokens": prompt + 40,
+            "prompt_tokens_details": {"cached_tokens": cached},
+        },
+        "metrics": {
+            "time_to_first_token_ms": milliseconds,
+            "queue_time_ms": 3000,
+            "generation_time_ms": 1000,
+            "mean_itl_ms": 25,
+        },
+    }
+
+
+def test_prefill_stream_to_outlet_excludes_cached_tokens_and_queue(
+    usage_display_module: ModuleType,
+) -> None:
+    f = usage_display_module.Filter()
+    f.valves.show_context_window = False
+    f.valves.cost_mode = "off"
+    f.valves.fallback_to_tiktoken = False
+    body = make_body([make_message("hello", role="user")])
+    metadata = {"chat_id": "test", "message_id": "assistant"}
+    run_async(f.inlet(body, __metadata__=metadata))
+    run_async(f.request(body, __metadata__=metadata))
+    packet = run_async(f.stream(_prefill_packet()))
+    body["messages"].append(make_message("hello back", usage=packet["usage"]))
+    emitter = CapturingEmitter()
+    run_async(f.outlet(body, __metadata__=metadata, __event_emitter__=emitter))
+    line = emitter.events[-1]["data"]["description"]
+    assert "⏩ prefill 2,000.0 t/s" in line
+    assert "⚡" in line
+    assert packet["metrics"]["queue_time_ms"] == 3000
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        ({"prompt_eval_count": 500, "prompt_eval_duration": 2_000_000_000}, 250),
+        ({"prompt_n": 1000, "prompt_ms": 4000}, 250),
+        ({"prompt_per_second": 250}, 250),
+        ({"prompt_token/s": 250}, 250),
+        ({"prompt_eval_duration": 2_000_000_000, "prompt_token/s": 250}, 250),
+        ({"tud_prefill_ms": 200, "tud_prefill_tokens": 400, "prompt_tokens": 9000}, 2000),
+    ],
+)
+def test_prefill_provider_units_and_last_tool_call_count(
+    usage_display_module: ModuleType, usage: dict[str, Any], expected: float
+) -> None:
+    timing = usage_display_module.Filter._resolve_prefill_timing(usage)
+    assert timing["prefill_tps"] == expected
+
+
+@pytest.mark.parametrize("usage", [None, {}, {"prompt_ms": 0}, {"prompt_n": -1, "prompt_ms": 10}])
+def test_prefill_missing_or_invalid_native_timing_is_hidden(
+    usage_display_module: ModuleType, usage: dict[str, Any] | None
+) -> None:
+    assert usage_display_module.Filter._resolve_prefill_timing(usage)["prefill_tps"] is None
+
+
+def test_prefill_missing_cache_detail_is_not_assumed_zero(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    event = _prefill_packet()
+    del event["usage"]["prompt_tokens_details"]
+    run_async(f.stream(event))
+    assert f._resolve_prefill_timing(event["usage"])["prefill_tps"] is None
+
+
+def test_prefill_responses_style_cache_detail(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    event = _prefill_packet()
+    event["usage"] = {"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 200}}
+    run_async(f.stream(event))
+    assert f._resolve_prefill_timing(event["usage"])["prefill_tps"] == 2000
+
+
+@pytest.mark.parametrize(
+    ("milliseconds", "cached"),
+    [(0, 200), (-1, 200), (float("nan"), 200), (True, 200), (400, 1001), (400, -1), (400, 1000)],
+)
+def test_prefill_invalid_or_fully_cached_measurement_is_hidden(
+    usage_display_module: ModuleType, milliseconds: object, cached: int
+) -> None:
+    f = usage_display_module.Filter()
+    event = run_async(f.stream(_prefill_packet(milliseconds=milliseconds, cached=cached)))
+    assert f._resolve_prefill_timing(event["usage"])["prefill_tps"] is None
+
+
+def test_prefill_is_never_estimated_from_full_response_time(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    timing = f._resolve_timing({"prompt_tokens": 15000, "completion_tokens": 1000}, 20, 1000)
+    assert timing["prefill_tps"] is None
+    assert timing["tps"] == 50
+
+
+def test_prefill_disabled_valve_and_unknown_ttft_schema(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    f.valves.show_prefill_tokens_per_second = False
+    event = _prefill_packet()
+    run_async(f.stream(event))
+    assert "tud_prefill_ms" not in event["usage"]
+    f.valves.show_prefill_tokens_per_second = True
+    del event["metrics"]["queue_time_ms"]
+    run_async(f.stream(event))
+    assert event["usage"]["tud_prefill_ms"] is None
+
+
+@pytest.mark.parametrize("event", [{}, {"usage": {}}, {"usage": "bad"}])
+def test_prefill_stream_ignores_events_without_usage(usage_display_module: ModuleType, event: dict[str, Any]) -> None:
+    f = usage_display_module.Filter()
+    before = dict(event)
+    assert run_async(f.stream(event)) == before
+
+
+def test_prefill_later_tool_call_without_metrics_clears_previous_rate(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    earlier = run_async(f.stream(_prefill_packet()))
+    later = run_async(f.stream({"usage": {"prompt_tokens": 1200, "completion_tokens": 20}}))
+    merged = {**earlier["usage"], **later["usage"]}
+    assert f._resolve_prefill_timing(merged)["prefill_tps"] is None
+
+
+def test_prefill_single_output_token_has_no_inter_token_latency(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    event = _prefill_packet()
+    del event["metrics"]["mean_itl_ms"]
+    event["metrics"]["generation_time_ms"] = 0
+    run_async(f.stream(event))
+    assert f._resolve_prefill_timing(event["usage"])["prefill_tps"] == 2000
+
+
+@pytest.mark.parametrize(("style", "prefix"), [("emoji", "⏩ "), ("simple", "⇥ "), ("off", "")])
+def test_render_prefill_visibility_and_icon_styles(
+    usage_display_module: ModuleType, valves: Any, style: str, prefix: str
+) -> None:
+    render = renderer(usage_display_module, "_render_prefill")
+    valves.icon_style = style
+    bags = [valves, make_tokens(), make_timing(prefill_tps=250), make_ctx(), make_cost(), None]
+    assert render(*bags) == f"{prefix}prefill 250.0 t/s"
+    valves.show_prefill_tokens_per_second = False
+    assert render(*bags) is None
+    valves.show_prefill_tokens_per_second = True
+    bags[2] = make_timing(prefill_tps=None)
+    assert render(*bags) is None
