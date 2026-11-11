@@ -3,7 +3,7 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.10.2
+version: 2.11.0
 license: MIT
 description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, native prefill tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
@@ -75,6 +75,18 @@ from __future__ import annotations
 #     after RAG/web search, with the outlet's own __metadata__ dict -> it stamps
 #     the first call (the wall-clock start) and counts the calls. Older OWUI never
 #     calls it: the inlet stamp and no count remain.
+#   * Prefill (v2.11.0; verified against OWUI v0.13.0 and v0.13.3): `stream`
+#     runs BEFORE usage capture/normalization. Its __metadata__ is the same dict
+#     passed to `request` and outlet (process_chat_payload returns it unchanged,
+#     main builds the response ctx from it). `request` clears _tud_prefill before
+#     EACH call, even if that call later emits no usage. `stream` records only
+#     native vLLM count/time there; event/usage stay byte-for-byte unchanged, so
+#     no custom usage fields reach stored chats, tooltips or raw-API clients.
+#     A stream exception makes OWUI drop the chunk -> stream must catch errors
+#     and return the original event. llama.cpp prompt_n already excludes cache_n.
+#     Ollama prompt_eval_count includes cache hits, but OWUI drops the cached
+#     count and computes prompt_token/s with the inflated numerator -> do NOT
+#     display Ollama prefill rates. See docs/owui-map.md for the call sites.
 #   * Since 0.12.0 the current outlet message carries `finish_reason` — the
 #     value from the LAST model call of the turn, never persisted. Provider-real
 #     for Chat Completions, Ollama, pipes passing an upstream response through and
@@ -953,10 +965,13 @@ def _render_time(s: _Stats) -> str | None:
 
 
 def _render_prefill(s: _Stats) -> str | None:
-    speed = s.timing.get("prefill_tps")
-    if s.valves.show_prefill_tokens_per_second and speed is not None and speed > 0:
-        return _with_icon(_icon(s.valves, "prefill"), f"prefill {speed:,.1f} t/s")
-    return None
+    speed, count = s.timing.get("prefill_tps"), s.timing.get("prefill_tokens")
+    if not s.valves.show_prefill_tokens_per_second or speed is None or speed <= 0:
+        return None
+    if count is not None and count < s.valves.prefill_min_tokens:
+        return None
+    text = f"{speed:,.0f}" if speed >= _THOUSAND else f"{speed:.1f}"
+    return _with_icon(_icon(s.valves, "prefill"), f"prefill {text} t/s")
 
 
 def _render_tps(s: _Stats) -> str | None:
@@ -1079,13 +1094,21 @@ class Filter:
         show_prefill_tokens_per_second: bool = Field(
             default=True,
             description=(
-                "Display native prompt-processing tokens/sec when timing is available. "
+                "Display native llama.cpp/vLLM prompt-processing tokens/sec when timing is available. "
                 "vLLM streaming requires --enable-per-request-metrics and "
                 "--enable-prompt-tokens-details; cached tokens are excluded. "
                 "Tool turns show the last model call's rate. Missing timings are hidden."
             ),
         )
-
+        prefill_min_tokens: int = Field(
+            default=64,
+            ge=0,
+            description=(
+                "Hide prefill rates when fewer than this many newly processed tokens are reported, "
+                "since tiny prefills mostly measure overhead. 0 disables the threshold; native rate-only "
+                "reports without a token count are unaffected."
+            ),
+        )
         show_reasoning_tokens: bool = Field(
             default=True, description="Display reasoning/thinking tokens (o1/o3/o4, Gemini thinking)."
         )
@@ -1316,41 +1339,36 @@ class Filter:
         into the user's chat request (`utils/filter.py`).
         """
         if __metadata__ is not None:
+            __metadata__.pop("_tud_prefill", None)
             __metadata__.setdefault("_tud_model_start", time.time())
             __metadata__["_tud_model_calls"] = __metadata__.get("_tud_model_calls", 0) + 1
         return body
 
-    async def stream(self, event: dict[str, Any]) -> dict[str, Any]:
-        """Preserve vLLM's native per-call prefill timing in saved usage.
-
-        In this vLLM version time_to_first_token_ms is scheduled-to-first-token,
-        excluding queue wait. OWUI otherwise drops the top-level metrics object.
-        Keep the count alongside its duration: tool-loop usage totals are summed,
-        but these extra fields describe only the last model call.
-        """
-        if not self.valves.show_prefill_tokens_per_second or not isinstance(event, dict):
+    async def stream(self, event: dict[str, Any], __metadata__: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Capture native vLLM timing in per-call metadata without changing the chunk."""
+        try:
+            if (
+                not self.valves.show_prefill_tokens_per_second
+                or __metadata__ is None
+                or "_tud_model_calls" not in __metadata__
+            ):
+                return event
+            metrics, usage = event.get("metrics"), event.get("usage")
+            if not isinstance(metrics, dict) or not isinstance(usage, dict):
+                return event
+            # In the tested vLLM schema this is scheduled-to-first-token time,
+            # excluding queue wait. Do not interpret arbitrary network TTFT.
+            if not all(key in metrics for key in ("queue_time_ms", "generation_time_ms")):
+                return event
+            ms = _num(metrics.get("time_to_first_token_ms"))
+            prompt = _first_num(usage, "prompt_tokens", "input_tokens")
+            cached = _detail_num(usage, "prompt_tokens_details", "cached_tokens")
+            if cached is None:
+                cached = _detail_num(usage, "input_tokens_details", "cached_tokens")
+            if ms is not None and ms > 0 and prompt is not None and cached is not None and 0 <= cached <= prompt:
+                __metadata__["_tud_prefill"] = {"ms": ms, "tokens": prompt - cached}
+        except Exception:  # noqa: BLE001 - a stream exception makes OWUI drop the final usage chunk
             return event
-        metrics, usage = event.get("metrics"), event.get("usage")
-        if not isinstance(usage, dict) or not usage:
-            return event
-        # Explicitly clear a previous tool round's timing if this call has none.
-        # OWUI keeps unknown usage fields from earlier rounds during merge.
-        usage.update(tud_prefill_ms=None, tud_prefill_tokens=None, tud_prefill_source=None)
-        if not isinstance(metrics, dict):
-            return event
-        # Identify the native vLLM timing schema; do not treat arbitrary network
-        # TTFT (which can contain queue/transport time) as compute time.
-        if not all(key in metrics for key in ("queue_time_ms", "generation_time_ms")):
-            return event
-        ms = _num(metrics.get("time_to_first_token_ms"))
-        prompt = _first_num(usage, "prompt_tokens", "input_tokens")
-        cached = _detail_num(usage, "prompt_tokens_details", "cached_tokens")
-        if cached is None:
-            cached = _detail_num(usage, "input_tokens_details", "cached_tokens")
-        if ms is not None and ms > 0 and prompt is not None and cached is not None and 0 <= cached <= prompt:
-            usage["tud_prefill_ms"] = ms
-            usage["tud_prefill_tokens"] = prompt - cached
-            usage["tud_prefill_source"] = "vllm_native"
         return event
 
     # --- outlet: build and emit the stats line ---------------------------------
@@ -1422,7 +1440,7 @@ class Filter:
         calls = (__metadata__ or {}).get("_tud_model_calls")
         model_calls = calls if isinstance(calls, int) else None
         tokens = self._extract_tokens(usage, assistant_msg, messages, model_id, model_calls)
-        timing = self._resolve_timing(usage, elapsed_seconds, tokens["output"])
+        timing = self._resolve_timing(usage, elapsed_seconds, tokens["output"], __metadata__)
         # The two resolvers touch valve-parsed maps and the network; a bug in either must degrade to a
         # sentinel, never break the response pipeline.
         try:
@@ -1774,7 +1792,11 @@ class Filter:
         return (time.time() - start_time) if start_time is not None else None
 
     def _resolve_timing(
-        self, usage: dict[str, Any] | None, wall_seconds: float | None, output_tokens: float | None
+        self,
+        usage: dict[str, Any] | None,
+        wall_seconds: float | None,
+        output_tokens: float | None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Prefer provider-reported generation time/tps; else labeled wall-clock."""
         gen_seconds = None
@@ -1805,39 +1827,31 @@ class Filter:
             # included), so time spent running tools between rounds is in it.
             tps = output_tokens / wall_seconds
 
-        return {"seconds": gen_seconds, "tps": tps, "source": source, **self._resolve_prefill_timing(usage)}
+        return {"seconds": gen_seconds, "tps": tps, "source": source, **self._resolve_prefill_timing(usage, metadata)}
 
     @staticmethod
-    def _resolve_prefill_timing(usage: dict[str, Any] | None) -> dict[str, Any]:
-        """Read native prefill timing; never divide input tokens by full reply time."""
+    def _resolve_prefill_timing(usage: dict[str, Any] | None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Read per-call metadata or native llama.cpp timing; never estimate from wall time."""
         result: dict[str, Any] = {
             "prefill_tps": None,
             "prefill_seconds": None,
             "prefill_tokens": None,
             "prefill_source": None,
         }
-        if not isinstance(usage, dict):
-            return result
         seconds = count = source = speed = None
-        ms = _num(usage.get("tud_prefill_ms"))
-        native_count = _num(usage.get("tud_prefill_tokens"))
-        if ms is not None and ms > 0 and native_count is not None and native_count >= 0:
-            seconds, count, source = ms / 1000.0, native_count, "vllm_native"
-        else:
-            duration = _num(usage.get("prompt_eval_duration"))  # Ollama: ns
-            prompt_ms = _num(usage.get("prompt_ms"))  # llama.cpp: ms
-            if duration is not None and duration > 0:
-                seconds = duration / 1e9
-                count = _num(usage.get("prompt_eval_count"))
-                source = "ollama_native"
-            elif prompt_ms is not None and prompt_ms > 0:
-                seconds = prompt_ms / 1000.0
-                count = _num(usage.get("prompt_n"))
-                source = "llamacpp_native"
-            if source is None or count is None:
-                speed = _first_num(usage, "prompt_per_second", "prompt_token/s")
-                if speed is not None and speed > 0:
-                    source = "provider_native"
+        native = (metadata or {}).get("_tud_prefill")
+        if isinstance(native, dict):
+            ms, count = _num(native.get("ms")), _num(native.get("tokens"))
+            if ms is not None and ms > 0 and count is not None and count >= 0:
+                seconds, source = ms / 1000.0, "vllm_native"
+        elif isinstance(usage, dict) and not usage.get("incomplete"):
+            # llama.cpp prompt_n counts only new tokens. OWUI's Ollama counts
+            # include cached tokens but omit their count: never read that path.
+            ms, count = _num(usage.get("prompt_ms")), _num(usage.get("prompt_n"))
+            if ms is not None and ms > 0:
+                seconds = ms / 1000.0
+            speed = _num(usage.get("prompt_per_second"))
+            source = "llamacpp_native"
         if seconds is not None and count is not None and count >= 0:
             speed = count / seconds
         if speed is not None and speed > 0 and math.isfinite(speed):

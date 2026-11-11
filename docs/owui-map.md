@@ -15,6 +15,42 @@ plugin reads; what moved is under "What changed in v0.12.1-v0.12.5". A `v0.12.5.
 OWUI internals shift between versions — before relying on any claim, re-check it against a current
 checkout (the local clone path and freshness-check commands live in `CLAUDE.local.md`).
 
+## Prefill hook contract (v0.13.0 and v0.13.3, PR #51)
+
+The additional prefill path was checked directly against these release tags (selected files,
+not a blanket re-verification of this entire map): `v0.13.0` (`c38885a1a737`) and `v0.13.3`
+(`b0e6098e9409`). The references below are **v0.13.3** line numbers under
+`backend/open_webui/` unless a frontend path is given. The same ordering, object identity,
+and usage-conversion behavior were checked in v0.13.0. Extracted copies of the actual
+`get_filter_params`, `run_filter_handler`, normalization, snapshot and merge helpers were
+also executed with the plugin's request → stream → outlet sequence; both versions preserved
+metadata identity and left the serialized chunk/usage unchanged.
+
+| Contract | Source anchor | Plugin consequence |
+|---|---|---|
+| `get_filter_params` supplies `event` to stream hooks and forwards declared dunder parameters by reference | `utils/filter.py:135-145`; `run_filter_handler:161-164` awaits the hook | Declare `stream(event, __metadata__)`; return the original event object |
+| The request hook gets the payload's metadata; `process_chat_payload` returns that dict without copying it | `utils/middleware.py:2219-2227, 2980-2989, 3050` | Reset the prefill record before each model call, not on a later usage event |
+| The caller carries that metadata into the response context | `main.py:1694-1711` (`process_chat_payload`, `build_chat_response_context`, `ctx.update`) | Request/stream/outlet can share ephemeral measurement state |
+| Stream/outlet extra parameters use `ctx['metadata']` | `utils/middleware.py:4293, 4302-4311, 4933`; outlet parameters at `:4001-4008` | No module-global per-chat cache or custom provider usage keys |
+| Stream filters run **before** usage capture | `utils/middleware.py:4974-4982`, then usage+llama.cpp timings at `:5103-5108` | Read top-level native vLLM metrics while present; never edit the chunk |
+| Unexpected stream exceptions skip the chunk | `utils/middleware.py:5637-5644` (`except Exception` → `continue`) | Catch `Exception` and return the original event, especially for final usage chunks |
+| Raw-API filters run before serialized chunks are returned | `utils/middleware.py:6638, 6672-6676` | Usage mutations would also leak into external clients; metadata avoids this |
+| Unknown usage keys survive normalization, snapshots and multi-call merging | `utils/response.py:22-48, 103-159` | No `tud_prefill_*` fields: they would persist and a no-usage round could retain them |
+| OWUI's usage tooltip serializes the entire usage dict | `src/lib/components/chat/Messages/ResponseMessage.svelte:1233` | Extra usage fields are user-visible, not private plugin storage |
+| Ollama's cached-count field is not passed through, and OWUI computes its rate from `prompt_eval_count` | `utils/response.py:178-233`, especially `:205-213` | Ignore Ollama prefill counts, durations and `prompt_token/s`; its generated-token timing is unchanged |
+
+Current Ollama's llama-server backend computes prompt evaluation count as `CacheN + PromptN`
+(`llm/llama_server.go`, `llamaServerTimings.promptEvalCount`), while prompt duration is only
+new-token `prompt_ms`. Thus 8000 cached + 50 new tokens in 50 ms become OWUI's **161000 t/s**,
+not the roughly **1000 t/s** new-token rate. Without the dropped cached count there is no safe
+correction. llama.cpp's native `prompt_n` excludes `cache_n` and can be paired with `prompt_ms`.
+
+The plugin stores a vLLM record only when its own `request` hook has stamped the shared metadata.
+Older OWUI paths without that hook, no shared metadata, missing cache details, invalid timing,
+and a later tool call that sends no usage all hide vLLM prefill. Legacy `tud_prefill_*` keys already
+present in chat history are ignored, not rewritten or deleted. Non-streaming vLLM top-level metrics
+are not currently available in outlet usage; no wall-clock estimate is substituted.
+
 ## What changed in v0.13.0 (plugin-relevant)
 
 Checked against `v0.12.5...v0.13.0` (2026-11-03, issue #42). Nothing here breaks the plugin. The usage core

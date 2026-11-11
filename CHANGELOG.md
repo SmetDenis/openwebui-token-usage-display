@@ -8,14 +8,18 @@ All notable changes to this project are documented here. The format loosely foll
 
 - Add native prompt-processing speed (`⏩ prefill … t/s`) separately from output speed,
   with a `show_prefill_tokens_per_second` valve (on by default) and `prefill` display-order key.
-- Read llama.cpp and Ollama prompt timings. For streamed vLLM Chat Completions, preserve native
-  per-request prefill timing in usage; enable `--enable-per-request-metrics` and
-  `--enable-prompt-tokens-details` on vLLM. Cached tokens and queue wait are excluded.
-- Keep each tool round's prefill count paired with its duration; display the last call rather
-  than dividing cumulative turn tokens by one call's time. Missing/invalid measurements and
-  fully cached requests are hidden, and later calls without timing clear stale measurements.
-- Verified against installed Open WebUI 0.13.0 normalization and streaming hooks, including a
-  real saved chat response with the new field. Existing output-speed behavior is unchanged.
+- Read llama.cpp's new-token count and duration. For streamed vLLM Chat Completions, enable
+  `--enable-per-request-metrics --enable-prompt-tokens-details`; cached tokens and queue wait
+  are excluded. Timing is kept only in per-call metadata: chunks and usage are never modified.
+- Reset the measurement in `request` before every model call, including a later tool call that
+  sends no usage. Stream-handler errors return the original chunk so final usage is not lost.
+- Do not display Ollama prefill speed: its prompt count includes cached tokens but Open WebUI
+  omits the separate cached count, making the reported rate unreliable on follow-up turns.
+- Hide missing/invalid measurements and fully cached prompts. The new `prefill_min_tokens`
+  valve defaults to 64 new tokens to suppress overhead-dominated tiny prefills; set 0 to disable.
+  Native rate-only reports without a count are unaffected. Rates ≥1000 t/s omit decimal places.
+- Rebase on 2.10.2 and verify the shared metadata/stream-before-usage contract against Open
+  WebUI 0.13.0 and 0.13.3. Existing output-speed behavior and provider usage payloads are unchanged.
 
 ## [2.10.2]
 
