@@ -160,10 +160,11 @@ an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
 
 - **Source:** the `finish_reason` OWUI 0.12.0 puts on the current outlet message (`docs/owui-map.md`, "What
   changed in v0.12.0"). Taken only when it is a string, so junk reads as unknown.
-- **Only `length` is shown** (owner's choice). `stop` is the norm and would be noise on a one-line
-  status; `tool_calls` ends a turn paused for tool approval or stopped at the tool-call limit;
-  `content_filter` was offered and declined (rare, provider-specific). Absence means "unknown" —
-  Responses API streams and OWUI < 0.12 send none — so it is never read as "stopped normally". Plain
+- **Only `length` (and, since v2.11.1, `incomplete`) is shown** (owner's choice). `stop` is the norm and
+  would be noise on a one-line status; `tool_calls` ends a turn paused for tool approval or stopped at the
+  tool-call limit; `content_filter` was offered and declined (rare, provider-specific). Absence means
+  "unknown" — OWUI < 0.12 sends none, and Responses API streams sent none before 0.13.1 — so it is never
+  read as "stopped normally". Plain
   pipes (and, before OWUI 0.13.0, non-streaming Responses replies) get a synthesized `stop`/`tool_calls`,
   never `length`, so the marker cannot show there; a pipe passing an upstream response through keeps its
   real value. Since 0.13.0 a non-streaming Responses reply reports `length` from `status: incomplete`. Rejected: also matching
@@ -171,6 +172,16 @@ an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
   `choices[0].finish_reason` as sent and maps no native `stop_reason` into it (`utils/anthropic.py`
   maps only the other way, for OWUI's own Anthropic-compatible API), so only a non-conforming proxy
   could send `max_tokens` — not worth a guess.
+- **`incomplete` from a Responses API stream (v2.11.1, OWUI 0.13.1+).** OWUI sets `finish_reason` to its
+  own `incomplete` when a Responses stream ends on `response.incomplete`, `response.failed` or `error`,
+  and to the final `status` (`completed`) on `response.completed` (`middleware.py:5008-5011` in v0.13.3).
+  `response.incomplete` carries the token-limit cut and the content-filter stop alike, and the
+  `incomplete_details.reason` that would tell them apart never reaches the outlet. Owner's choice: flag
+  every `incomplete` as `✂️ truncated` — nearly always the token limit, and in the other cases the answer
+  is still cut short. Accepted: a content-filter stop or a failed stream on this path is flagged too,
+  which the `content_filter` decision above declines elsewhere. Rejected: leaving `incomplete` unflagged
+  (a Responses stream cut at the limit would stay unmarked), and a separate `✂️ incomplete` wording (a
+  second marker to learn, for a distinction OWUI does not pass on).
 - **Own key `finish` + valve `show_finish_reason` (on by default), not a suffix on `⬇︎`:** keeps the
   rule that every fact has its own `show_*` gate and `display_order` slot. Rejected: a `✂︎` suffix on
   the output count (could not be hidden separately).
@@ -673,8 +684,8 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | cache rates missing | default to `input` rate | `:1567-1572` | `test_cost_components_cache_defaults_to_input_rate` |
 | cost below `cost_min_display` | hidden | `:681, :698` | `test_render_cost_estimate_marker_and_threshold` |
 | chat token total == message `Σ` | `🧮` suppressed | `_render_tokens_total` | `test_render_tokens_total_dedupes_and_marks_estimate` |
-| `finish_reason` `length` (v2.8.0, OWUI 0.12.0+) | `✂️ truncated` right after `⬇︎` | `_render_finish` | `test_render_finish_flags_only_length`, `test_outlet_flags_truncated_response_next_to_output` |
-| `finish_reason` `stop`/`tool_calls`/`content_filter`/absent/non-string | nothing shown; debug reports it (`null` when absent) | `_render_finish`, `outlet` | `test_render_finish_flags_only_length`, `test_outlet_flags_truncated_response_next_to_output`, `test_outlet_debug_payload_reports_finish_reason` |
+| `finish_reason` `length` (v2.8.0, OWUI 0.12.0+) or `incomplete` (v2.11.1, Responses API stream, OWUI 0.13.1+) | `✂️ truncated` right after `⬇︎` | `_render_finish` | `test_render_finish_flags_only_a_cut_off_answer`, `test_outlet_flags_truncated_response_next_to_output` |
+| `finish_reason` `stop`/`tool_calls`/`content_filter`/`completed`/absent/non-string | nothing shown; debug reports it (`null` when absent) | `_render_finish`, `outlet` | `test_render_finish_flags_only_a_cut_off_answer`, `test_outlet_flags_truncated_response_next_to_output`, `test_outlet_debug_payload_reports_finish_reason` |
 | a release narrows a valve type (OWUI 0.12+ would refuse the code save) | gate fails | `tests/test_valves_compat.py` | `test_stored_valves_of_every_release_validate_against_current`, `test_rejection_mirrors_owui_validate_valves` |
 | compat test finds no release tags (shallow clone, archive) | fails in CI, skips locally | `_release_tags` | `test_release_tags_fail_in_ci_and_skip_locally` |
 | tool/agent turn: `usage` merged over several requests (v2.7.0, #26) | `📐` uses the last request (`prompt_tokens + completion_tokens`, Anthropic-native cache added back) | `_last_round_context` | `test_outlet_context_reads_last_round_of_owui_merged_usage`, `test_last_round_context_helper`, `test_context_used_is_last_round_not_cross_round_sum` |

@@ -26,7 +26,7 @@ Shows token counts, reasoning/cached breakdowns, context-window utilization, gen
 - **Cached prompt** tokens - OpenAI prompt cache and Anthropic `cache_read` / `cache_creation` (Anthropic cache is correctly counted as *additional* to input)
 - **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable via `context_warn_percent` / `context_critical_percent`). On a response with tool calls (several requests to the model) it shows the last request, while `⬆︎`/`Σ`/cost add up all of them (Open WebUI 0.11+)
 - **Generation time** and **tokens/second**
-- **Truncation marker** (`✂️ truncated`, next to `⬇︎`) - shown only when the model stopped because it hit its output-token limit, so a cut-off answer is not mistaken for a complete one (Open WebUI 0.12.0+; Chat Completions / OpenAI-compatible and Ollama models, not the Responses API)
+- **Truncation marker** (`✂️ truncated`, next to `⬇︎`) - shown only when the model stopped because it hit its output-token limit, so a cut-off answer is not mistaken for a complete one (Open WebUI 0.12.0+ for Chat Completions / OpenAI-compatible and Ollama models; 0.13.0+ for the Responses API, 0.13.1+ for its streams, where a content-filter stop or a failed stream is flagged too)
 - **Cost** - the cost of the message and a running total for the chat: the provider's own reported cost when available (OpenRouter, LiteLLM, ...), or an optional estimate from models.dev prices (always marked `≈`)
 - **OpenRouter balance** (`💳`, off by default) - what is left on your OpenRouter account, asked from OpenRouter after each response (see below)
 - **Audio** tokens (off by default) and the **base model name** for workspace models

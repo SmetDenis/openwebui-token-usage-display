@@ -403,7 +403,7 @@ wheels = [
 
 [[package]]
 name = "openwebui-token-usage-display"
-version = "2.11.0"
+version = "2.11.1"
 source = { virtual = "." }
 
 [package.dev-dependencies]

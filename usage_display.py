@@ -3,7 +3,7 @@ title: Token Usage & Cost Display
 author: smetdenis
 author_url: https://github.com/SmetDenis
 git_url: https://github.com/SmetDenis/openwebui-token-usage-display.git
-version: 2.11.0
+version: 2.11.1
 license: MIT
 description: Shows token counts (input/output/total, running chat token total, reasoning, cached, audio), generation time, tokens/sec, native prefill tokens/sec, context-window utilization, a truncation marker when a response hits its output-token limit, message/chat cost and (opt-in) the remaining OpenRouter account balance below each AI response. The metric order, separator, icon style (emoji/simple/off), compact number format and a cost-display threshold are admin-configurable. Reads OWUI-normalized usage across providers (OpenAI Chat & Responses API, Anthropic, Gemini, Ollama, llama.cpp), falls back to tiktoken. Cost is native when the provider/proxy reports it (OpenRouter/LiteLLM), or optionally estimated from models.dev prices. Context sizes come first from the live window of a llama-swap / llama.cpp router reached through the model's own OWUI connection, then from what the serving backend lists for the model (llama.cpp, llama-swap, vLLM), then from an opt-in llama.cpp/llama-swap probe, an optional live models.dev fetch and a built-in table (seeded from models.dev). Workspace/custom ("agent") models resolve context and cost via their base model. Works on Open WebUI 0.9.0+ (built around the 0.10.x structured-output/normalized-usage model; degrades gracefully on 0.9.x). tiktoken is optional (soft import). With debug_mode, the diagnostic payload also carries the selected model/provider (sanitized, safe to share), a full cost breakdown with price provenance (incl. the provider's own cost_details when present), a web-search-usage hint, context-window provenance, and a valves snapshot.
 required_open_webui_version: 0.9.0
@@ -92,8 +92,11 @@ from __future__ import annotations
 #     for Chat Completions, Ollama, pipes passing an upstream response through and
 #     (since 0.13.0, from the response status) non-streaming Responses API;
 #     synthesized "stop"/"tool_calls" (never "length") for other pipes and, before
-#     0.13.0, non-streaming Responses API; absent for Responses API streams ->
-#     absence means "unknown", not "stop"; only "length" is shown (✂️, _render_finish).
+#     0.13.0, non-streaming Responses API. Responses API streams: absent before
+#     0.13.1; since then OWUI's own "incomplete" (the stream ended on
+#     response.incomplete / response.failed / error - token limit, content filter
+#     or a failure, not told apart) or the final status ("completed"). Absence
+#     means "unknown", not "stop"; "length" and "incomplete" are shown (✂️, _render_finish).
 #   * 0.9.0+ compatible: the outlet body carries per-message `usage` since 0.9.0 and
 #     normalize_usage exists since 0.8.0, so tokens/context/timing/estimate all work on
 #     0.9.x. Only NATIVE provider cost (USAGE_COST_KEYS) needs 0.10.0+ -> on 0.9.x use
@@ -288,13 +291,9 @@ _STATIC_CONTEXT_SIZES: dict[str, int] = {
 # or price_map. Rates are models.dev's base tier (long-context tiers are not modelled) and its own
 # cache_read/cache_write fields; an id several vendors list keeps the first vendor's price.
 # BEGIN generated static prices
-# models.dev https://models.dev/api.json of 2026-11-06: 46 models released on or after 2026-07-06.
+# models.dev https://models.dev/api.json of 2026-11-12: 42 models released on or after 2026-07-12.
 _STATIC_PRICES: dict[str, dict[str, float]] = {
     # --- openai ---
-    "gpt-5.6": {"input": 4.0, "output": 20.0, "cache_read": 0.4, "cache_write": 5.0},
-    "gpt-5.6-luna": {"input": 0.2, "output": 1.2, "cache_read": 0.02, "cache_write": 0.25},
-    "gpt-5.6-sol": {"input": 4.0, "output": 20.0, "cache_read": 0.4, "cache_write": 5.0},
-    "gpt-5.6-terra": {"input": 2.0, "output": 12.0, "cache_read": 0.2, "cache_write": 2.5},
     "gpt-6-astra": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5},
     "gpt-6-luna": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125},
     "gpt-6-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5},
@@ -302,9 +301,9 @@ _STATIC_PRICES: dict[str, dict[str, float]] = {
     "gpt-6.1-terra": {"input": 1.0, "output": 5.0, "cache_read": 0.05, "cache_write": 1.25},
     "gpt-daybreak-blue-latest": {"input": 4.0, "output": 20.0, "cache_read": 0.4, "cache_write": 5.0},
     "gpt-daybreak-red-latest": {"input": 12.5, "output": 75.0, "cache_read": 1.25, "cache_write": 15.625},
-    "gpt-realtime-2.1": {"input": 4.0, "output": 24.0, "cache_read": 0.4},
     # --- anthropic ---
     "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
+    "claude-fable-5-2": {"input": 8.0, "output": 40.0, "cache_read": 0.2, "cache_write": 10.0},
     "claude-haiku-5-5": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125},
     "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
     "claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0},
@@ -315,13 +314,13 @@ _STATIC_PRICES: dict[str, dict[str, float]] = {
     "gemini-3.7-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
     "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
     "gemini-4-argon": {"input": 2.0, "output": 10.0, "cache_read": 0.1},
+    "gemini-4-carbon": {"input": 2.0, "output": 10.0, "cache_read": 0.1},
     "gemini-flash-latest": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
     "gemini-flash-lite-latest": {"input": 0.3, "output": 2.5, "cache_read": 0.03},
     # --- deepseek ---
     "deepseek-flash": {"input": 0.15, "output": 0.6, "cache_read": 0.003},
     "deepseek-v4-pro": {"input": 0.66, "output": 1.98, "cache_read": 0.022},
     # --- xai ---
-    "grok-4.5": {"input": 2.0, "output": 6.0, "cache_read": 0.3},
     "grok-4.6": {"input": 2.0, "output": 6.0, "cache_read": 0.5},
     "grok-4.7": {"input": 2.0, "output": 6.0, "cache_read": 0.5},
     # --- moonshotai ---
@@ -905,10 +904,11 @@ def _render_output(s: _Stats) -> str | None:
 
 
 def _render_finish(s: _Stats) -> str | None:
-    # Only a hit output-token limit is worth a slot: "stop" is the norm, "tool_calls" ends a turn paused
-    # for approval or stopped at the tool-call limit, and a missing value (Responses API stream,
-    # OWUI < 0.12) means unknown.
-    if s.valves.show_finish_reason and s.finish_reason == "length":
+    # Only a cut-off answer is worth a slot: "length" (the output-token limit) and, from a Responses API
+    # stream on OWUI 0.13.1+, "incomplete" (mostly the same limit; OWUI also gives it to a content-filter
+    # stop or a failed stream and keeps no detail). "stop" is the norm, "tool_calls" ends a turn paused for
+    # approval or stopped at the tool-call limit, and a missing value (OWUI < 0.12) means unknown.
+    if s.valves.show_finish_reason and s.finish_reason in ("length", "incomplete"):
         return _with_icon(_icon(s.valves, "finish"), "truncated")
     return None
 
@@ -1078,7 +1078,9 @@ class Filter:
             default=True,
             description=(
                 "Flag a response the model cut off at its output-token limit (✂️ truncated). Needs Open WebUI "
-                "0.12.0+ and a Chat Completions (OpenAI-compatible) or Ollama model; not shown for the Responses API."
+                "0.12.0+ and a Chat Completions (OpenAI-compatible) or Ollama model; for the Responses API, "
+                "0.13.0+ (non-streaming) or 0.13.1+ (streaming, where a content-filter stop or a failed "
+                "stream is flagged too)."
             ),
         )
         show_total_tokens: bool = Field(default=True, description="Display total token count.")

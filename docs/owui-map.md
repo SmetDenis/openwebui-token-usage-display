@@ -51,6 +51,19 @@ and a later tool call that sends no usage all hide vLLM prefill. Legacy `tud_pre
 present in chat history are ignored, not rewritten or deleted. Non-streaming vLLM top-level metrics
 are not currently available in outlet usage; no wall-clock estimate is substituted.
 
+## Responses API stream `finish_reason` (v0.13.1-v0.13.3)
+
+One finding from the `v0.13.0...v0.13.3` diff, checked on its own (not a re-walk of this map; the rest of
+that diff is not checked yet). Since **v0.13.1** (commit `d87837372`) the streaming handler sets
+`finish_reason` for Responses API events too (`utils/middleware.py:5008-5011` in v0.13.3): OWUI's own value
+`incomplete` when the stream ends on `response.incomplete`, `response.failed` or an `error` event, and the
+response's final `status` (`completed`) on `response.completed`. It reaches the outlet on the current message
+like the Chat Completions value (`ctx['assistant_message']`, `:6555`; outlet body `:3984`), still from the last
+model call (`finish_reason = None` at the start of every round, `:4827`). `incomplete_details.reason`
+(token limit vs content filter) is not kept on this path; only the non-streaming converter reads it
+(`utils/response.py:244-248`, unchanged). The raw-API path (`update_assistant_message_from_stream`) sets no
+`finish_reason` for `response.*` events. The plugin flags `incomplete` like `length` since v2.11.1.
+
 ## What changed in v0.13.0 (plugin-relevant)
 
 Checked against `v0.12.5...v0.13.0` (2026-11-03, issue #42). Nothing here breaks the plugin. The usage core
@@ -184,7 +197,9 @@ Checked file by file against `v0.11.4...v0.12.0` (2026-10). Nothing here breaks 
      (`chat_completion_message_template` since 0.13.0); non-streaming Responses API replies get
      `tool_calls`/`stop` (`routers/openai.py:1399`) — **until 0.13.0**, which reads the response status
      and can report `length` (see "What changed in v0.13.0");
-   - **absent** for Responses API streams (`response.*` events `continue` before the `choices` loop).
+   - **absent** for Responses API streams (`response.*` events `continue` before the `choices` loop) —
+     **until 0.13.1**, which sets OWUI's own `incomplete` or the final status (see "Responses API stream
+     `finish_reason` (v0.13.1-v0.13.3)").
 
    It is **never persisted** — past messages never have it. A turn can end on `tool_calls` when it is
    paused for approval or stopped at the tool-call iteration limit.
