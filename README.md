@@ -46,8 +46,9 @@ tokens when a provider reports no usage; the plugin loads fine without it.
 - **Native prefill speed** (`⏩ prefill … t/s`) for prompt processing, separately from output speed
 - **Truncation marker** (`✂️ truncated`, next to `⬇︎`) - shown only when the model stopped because it hit its
   output-token limit, so a cut-off answer is not mistaken for a complete one. Needs Open WebUI 0.12.0+ and a
-  Chat Completions (OpenAI-compatible) or Ollama model, or a pipe that passes such a response through. Not
-  shown for the Responses API: Open WebUI passes no stop reason for its streams and a made-up `stop` otherwise
+  Chat Completions (OpenAI-compatible) or Ollama model, or a pipe that passes such a response through. For the
+  Responses API it needs Open WebUI 0.13.0+ (non-streaming) or 0.13.1+ (streaming); a Responses stream that
+  stopped on a content filter or failed is flagged too, because Open WebUI reports all three the same way
 - **Cost** - the provider's own reported cost when available (OpenRouter, LiteLLM, ...), or an optional estimate from [models.dev](https://models.dev) prices (always marked `≈`); shown per message (`💰`)
   and as a running chat total (`💰Σ`)
 - **OpenRouter balance** (`💳`, off by default) - what is left on your OpenRouter account, asked from
@@ -69,7 +70,7 @@ The filter reads Open WebUI's **normalized usage** attached to the response, so 
 ## Prompt-processing speed (prefill)
 
 When native prompt timing is available, the filter shows a separate field such as
-`⏩ prefill 3,056.4 t/s`. Toggle it with `show_prefill_tokens_per_second` (on by default)
+`⏩ prefill 3,056 t/s`. Toggle it with `show_prefill_tokens_per_second` (on by default)
 and reorder it with the `prefill` key in `display_order`.
 
 - **llama.cpp:** reads `prompt_n` / `prompt_ms`, or `prompt_per_second`.

@@ -581,19 +581,23 @@ def test_render_output(usage_display_module: ModuleType, valves: Any) -> None:
 @pytest.mark.parametrize(
     ("style", "expected"), [("emoji", "✂️ truncated"), ("simple", "✂︎ truncated"), ("off", "truncated")]
 )
-def test_render_finish_flags_only_length(
+def test_render_finish_flags_only_a_cut_off_answer(
     usage_display_module: ModuleType, valves: Any, style: str, expected: str
 ) -> None:
     r = renderer(usage_display_module, "_render_finish")
     valves.icon_style = style
     bags = (make_tokens(), make_timing(), make_ctx(), make_cost(), None)
-    assert r(valves, *bags, "length") == expected
-    # the normal stop, a turn paused on a tool call, a filter stop and "unknown" (no value) all stay silent
-    for reason in ("stop", "tool_calls", "content_filter", None):
-        assert r(valves, *bags, reason) is None
+    # the token limit, and OWUI 0.13.1+'s mark for a Responses API stream that did not complete
+    for reason in ("length", "incomplete"):
+        assert r(valves, *bags, reason) == expected
+    # the normal stop, a turn paused on a tool call, a filter stop, a completed Responses API stream and
+    # "unknown" (no value) all stay silent
+    for silent in ("stop", "tool_calls", "content_filter", "completed", None):
+        assert r(valves, *bags, silent) is None
     assert r(valves, *bags) is None  # _Stats default: OWUI < 0.12 sends no finish_reason
     valves.show_finish_reason = False
     assert r(valves, *bags, "length") is None
+    assert r(valves, *bags, "incomplete") is None
 
 
 def test_outlet_flags_truncated_response_next_to_output(
@@ -608,7 +612,16 @@ def test_outlet_flags_truncated_response_next_to_output(
     run_async(f.outlet(make_body([cut], model="gpt-4o"), __event_emitter__=emitter, __model__=make_model_dict()))
     assert "⬇︎ 4,096 · ✂️ truncated · Σ" in emitter.statuses()[0]["data"]["description"]
 
-    for finish in ("stop", 4096):  # a normal end, and a malformed non-string value
+    # OWUI 0.13.1+: a Responses API stream that ended on response.incomplete
+    cut_stream = make_message("partial answer", usage=make_usage(output_tokens=4096))
+    cut_stream["finish_reason"] = "incomplete"
+    emitter = CapturingEmitter()
+    run_async(
+        f.outlet(make_body([cut_stream], model="gpt-6.1"), __event_emitter__=emitter, __model__=make_model_dict())
+    )
+    assert "⬇︎ 4,096 · ✂️ truncated · Σ" in emitter.statuses()[0]["data"]["description"]
+
+    for finish in ("stop", "completed", 4096):  # a normal end, a completed stream, a malformed non-string value
         msg = make_message("answer", usage=make_usage())
         msg["finish_reason"] = finish
         emitter = CapturingEmitter()

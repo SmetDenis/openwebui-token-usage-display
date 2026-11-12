@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format loosely foll
 [Keep a Changelog](https://keepachangelog.com/). The authoritative version is the
 `version:` field in the `usage_display.py` docstring.
 
+## [2.11.1]
+
+The truncation marker now works for Responses API streams on Open WebUI 0.13.1+. No metric or valve changed.
+
+- **`✂️ truncated` for streamed Responses API replies.** Since Open WebUI 0.13.1 a Responses API stream that ends early reports `finish_reason: "incomplete"`, and the plugin now flags it like a Chat Completions `length`. Open WebUI uses the same value for a stream that stopped on a content filter or failed, and does not say which it was, so those replies get the marker too: the answer is cut short either way. On older Open WebUI versions nothing changes.
+- **Built-in prices refreshed from models.dev:** `claude-fable-5-2` and `gemini-4-carbon` get an offline estimate; `gpt-5.6` (with `-luna`, `-sol`, `-terra`), `gpt-realtime-2.1` and `grok-4.5` are now older than the table's 4-month window and fall out of it. They are still priced by the live models.dev table or by `price_map`.
+- README: the prefill example now shows the real format (`⏩ prefill 3,056 t/s`).
+
 ## [2.11.0]
 
 - Add native prompt-processing speed (`⏩ prefill … t/s`) separately from output speed,
