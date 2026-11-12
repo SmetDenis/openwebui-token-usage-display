@@ -10,6 +10,7 @@ built by the factories below, shaped to OWUI 0.10.2.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 import time
@@ -31,7 +32,7 @@ def test_module_loads_and_exposes_filter(usage_display_module: ModuleType) -> No
     assert f.valves.icon_style == "emoji"
     assert f.valves.cost_mode == "auto"
     assert mod._DEFAULT_ORDER[0] == "input"
-    assert len(mod._DEFAULT_ORDER) == 16
+    assert len(mod._DEFAULT_ORDER) == 17
     assert mod._DEFAULT_ORDER.index("tokens_total") == mod._DEFAULT_ORDER.index("total") + 1  # tokens grouped
     assert f.valves.show_cumulative_tokens is True  # on by default, like show_cumulative_cost
     # the truncation flag sits next to the output count, early enough to survive the one-line clamp
@@ -493,8 +494,8 @@ def test_resolve_display_order_is_full_permutation(usage_display_module: ModuleT
     assert mod._resolve_display_order("") == mod._DEFAULT_ORDER  # empty -> default
     resolved = mod._resolve_display_order("cost, model")
     assert resolved[:2] == ["cost", "model"]
-    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all 16, no dupes
-    assert len(resolved) == len(set(resolved)) == 16
+    assert sorted(resolved) == sorted(mod._DEFAULT_ORDER)  # still all metric keys, no duplicates
+    assert len(resolved) == len(set(resolved)) == 17
 
 
 def test_display_order_debug_provenance(usage_display_module: ModuleType) -> None:
@@ -1093,7 +1094,15 @@ def test_resolve_timing_wall_clock_fallback(usage_display_module: ModuleType) ->
 def test_resolve_timing_neither_source_available(usage_display_module: ModuleType) -> None:
     f = usage_display_module.Filter()
     timing = f._resolve_timing(None, wall_seconds=None, output_tokens=30)
-    assert timing == {"seconds": None, "tps": None, "source": None}
+    assert timing == {
+        "seconds": None,
+        "tps": None,
+        "source": None,
+        "prefill_tps": None,
+        "prefill_seconds": None,
+        "prefill_tokens": None,
+        "prefill_source": None,
+    }
 
 
 def test_resolve_timing_zero_wall_seconds_no_divide_by_zero(usage_display_module: ModuleType) -> None:
@@ -3976,3 +3985,263 @@ def test_probe_context_outer_exception_returns_none(
     f.valves.llamacpp_url = "http://localhost:8080"
     install_fake_aiohttp(monkeypatch, mod, session_error=RuntimeError("session boom"))
     assert run_async(f._probe_context("some-model")) is None
+
+
+# --- native prefill timing -----------------------------------------------------
+
+
+def _prefill_packet(*, prompt: int = 1000, cached: int = 200, milliseconds: object = 400) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-test",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": 40,
+            "total_tokens": prompt + 40,
+            "prompt_tokens_details": {"cached_tokens": cached},
+        },
+        "metrics": {
+            "time_to_first_token_ms": milliseconds,
+            "queue_time_ms": 3000,
+            "generation_time_ms": 1000,
+            "mean_itl_ms": 25,
+        },
+    }
+
+
+def _prefill_metadata(f: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    run_async(f.request({}, metadata))
+    return metadata
+
+
+def test_prefill_stream_to_outlet_excludes_cached_tokens_and_queue(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    f.valves.show_context_window = False
+    f.valves.cost_mode = "off"
+    f.valves.fallback_to_tiktoken = False
+    body = make_body([make_message("hello", role="user")])
+    metadata = {"chat_id": "test", "message_id": "assistant"}
+    run_async(f.inlet(body, __metadata__=metadata))
+    run_async(f.request(body, __metadata__=metadata))
+    packet = _prefill_packet()
+    before = copy.deepcopy(packet)
+    assert run_async(f.stream(packet, __metadata__=metadata)) is packet
+    assert packet == before  # usage, nested details and the raw-API chunk are untouched
+    body["messages"].append(make_message("hello back", usage=packet["usage"]))
+    emitter = CapturingEmitter()
+    run_async(f.outlet(body, __metadata__=metadata, __event_emitter__=emitter))
+    line = emitter.events[-1]["data"]["description"]
+    assert "⏩ prefill 2,000 t/s" in line
+    assert "⚡" in line
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        ({"prompt_n": 1000, "cache_n": 8000, "prompt_ms": 4000}, 250),
+        ({"prompt_per_second": 250}, 250),
+        ({"prompt_ms": 4000, "prompt_per_second": 250}, 250),
+    ],
+)
+def test_prefill_llamacpp_counts_only_new_tokens(
+    usage_display_module: ModuleType, usage: dict[str, Any], expected: float
+) -> None:
+    timing = usage_display_module.Filter._resolve_prefill_timing(usage)
+    assert timing["prefill_tps"] == expected
+    assert timing["prefill_source"] == "llamacpp_native"
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"prompt_eval_count": 8050, "prompt_eval_duration": 50_000_000, "prompt_token/s": 161000},
+        {"prompt_token/s": 161000},
+        {"tud_prefill_ms": 50, "tud_prefill_tokens": 8050},
+    ],
+)
+def test_prefill_ollama_and_old_persisted_custom_fields_are_not_used(
+    usage_display_module: ModuleType, usage: dict[str, Any]
+) -> None:
+    assert usage_display_module.Filter._resolve_prefill_timing(usage)["prefill_tps"] is None
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [None, {}, {"prompt_ms": 0}, {"prompt_n": -1, "prompt_ms": 10}, {"prompt_n": 1000, "prompt_ms": 1e-308}],
+)
+def test_prefill_missing_or_invalid_native_timing_is_hidden(
+    usage_display_module: ModuleType, usage: dict[str, Any] | None
+) -> None:
+    assert usage_display_module.Filter._resolve_prefill_timing(usage)["prefill_tps"] is None
+
+
+def test_prefill_missing_cache_detail_is_not_assumed_zero(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    event = _prefill_packet()
+    del event["usage"]["prompt_tokens_details"]
+    metadata = _prefill_metadata(f)
+    run_async(f.stream(event, metadata))
+    assert f._resolve_prefill_timing(event["usage"], metadata)["prefill_tps"] is None
+
+
+def test_prefill_input_token_aliases_in_metadata(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    event = _prefill_packet()
+    event["usage"] = {"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 200}}
+    metadata = _prefill_metadata(f)
+    run_async(f.stream(event, metadata))
+    assert f._resolve_prefill_timing(event["usage"], metadata)["prefill_tps"] == 2000
+
+
+@pytest.mark.parametrize(
+    ("milliseconds", "cached"),
+    [(0, 200), (-1, 200), (float("nan"), 200), (True, 200), (400, 1001), (400, -1), (400, 1000)],
+)
+def test_prefill_invalid_or_fully_cached_measurement_is_hidden(
+    usage_display_module: ModuleType, milliseconds: object, cached: int
+) -> None:
+    f = usage_display_module.Filter()
+    metadata = _prefill_metadata(f)
+    event = run_async(f.stream(_prefill_packet(milliseconds=milliseconds, cached=cached), metadata))
+    assert f._resolve_prefill_timing(event["usage"], metadata)["prefill_tps"] is None
+
+
+def test_prefill_is_never_estimated_from_full_response_time(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    timing = f._resolve_timing({"prompt_tokens": 15000, "completion_tokens": 1000}, 20, 1000)
+    assert timing["prefill_tps"] is None
+    assert timing["tps"] == 50
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_disabled_or_missing_metadata_leaves_chunk_unchanged(
+    usage_display_module: ModuleType, *, enabled: bool
+) -> None:
+    f = usage_display_module.Filter()
+    f.valves.show_prefill_tokens_per_second = enabled
+    event = _prefill_packet()
+    before = copy.deepcopy(event)
+    metadata: dict[str, Any] | None = None if enabled else {}
+    assert run_async(f.stream(event, metadata)) is event
+    assert event == before
+    assert not metadata
+
+
+@pytest.mark.parametrize("event", [{}, {"usage": {}}, {"usage": "bad"}, {"usage": {"prompt_tokens": 4}, "metrics": {}}])
+def test_prefill_unrecognized_provider_chunks_are_unchanged(
+    usage_display_module: ModuleType, event: dict[str, Any]
+) -> None:
+    f = usage_display_module.Filter()
+    before = copy.deepcopy(event)
+    metadata = _prefill_metadata(f)
+    assert run_async(f.stream(event, metadata)) is event
+    assert event == before
+    assert "_tud_prefill" not in metadata
+
+
+def test_prefill_new_tool_call_without_usage_cannot_reuse_previous_timing(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    metadata: dict[str, Any] = {}
+    run_async(f.request({}, metadata))
+    first = run_async(f.stream(_prefill_packet(), metadata))
+    assert f._resolve_prefill_timing(first["usage"], metadata)["prefill_tps"] == 2000
+    run_async(f.request({}, metadata))  # clear before every model call, not only on usage chunks
+    run_async(f.stream({"choices": [{"delta": {"content": "no usage"}}]}, metadata))
+    retained_usage = {**first["usage"], "incomplete": True}  # OWUI's no-usage fallback
+    assert f._resolve_prefill_timing(retained_usage, metadata)["prefill_tps"] is None
+    assert first["usage"] == _prefill_packet()["usage"]
+
+
+def test_prefill_last_tool_call_uses_its_own_count_not_merged_usage(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    metadata: dict[str, Any] = {}
+    run_async(f.request({}, metadata))
+    run_async(f.stream(_prefill_packet(), metadata))
+    run_async(f.request({}, metadata))
+    run_async(f.stream(_prefill_packet(prompt=600, cached=200, milliseconds=200), metadata))
+    merged = {"input_tokens": 1600, "prompt_tokens": 600, "prompt_tokens_details": {"cached_tokens": 400}}
+    timing = f._resolve_prefill_timing(merged, metadata)
+    assert timing["prefill_tps"] == 2000
+    assert timing["prefill_tokens"] == 400
+
+
+def test_prefill_concurrent_request_metadata_is_isolated(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    first: dict[str, Any] = {}
+    second: dict[str, Any] = {}
+    run_async(f.request({}, first))
+    run_async(f.stream(_prefill_packet(), first))
+    run_async(f.request({}, second))
+    run_async(f.stream(_prefill_packet(prompt=4000, cached=0, milliseconds=1000), second))
+    assert f._resolve_prefill_timing(None, first)["prefill_tps"] == 2000
+    assert f._resolve_prefill_timing(None, second)["prefill_tps"] == 4000
+
+
+def test_prefill_stream_error_preserves_final_usage_chunk(
+    usage_display_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_detail(*_args: Any) -> None:
+        raise RuntimeError("unexpected parsing failure")
+
+    f = usage_display_module.Filter()
+    event = _prefill_packet()
+    before = copy.deepcopy(event)
+    metadata = _prefill_metadata(f)
+    monkeypatch.setattr(usage_display_module, "_detail_num", broken_detail)
+    assert run_async(f.stream(event, metadata)) is event
+    assert event == before
+    assert "_tud_prefill" not in metadata
+
+
+def test_prefill_single_output_token_has_no_inter_token_latency(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    event = _prefill_packet()
+    del event["metrics"]["mean_itl_ms"]
+    event["metrics"]["generation_time_ms"] = 0
+    metadata = _prefill_metadata(f)
+    run_async(f.stream(event, metadata))
+    assert f._resolve_prefill_timing(event["usage"], metadata)["prefill_tps"] == 2000
+
+
+@pytest.mark.parametrize(("style", "prefix"), [("emoji", "⏩ "), ("simple", "⇥ "), ("off", "")])
+def test_render_prefill_visibility_and_icon_styles(
+    usage_display_module: ModuleType, valves: Any, style: str, prefix: str
+) -> None:
+    render = renderer(usage_display_module, "_render_prefill")
+    valves.icon_style = style
+    bags = [valves, make_tokens(), make_timing(prefill_tps=250), make_ctx(), make_cost(), None]
+    assert render(*bags) == f"{prefix}prefill 250.0 t/s"
+    valves.show_prefill_tokens_per_second = False
+    assert render(*bags) is None
+    valves.show_prefill_tokens_per_second = True
+    bags[2] = make_timing(prefill_tps=None)
+    assert render(*bags) is None
+
+
+@pytest.mark.parametrize(("speed", "expected"), [(3056.4, "3,056"), (250.12, "250.1")])
+def test_render_prefill_precision(usage_display_module: ModuleType, valves: Any, speed: float, expected: str) -> None:
+    render = renderer(usage_display_module, "_render_prefill")
+    assert render(valves, make_tokens(), make_timing(prefill_tps=speed), make_ctx(), make_cost(), None) == (
+        f"⏩ prefill {expected} t/s"
+    )
+
+
+@pytest.mark.parametrize(("count", "visible"), [(1, False), (63, False), (64, True), (None, True)])
+def test_render_prefill_minimum_new_token_count(
+    usage_display_module: ModuleType, valves: Any, count: int | None, *, visible: bool
+) -> None:
+    render = renderer(usage_display_module, "_render_prefill")
+    bags = [valves, make_tokens(), make_timing(prefill_tps=2000, prefill_tokens=count), make_ctx(), make_cost(), None]
+    assert (render(*bags) is not None) == visible
+    valves.prefill_min_tokens = 0
+    assert render(*bags) == "⏩ prefill 2,000 t/s"
+
+
+def test_prefill_without_request_hook_does_not_capture_unreset_timing(usage_display_module: ModuleType) -> None:
+    f = usage_display_module.Filter()
+    event = _prefill_packet()
+    metadata: dict[str, Any] = {}
+    assert run_async(f.stream(event, metadata)) is event
+    assert metadata == {}
+    assert f._resolve_prefill_timing(event["usage"], metadata)["prefill_tps"] is None

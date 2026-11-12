@@ -43,6 +43,7 @@ tokens when a provider reports no usage; the plugin loads fine without it.
   (Anthropic cache is correctly counted as *additional* to input)
 - **Context-window utilization** - how much of the model's window you've used, e.g. `8.8k/200k (4%)`; the icon turns 🟠 at 30% and 🔴 at 70% by default (configurable). On a response with tool calls (several requests to the model) it shows the last request, while `⬆︎`/`Σ`/cost add up all of them - so `⬆︎` can be far larger than `📐` (Open WebUI 0.11+; on 0.10.x `📐` is the sum too). Marked `≈` when it is an estimate (see [Notes & limitations](#notes--limitations)). This is the model's real window, not Open WebUI's own context indicator, which divides by its compaction threshold (80k by default) and leaves Anthropic cache out, so the two percentages differ by design
 - **Generation time** and **tokens/second**
+- **Native prefill speed** (`⏩ prefill … t/s`) for prompt processing, separately from output speed
 - **Truncation marker** (`✂️ truncated`, next to `⬇︎`) - shown only when the model stopped because it hit its
   output-token limit, so a cut-off answer is not mistaken for a complete one. Needs Open WebUI 0.12.0+ and a
   Chat Completions (OpenAI-compatible) or Ollama model, or a pipe that passes such a response through. Not
@@ -64,6 +65,38 @@ The filter reads Open WebUI's **normalized usage** attached to the response, so 
   to indicate it's approximate. On Open WebUI 0.11.2+ it starts at the first request to the model, so time
   spent on RAG and web search before it is left out; tools that run between requests are counted. Older
   versions start it when the message is sent.
+
+## Prompt-processing speed (prefill)
+
+When native prompt timing is available, the filter shows a separate field such as
+`⏩ prefill 3,056.4 t/s`. Toggle it with `show_prefill_tokens_per_second` (on by default)
+and reorder it with the `prefill` key in `display_order`.
+
+- **llama.cpp:** reads `prompt_n` / `prompt_ms`, or `prompt_per_second`.
+- **vLLM streamed Chat Completions:** start vLLM with
+  `--enable-per-request-metrics --enable-prompt-tokens-details` and enable the model's **Usage**
+  capability in Open WebUI. The stream hook captures its native timing in per-request metadata
+  before Open WebUI drops the top-level `metrics` object; response chunks and usage stay untouched. The tested vLLM version reports prefill as
+  scheduling-to-first-token time, excluding queue wait. The token count excludes cache hits.
+
+This is a per-call measurement, not the server's interval-averaged prompt throughput. For a turn
+with tools, it describes the last model call, using that call's token count and duration together.
+Missing/invalid timing, unknown vLLM cache counts, and fully cached prompts hide the field. The
+`request` hook clears timing before each model call, including calls that send no usage at all. Input
+counts are never divided by full response wall time to invent a prefill rate. vLLM non-streaming
+responses currently do not preserve their top-level metrics into outlet usage, so that path does
+not show prefill speed. Other providers continue to show their existing statistics unchanged.
+Ollama prefill is deliberately hidden: its prompt count includes cached tokens, but Open WebUI
+omits the separate cached count and computes its own inflated `prompt_token/s`. That numerator
+cannot safely be paired with the duration for newly processed tokens. Ollama output-speed and
+other statistics remain unchanged.
+
+`prefill_min_tokens` defaults to **64 newly processed tokens**: smaller prefills mostly measure
+fixed overhead. Set it to `0` to disable the threshold. A native rate-only report without a token
+count is unaffected. Rates at or above 1000 t/s omit decimal places; smaller rates keep one.
+The metadata and stream ordering were verified against Open WebUI **0.13.0 and 0.13.3**; native
+vLLM timing semantics were checked with 0.33.0rc1. Older supported versions still load the filter;
+without the shared hook metadata, vLLM prefill stays hidden.
 
 ## Context-window detection
 

@@ -101,12 +101,14 @@ when non-obvious:
 - **Visibility** — `show_input_tokens`, `show_output_tokens`, `show_finish_reason` (True, v2.8.0),
   `show_total_tokens`,
   `show_cumulative_tokens` (True, v2.6.0),
-  `show_generation_time`, `show_tokens_per_second`, `show_reasoning_tokens`, `show_cached_tokens`,
+  `show_generation_time`, `show_tokens_per_second`, `show_prefill_tokens_per_second` (True, v2.11.0),
+  `show_reasoning_tokens`, `show_cached_tokens`,
   `show_audio_tokens` (False), `show_model_name`, `show_data_source` (False),
   `show_context_window`, `show_cumulative_cost`, `show_balance` (False, v2.9.0). Message cost has **no** `show_*` — its visibility
   is `cost_mode` itself.
-- **Presentation** — `display_order` (pre-filled full 16-key order), `separator` (`" · "`),
+- **Presentation** — `display_order` (pre-filled full 17-key order), `separator` (`" · "`),
   `icon_style` (`emoji`/`simple`/`off`), `compact_numbers` (False).
+- **Prefill** — `prefill_min_tokens` (64 new tokens, v2.11.0; 0 disables the threshold).
 - **Estimation** — `fallback_to_tiktoken` (True), `count_all_messages_for_input` (True).
 - **Context** — `context_size_override` (0 = auto), `context_size_map` (JSON string),
   `fetch_context_from_modelsdev` (**False** — privacy: no network without consent),
@@ -137,8 +139,8 @@ tags skips (`git fetch --tags`). Not covered: a tightened bound for a value outs
 
 ## Renderer dispatch
 
-`_STATS_RENDERERS` (`:737-751`) maps 16 keys (`input`, `output`, `finish`, `total`, `tokens_total`,
-`reasoning`, `cached`, `audio`, `context`, `time`, `tps`, `cost`, `cost_total`, `balance`, `model`, `source`)
+`_STATS_RENDERERS` (`:737-751`) maps 17 keys (`input`, `output`, `finish`, `total`, `tokens_total`,
+`reasoning`, `cached`, `audio`, `context`, `time`, `prefill`, `tps`, `cost`, `cost_total`, `balance`, `model`, `source`)
 to `_render_*`
 functions with one signature `(s: _Stats) -> str | None`. `_Stats` is a frozen dataclass bundling
 `valves`, `tokens`, `timing`, `ctx`, `cost`, `model`, plus `finish_reason` (default `None`, added in
@@ -149,7 +151,7 @@ consisting solely of `source` parts. `_emit_debug` takes the same `_Stats` plus 
 messages, assistant message, usage, metadata).
 
 Rules: **`show_*` valves gate visibility; `display_order` only sorts.** `_resolve_display_order`
-(`:451-458`) always returns a full 16-key permutation — removed keys move to the end, unknown keys
+(`:451-458`) always returns a full 17-key permutation — removed keys move to the end, unknown keys
 are ignored (surfaced only in the debug payload). To add a metric: add a `show_*` valve, write a
 `_render_*(s: _Stats)`, register it in `_STATS_RENDERERS`, append the key to `_DEFAULT_ORDER`, add
 an icon to `_ICON_EMOJI`/`_ICON_SIMPLE`.
@@ -502,6 +504,20 @@ used for the live models.dev prices and `_STATIC_PRICES` (see Price above). Clas
   falls through to walking the structured `output` array (`_extract_output_text:268-288` — only
   `type=="message"` items; `reasoning` items excluded so they are not double-counted). Input is
   estimated over all non-assistant messages (or just the last user message).
+- **Prefill timing (v2.11.0)** — `stream` runs before usage capture (verified against OWUI
+  v0.13.0/v0.13.3) and records vLLM's matched new-token count and milliseconds in
+  `__metadata__["_tud_prefill"]`. `request` clears it before **every** model call, including
+  calls that later send no usage. The same metadata dict reaches outlet, so tool-turn token
+  sums cannot be divided by one call's duration. The stream hook returns the original event,
+  never changes usage, and catches all exceptions to keep OWUI from dropping the usage chunk.
+  Native vLLM timing is scheduling-to-first-token (queue excluded); cache counts are subtracted
+  only when known. llama.cpp's `prompt_n` / `prompt_ms` already describe new tokens; its native
+  `prompt_per_second` is also accepted. Ollama prefill is intentionally not read: OWUI's count
+  includes cache hits but its duration does not, and the separate cached count is not passed on.
+  Incomplete llama.cpp usage is suppressed conservatively to avoid reusing stale timing.
+  Missing/invalid/zero-compute rates are hidden. `_render_prefill` suppresses known counts below
+  `prefill_min_tokens` (64 by default, 0 disables; rate-only reports are unaffected), and omits
+  decimals at ≥1000 t/s. No wall-clock estimate or global metrics request is used.
 - **Timing — `_resolve_timing` (`:1198+`)**: provider-reported wins (Ollama
   `eval_duration`/`response_token/s`, llama.cpp `predicted_ms`/`predicted_per_second`), else
   wall-clock marked `~`. Since v2.10.0 (issue #39) the wall clock starts at the **first model call**
@@ -581,6 +597,24 @@ stale. All aiohttp fetchers catch broad `Exception` and degrade to `{}`/`None`.
   last models.dev fetch — a failed fetch used to look exactly like an unlisted model) and
   `cost_debug.cumulative_unpriced_messages`.
 
+### Design decisions (v2.11.0, PR #51)
+
+- **Per-call metadata, not usage or module-global state.** OWUI's request/stream/outlet hooks
+  share a metadata dict in v0.13.0/v0.13.3. This isolates concurrent requests, keeps the last
+  call's count/time paired, and leaves API chunks, persisted usage, and OWUI's usage tooltip
+  unchanged. Rejected: custom `tud_prefill_*` usage fields (persisted/leaked to clients), and
+  clearing them with nulls in the next usage chunk (a later call may send no usage at all).
+- **Reset in `request`, fail open in `stream`.** The reset occurs before every tool round;
+  a missing final usage chunk cannot resurrect the previous round's timing. An unexpected
+  stream failure returns the original event because OWUI otherwise drops that chunk.
+- **Only native llama.cpp/vLLM prefill.** No wall-time estimate or global throughput snapshot.
+  Ollama is deliberately excluded: it counts cached+new prompt tokens against new-token time,
+  and OWUI omits the cached count needed to correct it. Its existing generation-speed path stays.
+- **Small-count threshold is a presentation choice.** Default 64 new tokens avoids reporting
+  fixed per-request overhead as a throughput regression after a warm-cache hit. Admins can
+  disable/tune it; rate-only reports cannot be thresholded without inventing a token count.
+  High rates use whole t/s, smaller rates one decimal, to avoid distracting false precision.
+
 ## Edge-case catalog
 
 Every guard, with its trigger, handling and covering test (`tests/test_usage_display.py`).
@@ -620,6 +654,17 @@ Every guard, with its trigger, handling and covering test (`tests/test_usage_dis
 | stale timing entries | purged >600s on every call | `:1191-1194` | `test_resolve_wall_clock_purges_stale_entries` |
 | `wall_seconds == 0.0` | no div-by-zero (falsy guard) | `:1225-1226` | `test_resolve_timing_zero_wall_seconds_no_divide_by_zero` |
 | provider-reported tps present | beats computed `output/seconds` | `:1214-1221` | `test_resolve_timing_ollama_reported_tps` |
+| native vLLM prefill + cached tokens + queue wait | matched new-token count / scheduled-to-first-token time; original chunk unchanged | `stream`, `_resolve_prefill_timing` | `test_prefill_stream_to_outlet_excludes_cached_tokens_and_queue` |
+| next tool call reports no usage at all | request clears metadata; old timing cannot reappear in retained/incomplete usage | `request`, `stream` | `test_prefill_new_tool_call_without_usage_cannot_reuse_previous_timing` |
+| tool usage sums several calls | last call's count and duration stay paired | `_resolve_prefill_timing` | `test_prefill_last_tool_call_uses_its_own_count_not_merged_usage` |
+| concurrent chats use one cached filter instance | timing isolated in each request's metadata | `stream` | `test_prefill_concurrent_request_metadata_is_isolated` |
+| unexpected stream parsing failure | original final usage chunk returned, never dropped | `stream` exception guard | `test_prefill_stream_error_preserves_final_usage_chunk` |
+| unknown backend, missing metadata, disabled valve | original chunk and usage unchanged; no custom persisted keys | `stream` | `test_prefill_unrecognized_provider_chunks_are_unchanged`, `test_prefill_disabled_or_missing_metadata_leaves_chunk_unchanged` |
+| Ollama warm cache (8000 cached + 50 new in 50 ms) or old `tud_prefill_*` usage | prefill hidden; never use inflated count/rate or stale saved fields | `_resolve_prefill_timing` | `test_prefill_ollama_and_old_persisted_custom_fields_are_not_used` |
+| llama.cpp prompt_n=1000, cache_n=8000 | only the 1000 new tokens counted | `_resolve_prefill_timing` | `test_prefill_llamacpp_counts_only_new_tokens` |
+| missing vLLM cache count, malformed/non-finite timing, fully cached prompt | prefill hidden instead of estimated | `stream`, `_resolve_prefill_timing` | `test_prefill_missing_cache_detail_is_not_assumed_zero`, `test_prefill_invalid_or_fully_cached_measurement_is_hidden` |
+| single output token, no inter-token latency | prefill still captured from native timing | `stream` | `test_prefill_single_output_token_has_no_inter_token_latency` |
+| fewer than 64 new tokens or high t/s | configurable threshold hides tiny prefills; whole t/s above 1000 | `_render_prefill` | `test_render_prefill_minimum_new_token_count`, `test_render_prefill_precision` |
 | proxy folds Anthropic cache into details | treated as subset (no double count) | `:1127-1134` | `test_cache_and_fresh_openai_subset` / `_anthropic_native_on_top` |
 | non-streaming Responses usage with both detail families (OWUI 0.13.0) | first family read, never both; one call and a merged two-call turn | `_cache_and_fresh`, `_extract_tokens` | `test_outlet_reads_owui_0130_responses_usage_with_both_detail_families_once` |
 | `auto` mode, no native cost key | never estimates/fetches | `:1442-1446` | `test_resolve_cost_auto_no_native_key_never_estimates` |
